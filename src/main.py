@@ -1085,6 +1085,33 @@ def _safe_target(dest_dir: Path, member: str) -> Path:
     return target
 
 
+def _reject_escaping_links(dest: Path) -> None:
+    """Refuse an extraction that left a link pointing out of its own directory.
+
+    `_safe_target` inspects member NAMES, which is all a zip or tar listing
+    gives before extraction — and all that any check can do for unrar, unar and
+    7z, which are handed the archive whole and validate it by their own rules.
+    A symlink is the gap in that: the name is ordinary, the target is not.
+
+    Checked after the fact because it is the only point at which every
+    extractor, external ones included, can be held to the same rule. The
+    offending link is removed rather than left for the organiser to walk into,
+    and the archive is reported as unsafe.
+    """
+    dest = dest.resolve()
+    for path in dest.rglob("*"):
+        if not path.is_symlink():
+            continue
+        # Read the link BEFORE removing it: the message needs the target, and
+        # the first version of this unlinked first and then tried to read the
+        # thing it had just deleted.
+        link = os.readlink(path)
+        target = (path.parent / link).resolve()
+        if target != dest and dest not in target.parents:
+            path.unlink(missing_ok=True)
+            raise UnsafeArchive(f"{path.name} -> {link}")
+
+
 def extract_dir_for(archive: Path) -> Path:
     name = archive.name
     lower = name.lower()
@@ -1114,7 +1141,12 @@ def extract_tar(path: Path, dest: Path) -> None:
     with tarfile.open(path) as tf:
         for member in tf.getmembers():
             _safe_target(dest, member.name)
-        tf.extractall(dest)
+        # `filter="data"` is what stops the case _safe_target cannot see: a
+        # member whose NAME is innocent and whose symlink TARGET points outside
+        # the tree, which a later member then writes through. Python 3.14 makes
+        # this the default and 3.12/3.13 only warn, so it is stated rather than
+        # inherited — the tool claims to run on older interpreters too.
+        tf.extractall(dest, filter="data")
 
 
 def run_cmd(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -1130,9 +1162,17 @@ def extract_rar(path: Path, dest: Path) -> None:
             for info in rf.infolist():
                 _safe_target(dest, info.filename)
             rf.extractall(dest)
+        _reject_escaping_links(dest)
         return
     except ImportError:
+        # rarfile is optional; fall back to whatever is on PATH.
         pass
+    except UnsafeArchive:
+        # NEVER fall through on this one. It used to be caught by the bare
+        # `except Exception` below, so an archive that FAILED the path check was
+        # then handed to unrar/unar/7z with no check at all — the guard defeated
+        # by its own fallback. A rejected archive is rejected.
+        raise
     except Exception:
         pass
     unrar = which(["unrar"])
@@ -1184,6 +1224,9 @@ def extract_archive(path: Path) -> Path:
         extract_7z(path, dest)
     else:
         raise RuntimeError(f"Unsupported archive: {path.name}")
+    # Belt and braces for the external extractors, which validate by their own
+    # rules and cannot be made to use ours.
+    _reject_escaping_links(dest)
     return dest
 
 
@@ -1598,7 +1641,7 @@ def remove_empty_dirs(root: Path, keep: set[Path]) -> None:
             pass
 
 
-def apply_extracts(plan: Plan, trash: Path, dry_run: bool) -> list[str]:
+def apply_extracts(plan: Plan, trash: Path, dry_run: bool, copy: bool = False) -> list[str]:
     errors: list[str] = []
     for op in plan.extracts:
         if dry_run:
@@ -1606,7 +1649,10 @@ def apply_extracts(plan: Plan, trash: Path, dry_run: bool) -> list[str]:
         try:
             extracted = extract_archive(op.src)
             print(f"  extracted {op.src.name} -> {extracted.name}/")
-            if op.src.exists():
+            # Under --copy the archive stays where it is. Extraction already
+            # writes a folder beside it, which is as far as a "read the dump"
+            # run should ever reach into the source.
+            if op.src.exists() and not copy:
                 move_file(op.src, unique_trash_path(trash, op.src.name))
         except Exception as exc:
             errors.append(f"{op.src.name}: {exc}")
@@ -1614,25 +1660,31 @@ def apply_extracts(plan: Plan, trash: Path, dry_run: bool) -> list[str]:
 
 
 def apply_plan(plan: Plan, trash: Path, dry_run: bool, copy: bool) -> None:
+    """Write the plan. In copy mode the source is READ, never written.
+
+    Trashing is skipped entirely under --copy. It used to run, which meant a
+    "leave the dump untouched" run put a trash/ folder inside the dump holding
+    COPIES of junk that was still sitting where it had always been: the files
+    duplicated, the clutter not actually cleared, and the one promise the flag
+    makes quietly broken.
+    """
     transfer = copy_file if copy else move_file
-    if not dry_run:
+    if not dry_run and not copy:
         trash.mkdir(parents=True, exist_ok=True)
     for book in plan.books:
         for op in book.tracks + book.extras:
             if op.kind == "trash":
-                dest = unique_trash_path(trash, op.src.name)
-                if dry_run:
+                if dry_run or copy:
                     continue
-                transfer(op.src, dest)
+                transfer(op.src, unique_trash_path(trash, op.src.name))
             else:
                 if dry_run:
                     continue
                 transfer(op.src, op.dest)
     for op in plan.trash:
-        if dry_run:
+        if dry_run or copy:
             continue
-        dest = unique_trash_path(trash, op.src.name)
-        transfer(op.src, dest)
+        transfer(op.src, unique_trash_path(trash, op.src.name))
     if not dry_run and not copy:
         for op in plan.extracts:
             if op.src.exists():
@@ -1748,17 +1800,26 @@ def run(args: argparse.Namespace) -> int:
         print("Dry run. No files were changed. Pass --apply to make it real.")
         return 0
 
-    if not args.yes and sys.stdin.isatty():
+    if not args.yes:
+        # Refuse rather than assume. The old test was `and sys.stdin.isatty()`,
+        # which SKIPPED the prompt whenever there was no terminal — so piping
+        # the output, running from cron, or `--apply < /dev/null` moved a whole
+        # library with nobody asked. A tool that relocates files should treat
+        # "no one is here to answer" as a reason to stop.
+        if not sys.stdin.isatty():
+            eprint("Refusing to apply with no terminal to confirm at. Pass --yes to mean it.")
+            return 2
         if not confirm("Apply this plan? [y/N] "):
             print("Cancelled.")
             return 1
 
     if plan.extracts:
         print("Extracting archives…")
-        errors = apply_extracts(plan, trash=trash, dry_run=False)
+        errors = apply_extracts(plan, trash=trash, dry_run=False, copy=args.copy)
         for err in errors:
             eprint(f"  extract failed: {err}")
         print("Re-scanning after extract…")
+        before = len(plan.books)
         plan = build_plan(
             source=source,
             dest=dest,
@@ -1770,11 +1831,26 @@ def run(args: argparse.Namespace) -> int:
         )
         print_plan(plan, source, dest)
 
+        # The plan just changed. What was agreed to was the FIRST one — which,
+        # for a dump of archives, says "Books 0, Archives 1" and nothing about
+        # the files that appear once they are opened. Asking again is the only
+        # honest reading of that answer.
+        if plan.books and len(plan.books) != before and not args.yes:
+            if not sys.stdin.isatty():
+                eprint("Extracting revealed a different plan and there is no terminal to confirm it.")
+                return 2
+            if not confirm(f"Extracting revealed {len(plan.books)} book(s). Apply this plan? [y/N] "):
+                print("Cancelled. Extracted files were left in place.")
+                return 1
+
     print("Moving files…")
     apply_plan(plan, trash=trash, dry_run=False, copy=args.copy)
 
-    keep = {source, dest, trash}
-    remove_empty_dirs(source, keep)
+    # Not under --copy: an empty directory in the dump is the operator's, and
+    # nothing was taken out of it to make it empty.
+    if not args.copy:
+        keep = {source, dest, trash}
+        remove_empty_dirs(source, keep)
 
     print()
     print(f"Done. {len(plan.books)} books on the shelf.")

@@ -37,10 +37,16 @@ chmod +x run.sh
 # Preview only (safe)
 ./run.sh "/path/to/messy/dump" --dry-run
 
-# Write a clean library (source left intact when --dest is set)
+# Write a clean library. NOTE: this MOVES the files out of the dump.
+# Add --copy if you want the dump to survive.
 ./run.sh "/path/to/messy/dump" \
   --dest "/path/to/Audiobooks-clean" \
   --apply
+
+# The same thing, taking nothing out of the dump
+./run.sh "/path/to/messy/dump" \
+  --dest "/path/to/Audiobooks-clean" \
+  --copy --apply
 
 # Ebooks only
 ./run.sh "/path/to/ebook/dump" \
@@ -63,15 +69,15 @@ In-place reorganize (no separate dest):
 | Flag | Description |
 |------|-------------|
 | `source` | Messy dump folder (required) |
-| `--dest DIR` | Clean output library. Omit to edit source in place |
+| `--dest DIR` | Clean output library. Omit to edit source in place. Files are **moved** unless `--copy` |
 | `--apply` | Actually move/copy files (default is dry-run plan) |
 | `--dry-run` | Force plan-only |
-| `--copy` | Copy into dest instead of moving |
+| `--copy` | Copy into dest instead of moving. Nothing is removed from the source: no trashing, archives stay put, empty folders are left alone. Archives are still **extracted in place**, so a dump containing zips gains the unpacked folders |
 | `--media auto\|audio\|ebook\|both` | What to organize (default: `auto`) |
 | `--format year-title\|title-year\|title` | Folder naming (default: `year-title` → `1999 - Title`) |
 | `--keep-names` | Audio tracks as `01 - Chapter.mp3` instead of `01.mp3` |
 | `--keep-images` | Keep all images, not only cover |
-| `--yes` / `-y` | Skip confirmation |
+| `--yes` / `-y` | Skip confirmation. Required when there is no terminal (a pipe, cron, a script) — without it, `--apply` refuses rather than guessing |
 | `--trash-name NAME` | Junk folder name under source (default: `trash`) |
 | `--self-test` | Run built-in smoke tests |
 
@@ -108,7 +114,15 @@ Edit `src/main.py`:
 ## Tips
 
 - Always `--dry-run` first on a large library.
-- Use `--dest` so the original dump stays untouched.
+- Use `--dest --copy` if you want to keep the original dump. `--dest` on its own
+  moves the files out of it.
+- `--copy` removes nothing — not the junk, not the archives, not empty folders.
+  The one thing it adds is the extracted contents of any archive, unpacked
+  beside it, because the organiser has to be able to see inside. If even that is
+  too much, copy the dump somewhere else first and run against the copy.
+- A dry run cannot see inside archives, so on a dump of zips it will report
+  `Books 0`. With `--apply` the tool extracts, re-plans, and asks again before
+  moving anything.
 - Install `unrar` for RAR sets: `sudo apt install unrar`
 - Point Audiobookshelf at the **clean** folder, not the dump or `trash/`.
 - After in-place runs, review and delete `trash/` before library scan.
