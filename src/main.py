@@ -289,6 +289,34 @@ def is_disc_folder(name: str) -> bool:
     return bool(re.match(r"^(?:cd|disc|disk|dvd)[\s._-]*\d+", cleaned, re.I))
 
 
+# A disc marker at the END of a name, e.g. "Ender's Game CD2", "The Book - Disc 1".
+#
+# DISC_RE only matches a name that BEGINS with the marker, which covers the
+# nested layout (a book folder containing CD1/, CD2/). The other common rip
+# layout puts the marker on the book folder itself, as siblings — and there the
+# marker ends up inside the parsed TITLE, so the two halves resolve to different
+# titles, never merge, and land in the library as two separate books.
+#
+# Anchored to the end and requiring a separator, so a title that merely contains
+# a number ("Apollo 13", "Fahrenheit 451") is untouched.
+TRAILING_DISC_RE = re.compile(
+    r"^(?P<base>.+?)[\s._-]+(?:cd|disc|disk|dvd|side)[\s._-]*(?P<num>[0-9]{1,3}|[a-d])$",
+    re.I,
+)
+
+
+def trailing_disc(name: str) -> tuple[str, int] | None:
+    """Split a trailing disc marker off a name: ("The Book", 2) or None."""
+    m = TRAILING_DISC_RE.match(name.strip())
+    if not m:
+        return None
+    token = m.group("num").lower()
+    num = ord(token) - 96 if token.isalpha() else int(token)
+    base = m.group("base").strip(" .-_")
+    # A marker that eats the whole name leaves nothing to call the book.
+    return (base, num) if base else None
+
+
 def disc_number(name: str) -> int:
     m = re.match(
         r"^(?:cd|disc|disk|dvd|side)[\s._-]*([0-9]{1,3}|[a-d])",
@@ -503,6 +531,15 @@ def parse_name(raw: str) -> Meta:
         if lower.endswith(".tar.gz"):
             original = Path(raw).name[: -len(".tar.gz")]
     text = humanize(original)
+    # Drop a trailing disc marker before anything else reads the name. Left in,
+    # it becomes part of the TITLE, so "The Book CD1" and "The Book CD2" never
+    # match on (author, title, year) and the two halves of one audiobook land in
+    # the library as two separate books. The disc number is not lost — it is
+    # recovered from the folder name by track_sort_key, which is what orders the
+    # merged tracks.
+    split = trailing_disc(text)
+    if split:
+        text = split[0]
     narrator, text = extract_narrator(text)
     text = peel_index_prefix(text)
     text = SCENE_RE.sub(" ", text)
@@ -1044,6 +1081,11 @@ def track_sort_key(path: Path, source: Path) -> tuple:
             break
         if is_disc_folder(parent.name) and disc == 0:
             disc = disc_number(parent.name)
+        elif disc == 0:
+            # "…/The Book CD2/01.mp3" — the disc is on the book folder itself.
+            trailing = trailing_disc(parent.name)
+            if trailing:
+                disc = trailing[1]
         if is_section_folder(parent.name) and section == 0:
             section = section_number(parent.name)
     # Leading chapter/part index in the filename (e.g. "1_ Part One - November")
@@ -1627,12 +1669,52 @@ def unique_trash_path(trash: Path, name: str) -> Path:
         n += 1
 
 
-def remove_empty_dirs(root: Path, keep: set[Path]) -> None:
-    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+def dirs_the_plan_empties(plan: "Plan") -> set[Path]:
+    """Every source directory this run takes a file out of.
+
+    Used to bound the tidy-up below. Nothing else in the dump is the tool's to
+    remove.
+    """
+    dirs: set[Path] = set()
+    for book in plan.books:
+        for op in book.tracks + book.extras:
+            dirs.add(op.src.parent)
+    for op in plan.trash:
+        dirs.add(op.src.parent)
+    for op in plan.extracts:
+        dirs.add(op.src.parent)
+    return dirs
+
+
+def remove_empty_dirs(root: Path, keep: set[Path], emptied: set[Path]) -> None:
+    """Remove directories this run emptied — and only those.
+
+    It used to remove EVERY empty directory under the source. On a dump that
+    also holds the operator's own folders, that quietly deleted them: a test
+    with `my-notes/`, `to-sort-later/` and `keep/nested/` beside one book lost
+    all four, none of which the tool had touched. An empty directory the tool
+    did not empty is not litter — it is someone's filing, and a directory tree
+    carries intent that cannot be recovered from a backup nobody took.
+
+    A directory qualifies if the plan took a file out of it, or if it is an
+    ancestor of such a directory (a book folder whose CD1/CD2 children were
+    emptied should go with them). Bottom-up, so children clear before parents.
+    """
+    # Ancestors of an emptied directory, stopping at the root.
+    qualifying = set(emptied)
+    for d in emptied:
+        for parent in d.parents:
+            if parent == root or root not in parent.parents:
+                break
+            qualifying.add(parent)
+
+    for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
         current = Path(dirpath)
         if current in keep:
             continue
         if current.name.casefold() in SKIP_DIR_NAMES:
+            continue
+        if current not in qualifying:
             continue
         try:
             if not any(current.iterdir()):
@@ -1850,7 +1932,7 @@ def run(args: argparse.Namespace) -> int:
     # nothing was taken out of it to make it empty.
     if not args.copy:
         keep = {source, dest, trash}
-        remove_empty_dirs(source, keep)
+        remove_empty_dirs(source, keep, dirs_the_plan_empties(plan))
 
     print()
     print(f"Done. {len(plan.books)} books on the shelf.")
@@ -1961,6 +2043,56 @@ def self_test() -> int:
     assert len(plan.extracts) == 1, plan.extracts
     ebook_books = [b for b in plan.books if any(op.kind == "ebook" for op in b.tracks)]
     assert ebook_books, "expected at least one ebook book"
+
+    # ── the disc marker on the BOOK folder, not a child folder ─────────────
+    # "The Book CD1" / "The Book CD2" as siblings. Left unhandled the marker
+    # stays in the title, the halves never match on (author, title, year), and
+    # one audiobook lands in the library as two books.
+    sib = tmp / "siblings"
+    for disc in (1, 2):
+        for track in (1, 2):
+            touch(sib / f"Some Author - The Book (2001) CD{disc}" / f"{track:02d}.mp3", f"d{disc}-{track}")
+    sib_plan = build_plan(
+        source=sib,
+        dest=tmp / "sib-out",
+        trash=sib / "trash",
+        folder_format="year-title",
+        keep_names=False,
+        include_non_cover_images=False,
+        media_mode="audio",
+    )
+    assert len(sib_plan.books) == 1, [b.meta.title for b in sib_plan.books]
+    assert len(sib_plan.books[0].tracks) == 4, sib_plan.books[0].tracks
+    assert "CD" not in sib_plan.books[0].meta.title.upper(), sib_plan.books[0].meta.title
+    # Disc 1 before disc 2, or the audiobook plays out of order.
+    order = [op.src.parent.name for op in sib_plan.books[0].tracks]
+    assert order == sorted(order), order
+
+    # A title that merely ends in a number is not a disc marker.
+    assert trailing_disc("Apollo 13") is None
+    assert trailing_disc("Fahrenheit 451") is None
+
+    # ── pruning only removes what the run emptied ──────────────────────────
+    # Every empty directory under the source used to be deleted, including the
+    # operator's own filing. Losing a folder tree is not recoverable.
+    prune = tmp / "prune"
+    touch(prune / "Some Author - The Book (2001)" / "01.mp3")
+    for own in ("my-notes", "to-sort-later", "keep/nested"):
+        (prune / own).mkdir(parents=True, exist_ok=True)
+    prune_plan = build_plan(
+        source=prune,
+        dest=tmp / "prune-out",
+        trash=prune / "trash",
+        folder_format="year-title",
+        keep_names=False,
+        include_non_cover_images=False,
+        media_mode="audio",
+    )
+    emptied = dirs_the_plan_empties(prune_plan)
+    assert (prune / "Some Author - The Book (2001)") in emptied, emptied
+    for own in ("my-notes", "to-sort-later", "keep", "keep/nested"):
+        assert (prune / own) not in emptied, f"{own} is not the tool's to remove"
+
     print("self-test OK")
     shutil.rmtree(tmp, ignore_errors=True)
     return 0
