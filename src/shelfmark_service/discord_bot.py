@@ -209,6 +209,49 @@ def install_commands(bot: commands.Bot, api: ShelfmarkApi, allowed_roles: set[in
         except ServiceError:
             await interaction.followup.send("That job could not be loaded.", ephemeral=True)
 
+    @bot.tree.command(name="metadata-match", description="Queue an Audiobookshelf metadata match")
+    @app_commands.describe(item_id="Audiobookshelf library item ID", title="Optional title hint", author="Optional author hint")
+    async def metadata_match(interaction: discord.Interaction, item_id: str, title: str | None = None, author: str | None = None) -> None:
+        if not await guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        payload: dict[str, Any] = {}
+        if title:
+            payload["title"] = title
+        if author:
+            payload["author"] = author
+        try:
+            result = await api.post(
+                f"/api/v1/items/{item_id}/match",
+                json_body=payload,
+                actor=_actor(interaction),
+            )
+            await interaction.followup.send(
+                f"Queued metadata match job **{result.get('id', 'unknown')}**.",
+                ephemeral=True,
+            )
+        except ServiceError:
+            await interaction.followup.send("The metadata match job could not be queued.", ephemeral=True)
+
+    @bot.tree.command(name="scan", description="Queue an Audiobookshelf library scan")
+    @app_commands.describe(library_id="Audiobookshelf library ID", force="Force a full rescan")
+    async def scan(interaction: discord.Interaction, library_id: str, force: bool = False) -> None:
+        if not await guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await api.post(
+                f"/api/v1/libraries/{library_id}/scan",
+                json_body={"force": force},
+                actor=_actor(interaction),
+            )
+            await interaction.followup.send(
+                f"Queued library scan job **{result.get('id', 'unknown')}**.",
+                ephemeral=True,
+            )
+        except ServiceError:
+            await interaction.followup.send("The library scan job could not be queued.", ephemeral=True)
+
     @bot.tree.command(name="organize-preview", description="Preview organizing an incoming folder")
     @app_commands.describe(source="Absolute path mounted in the worker", destination="Optional destination root")
     async def organize_preview(interaction: discord.Interaction, source: str, destination: str | None = None) -> None:

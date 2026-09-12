@@ -24,7 +24,14 @@ database = Database(settings.database_path)
 
 
 class JobRequest(BaseModel):
-    kind: Literal["organize_preview", "organize_apply", "grab_release"]
+    kind: Literal[
+        "organize_preview",
+        "organize_apply",
+        "grab_release",
+        "metadata_update",
+        "metadata_match",
+        "library_scan",
+    ]
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -35,6 +42,23 @@ class ReleaseGrabRequest(BaseModel):
 class TransferRequest(BaseModel):
     remote_path: str = Field(min_length=1, max_length=500)
     local_path: str | None = Field(default=None, max_length=500)
+
+
+class MetadataUpdateRequest(BaseModel):
+    media: dict[str, Any]
+
+
+class MetadataMatchRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=300)
+    author: str | None = Field(default=None, max_length=300)
+    provider: str | None = Field(default=None, max_length=80)
+    isbn: str | None = Field(default=None, max_length=40)
+    asin: str | None = Field(default=None, max_length=40)
+    override_defaults: bool = False
+
+
+class LibraryScanRequest(BaseModel):
+    force: bool = False
 
 
 def _job_response(job: Job) -> dict[str, Any]:
@@ -156,6 +180,47 @@ def library_item(item_id: str, _actor: str = Depends(_actor)) -> Any:
         return _abs_client().get_item(item_id, expanded=True)
     except ServiceError as exc:
         raise _upstream_error(exc) from exc
+
+
+@app.patch("/api/v1/items/{item_id}/media", status_code=status.HTTP_202_ACCEPTED)
+def update_metadata(
+    item_id: str, request: MetadataUpdateRequest, actor: str = Depends(_actor)
+) -> dict[str, Any]:
+    if not settings.audiobookshelf_url or not settings.audiobookshelf_token:
+        raise HTTPException(status_code=503, detail="Audiobookshelf integration is not configured")
+    return _job_response(
+        database.enqueue(
+            "metadata_update",
+            {"item_id": item_id, "media": request.media},
+            actor=actor,
+        )
+    )
+
+
+@app.post("/api/v1/items/{item_id}/match", status_code=status.HTTP_202_ACCEPTED)
+def match_metadata(
+    item_id: str, request: MetadataMatchRequest, actor: str = Depends(_actor)
+) -> dict[str, Any]:
+    if not settings.audiobookshelf_url or not settings.audiobookshelf_token:
+        raise HTTPException(status_code=503, detail="Audiobookshelf integration is not configured")
+    payload = request.model_dump(exclude_none=True)
+    payload["item_id"] = item_id
+    return _job_response(database.enqueue("metadata_match", payload, actor=actor))
+
+
+@app.post("/api/v1/libraries/{library_id}/scan", status_code=status.HTTP_202_ACCEPTED)
+def scan_library(
+    library_id: str, request: LibraryScanRequest, actor: str = Depends(_actor)
+) -> dict[str, Any]:
+    if not settings.audiobookshelf_url or not settings.audiobookshelf_token:
+        raise HTTPException(status_code=503, detail="Audiobookshelf integration is not configured")
+    return _job_response(
+        database.enqueue(
+            "library_scan",
+            {"library_id": library_id, "force": request.force},
+            actor=actor,
+        )
+    )
 
 
 @app.get("/api/v1/releases/search")

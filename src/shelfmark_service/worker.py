@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .clients import ProwlarrClient
+from .clients import AudiobookshelfClient, ProwlarrClient
 from .config import Settings
 from .db import Database, Job
 from .transfer import RsyncTransfer, wait_until_stable
@@ -82,6 +82,47 @@ class Worker:
         return True
 
     def execute(self, job: Job) -> dict[str, Any]:
+        if job.kind in {"metadata_update", "metadata_match", "library_scan"}:
+            if not self.settings.audiobookshelf_url or not self.settings.audiobookshelf_token:
+                raise ValueError("Audiobookshelf integration is not configured")
+            client = AudiobookshelfClient(
+                self.settings.audiobookshelf_url,
+                self.settings.audiobookshelf_token,
+                timeout=self.settings.http_timeout,
+                retries=self.settings.http_retries,
+            )
+            if job.kind == "metadata_update":
+                item_id = str(job.payload.get("item_id", ""))
+                media = job.payload.get("media")
+                if not item_id or not isinstance(media, dict):
+                    raise ValueError("metadata_update requires item_id and media")
+                return {"item_id": item_id, "upstream": client.update_media(item_id, media), "updated": True}
+            if job.kind == "metadata_match":
+                item_id = str(job.payload.get("item_id", ""))
+                if not item_id:
+                    raise ValueError("metadata_match requires item_id")
+                fields = {
+                    key: job.payload.get(key)
+                    for key in ("title", "author", "provider", "isbn", "asin")
+                    if job.payload.get(key)
+                }
+                return {
+                    "item_id": item_id,
+                    "upstream": client.match(
+                        item_id,
+                        **fields,
+                        override_defaults=bool(job.payload.get("override_defaults", False)),
+                    ),
+                    "matched": True,
+                }
+            library_id = str(job.payload.get("library_id", ""))
+            if not library_id:
+                raise ValueError("library_scan requires library_id")
+            return {
+                "library_id": library_id,
+                "upstream": client.scan(library_id, force=bool(job.payload.get("force", False))),
+                "scan_started": True,
+            }
         if job.kind == "transfer_completed":
             if not self.settings.sullivan_host or not self.settings.sullivan_user:
                 raise ValueError("Sullivan transfer is not configured")
