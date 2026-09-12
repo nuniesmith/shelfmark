@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bindery — create a venv, install deps, run src/main.py
+# Shelfmark — create a venv, install deps, run src/main.py
 # Usage:
 #   ./run.sh "/path/to/dump" --dry-run
 #   ./run.sh "/path/to/dump" --dest "/path/to/Audiobooks" --apply
@@ -35,7 +35,7 @@ else
   echo "Could not find the virtualenv Python at $VENV" >&2
   exit 1
 fi
-STAMP="$VENV/.bindery-installed"
+STAMP="$VENV/.shelfmark-installed"
 REQ="$ROOT/requirements.txt"
 if [ ! -f "$STAMP" ] || [ "$REQ" -nt "$STAMP" ]; then
   echo "Installing requirements…"

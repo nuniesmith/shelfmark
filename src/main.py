@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bindery — organize messy audiobook and ebook dumps.
+"""Shelfmark — organize messy audiobook and ebook dumps.
 
 Audiobook layout (Audiobookshelf-friendly):
 
@@ -66,7 +66,11 @@ JUNK_NAMES = {
     "albumartsmall.jpg", "albumart_{small}.jpg",
 }
 SKIP_DIR_NAMES = {
-    "trash", "_trash", ".trash", ".bindery-work", "__macosx",
+    # ".bindery-work" is this tool's former name. Keep it: a library organised
+    # before the rename still has those directories, and dropping the entry
+    # would make the tool start descending into working folders it created and
+    # promised to skip.
+    "trash", "_trash", ".trash", ".shelfmark-work", ".bindery-work", "__macosx",
     ".git", "@eadir", ".spotlight-v100", ".trashes",
 }
 DISC_RE = re.compile(
@@ -2040,7 +2044,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def self_test() -> int:
-    tmp = Path(tempfile.mkdtemp(prefix="bindery-test-"))
+    tmp = Path(tempfile.mkdtemp(prefix="shelfmark-test-"))
     dump = tmp / "dump"
     dest = tmp / "library"
     dump.mkdir()

@@ -1,6 +1,15 @@
-# Bindery
+# Shelfmark
 
-Organize messy **audiobook** and **ebook** dumps into a clean Author / Year - Title layout for [Audiobookshelf](https://www.audiobookshelf.org/) (audio) or a simple ebook library.
+A shelfmark is the code a library puts on a book to say where it belongs on the
+shelf. This tool assigns one to every book in a messy dump: it reads author,
+title and year out of whatever the folder happens to be called, and files the
+result as `Author / Year - Title /` for
+[Audiobookshelf](https://www.audiobookshelf.org/) or a plain ebook library.
+
+It also repairs libraries Audiobookshelf has *already* scanned and got wrong,
+which is a different problem and needs a different tool — see
+[Repairing a library](#repairing-a-library-audiobookshelf-has-already-scanned)
+below.
 
 ## Layout
 
@@ -187,12 +196,17 @@ Edit `src/main.py`:
 ```text
 run.sh              # venv + deps + entrypoint
 requirements.txt    # optional: rarfile, mutagen
-src/main.py         # organizer
+src/main.py         # organizer — assigns the shelfmark
 src/fix_metadata.py # repair Audiobookshelf's metadata.json in place
+LICENSE             # MIT
 README.md
 .gitignore
 ```
 
+Previously `src/utils/books` in
+[nuniesmith/scripts](https://github.com/nuniesmith/scripts); the commit history
+moved with it.
+
 ## License
 
-Use and modify freely for personal library management.
+[MIT](LICENSE). © nuniesmith 2026.

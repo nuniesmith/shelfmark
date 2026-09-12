@@ -1,0 +1,10 @@
+# run.sh builds its virtualenv here
+.venv/
+venv/
+
+# Bytecode / cache
+__pycache__/
+*.py[cod]
+
+# Nothing this tool writes belongs in the repo
+*.bak
