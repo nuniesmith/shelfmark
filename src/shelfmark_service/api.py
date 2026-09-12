@@ -14,7 +14,7 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
-from .clients import AudiobookshelfClient, ProwlarrClient, ServiceError
+from .clients import AudiobookshelfClient, ProwlarrClient, QBittorrentClient, ServiceError
 from .config import Settings
 from .db import Database, Job
 
@@ -115,6 +115,23 @@ def _prowlarr_client() -> ProwlarrClient:
     return ProwlarrClient(
         settings.prowlarr_url,
         settings.prowlarr_api_key,
+        timeout=settings.http_timeout,
+        retries=settings.http_retries,
+    )
+
+
+def _qbittorrent_client() -> QBittorrentClient:
+    if not settings.qbittorrent_url:
+        raise HTTPException(status_code=503, detail="qBittorrent integration is not configured")
+    if not settings.qbittorrent_api_key and not (
+        settings.qbittorrent_username and settings.qbittorrent_password
+    ):
+        raise HTTPException(status_code=503, detail="qBittorrent credentials are not configured")
+    return QBittorrentClient(
+        settings.qbittorrent_url,
+        username=settings.qbittorrent_username,
+        password=settings.qbittorrent_password,
+        api_key=settings.qbittorrent_api_key,
         timeout=settings.http_timeout,
         retries=settings.http_retries,
     )
@@ -237,6 +254,19 @@ def release_search(
                 q, search_type=search_type, limit=limit, offset=offset
             )
         }
+    except ServiceError as exc:
+        raise _upstream_error(exc) from exc
+
+
+@app.get("/api/v1/downloads")
+def downloads(
+    category: str = Query(default="shelfmark-books", min_length=1, max_length=100),
+    _actor: str = Depends(_actor),
+) -> dict[str, Any]:
+    client = _qbittorrent_client()
+    try:
+        client.login()
+        return {"downloads": client.torrents(category=category)}
     except ServiceError as exc:
         raise _upstream_error(exc) from exc
 

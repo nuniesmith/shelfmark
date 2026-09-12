@@ -407,6 +407,7 @@ GET  /readyz
 - [x] Add restricted rsync pull and local stable-file detection for Sullivan transfers.
 - [x] Add initial Discord slash-command adapter with deferred responses and release-grab buttons.
 - [x] Add Discord metadata-match and library-scan job commands.
+- [x] Add qBittorrent Shelfmark-category status to the API and Discord adapter.
 - [ ] Implement SSH/rsync transfer client.
 - [ ] Implement stable-file detection.
 - [ ] Implement checksum verification.

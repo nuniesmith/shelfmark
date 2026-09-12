@@ -67,7 +67,7 @@ def _result_list(payload: Any) -> list[dict[str, Any]]:
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
         return []
-    for key in ("results", "book", "podcast", "items"):
+    for key in ("results", "book", "podcast", "items", "downloads"):
         value = payload.get(key)
         if isinstance(value, list):
             # Audiobookshelf search wraps each result in a libraryItem object.
@@ -192,6 +192,28 @@ def install_commands(bot: commands.Bot, api: ShelfmarkApi, allowed_roles: set[in
             )
         except ServiceError:
             await interaction.followup.send("Prowlarr search is unavailable.", ephemeral=True)
+
+    @bot.tree.command(name="downloads", description="Show Shelfmark downloads in qBittorrent")
+    async def downloads(interaction: discord.Interaction) -> None:
+        if not await guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            payload = await api.get("/api/v1/downloads", actor=_actor(interaction))
+            results = _result_list(payload)[:10]
+            if not results:
+                await interaction.followup.send("No Shelfmark downloads are active.", ephemeral=True)
+                return
+            lines = []
+            for item in results:
+                name = str(item.get("name") or item.get("hash") or "unknown")
+                progress = item.get("progress")
+                state = str(item.get("state") or "unknown")
+                progress_text = f"{float(progress) * 100:.1f}%" if isinstance(progress, (int, float)) else "?"
+                lines.append(f"• **{name[:80]}** — {progress_text} — `{state}`")
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+        except ServiceError:
+            await interaction.followup.send("qBittorrent download status is unavailable.", ephemeral=True)
 
     @bot.tree.command(name="job", description="Show a Shelfmark job")
     @app_commands.describe(job_id="UUID returned when the job was queued")
