@@ -373,6 +373,7 @@ Acceptance criteria:
 - [x] Add SQLite schema, migrations, and WAL mode.
 - [x] Add the database-backed worker queue.
 - [x] Add health/readiness endpoints and worker heartbeat.
+- [x] Requeue jobs abandoned by a stale worker heartbeat.
 - [ ] Add structured logs, correlation IDs, and redaction.
 - [ ] Add API authentication and role checks.
 - [x] Add the audit log.

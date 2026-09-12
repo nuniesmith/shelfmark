@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -319,3 +319,36 @@ class Database:
                 "SELECT cancel_requested FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
         return bool(row["cancel_requested"]) if row else False
+
+    def requeue_stale(self, stale_after_seconds: float = 900.0, actor: str = "reaper") -> int:
+        """Return abandoned running jobs to the queue after a worker crash."""
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=max(1.0, stale_after_seconds))
+        ).isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                "SELECT id FROM jobs WHERE status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < ?)",
+                (cutoff,),
+            ).fetchall()
+            if not rows:
+                return 0
+            now = utc_now()
+            conn.execute(
+                """
+                UPDATE jobs
+                   SET status = 'queued', worker_id = NULL, heartbeat_at = NULL,
+                       error = 'requeued after stale worker heartbeat'
+                 WHERE status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+                """,
+                (cutoff,),
+            )
+            for row in rows:
+                self._audit(
+                    conn,
+                    actor=actor,
+                    action="job.requeued",
+                    target_type="job",
+                    target_id=row["id"],
+                    details={"requeued_at": now},
+                )
+            return len(rows)

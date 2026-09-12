@@ -60,6 +60,7 @@ class Settings:
     transfer_settle_seconds: float = 30.0
     transfer_poll_seconds: float = 5.0
     transfer_timeout_seconds: float = 3600.0
+    worker_stale_seconds: float = 900.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -94,6 +95,7 @@ class Settings:
             transfer_settle_seconds=_float_from_env("SHELFMARK_TRANSFER_SETTLE_SECONDS", 30.0),
             transfer_poll_seconds=_float_from_env("SHELFMARK_TRANSFER_POLL_SECONDS", 5.0),
             transfer_timeout_seconds=_float_from_env("SHELFMARK_TRANSFER_TIMEOUT_SECONDS", 3600.0),
+            worker_stale_seconds=_float_from_env("SHELFMARK_WORKER_STALE_SECONDS", 900.0),
         )
 
     def configured_roots(self) -> dict[str, Path]:

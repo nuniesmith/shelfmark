@@ -170,6 +170,7 @@ def main() -> None:
     settings = Settings.from_env()
     database = Database(settings.database_path)
     database.initialize()
+    database.requeue_stale(settings.worker_stale_seconds, actor=settings.worker_id)
     worker = Worker(database, settings)
     stopping = False
 
@@ -180,6 +181,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     while not stopping:
+        database.requeue_stale(settings.worker_stale_seconds, actor=settings.worker_id)
         if not worker.run_once():
             time.sleep(settings.poll_interval)
 

@@ -59,6 +59,22 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(self.database.cancel_running(running_job.id, "worker-a"))
         self.assertEqual(self.database.get_job(running_job.id).status, "cancelled")  # type: ignore[union-attr]
 
+    def test_stale_running_job_is_requeued(self) -> None:
+        job = self.database.enqueue("organize_preview", {"source": "/incoming"})
+        claimed = self.database.claim_next("worker-a")
+        self.assertIsNotNone(claimed)
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET heartbeat_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                (job.id,),
+            )
+        self.assertEqual(self.database.requeue_stale(60, actor="reaper"), 1)
+        requeued = self.database.get_job(job.id)
+        self.assertIsNotNone(requeued)
+        assert requeued is not None
+        self.assertEqual(requeued.status, "queued")
+        self.assertIsNone(requeued.worker_id)
+
 
 if __name__ == "__main__":
     unittest.main()
