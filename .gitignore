@@ -8,3 +8,6 @@ __pycache__/
 
 # Nothing this tool writes belongs in the repo
 *.bak
+
+freddy.docker-compose.yml
+sullivan.docker-compose.yml
