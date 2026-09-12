@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 import signal
 import time
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any
 from .clients import ProwlarrClient
 from .config import Settings
 from .db import Database, Job
+from .transfer import RsyncTransfer, wait_until_stable
 
 logger = logging.getLogger("shelfmark.worker")
 
@@ -80,6 +82,38 @@ class Worker:
         return True
 
     def execute(self, job: Job) -> dict[str, Any]:
+        if job.kind == "transfer_completed":
+            if not self.settings.sullivan_host or not self.settings.sullivan_user:
+                raise ValueError("Sullivan transfer is not configured")
+            raw_remote = str(job.payload.get("remote_path", "")).strip()
+            if not raw_remote:
+                raise ValueError("job payload requires remote_path")
+            base_remote = posixpath.normpath(self.settings.sullivan_completed_root)
+            remote = posixpath.normpath(
+                raw_remote if raw_remote.startswith("/") else posixpath.join(base_remote, raw_remote)
+            )
+            if remote != base_remote and not remote.startswith(base_remote.rstrip("/") + "/"):
+                raise ValueError("remote_path must stay within Sullivan's Shelfmark category")
+            local_root = self.settings.incoming_root or Path("/incoming")
+            local = _path(job.payload, "local_path", local_root)
+            if local != local_root and local_root not in local.parents:
+                raise ValueError("local_path must stay within the configured incoming root")
+            transfer = RsyncTransfer(
+                host=self.settings.sullivan_host,
+                user=self.settings.sullivan_user,
+                identity_file=self.settings.sullivan_identity_file,
+                port=self.settings.sullivan_ssh_port,
+                timeout_seconds=self.settings.http_timeout,
+                retries=self.settings.http_retries,
+            )
+            transfer.pull(remote, local)
+            snapshot = wait_until_stable(
+                local,
+                settle_seconds=self.settings.transfer_settle_seconds,
+                poll_seconds=self.settings.transfer_poll_seconds,
+                timeout_seconds=self.settings.transfer_timeout_seconds,
+            )
+            return {"remote_path": remote, "local_path": str(local), "files": len(snapshot)}
         if job.kind == "grab_release":
             if not self.settings.prowlarr_url or not self.settings.prowlarr_api_key:
                 raise ValueError("Prowlarr integration is not configured")

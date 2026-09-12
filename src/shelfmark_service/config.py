@@ -52,6 +52,14 @@ class Settings:
     qbittorrent_username: str | None = None
     qbittorrent_password: str | None = None
     qbittorrent_api_key: str | None = None
+    sullivan_host: str | None = None
+    sullivan_user: str | None = None
+    sullivan_identity_file: Path | None = None
+    sullivan_ssh_port: int = 22
+    sullivan_completed_root: str = "/complete/shelfmark-books"
+    transfer_settle_seconds: float = 30.0
+    transfer_poll_seconds: float = 5.0
+    transfer_timeout_seconds: float = 3600.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -76,6 +84,16 @@ class Settings:
             qbittorrent_username=os.environ.get("QBITTORRENT_USERNAME") or None,
             qbittorrent_password=os.environ.get("QBITTORRENT_PASSWORD") or None,
             qbittorrent_api_key=os.environ.get("QBITTORRENT_API_KEY") or None,
+            sullivan_host=os.environ.get("SULLIVAN_SSH_HOST") or None,
+            sullivan_user=os.environ.get("SULLIVAN_SSH_USER") or None,
+            sullivan_identity_file=_path_from_env("SULLIVAN_SSH_IDENTITY_FILE"),
+            sullivan_ssh_port=int(os.environ.get("SULLIVAN_SSH_PORT", "22")),
+            sullivan_completed_root=os.environ.get(
+                "SULLIVAN_COMPLETED_ROOT", "/complete/shelfmark-books"
+            ),
+            transfer_settle_seconds=_float_from_env("SHELFMARK_TRANSFER_SETTLE_SECONDS", 30.0),
+            transfer_poll_seconds=_float_from_env("SHELFMARK_TRANSFER_POLL_SECONDS", 5.0),
+            transfer_timeout_seconds=_float_from_env("SHELFMARK_TRANSFER_TIMEOUT_SECONDS", 3600.0),
         )
 
     def configured_roots(self) -> dict[str, Path]:

@@ -403,6 +403,7 @@ GET  /readyz
 - [x] Implement Prowlarr search and grab client transport wrapper.
 - [x] Implement qBittorrent status and lifecycle client transport wrapper.
 - [x] Expose authenticated library/release search and asynchronous release-grab API routes.
+- [x] Add restricted rsync pull and local stable-file detection for Sullivan transfers.
 - [x] Add initial Discord slash-command adapter with deferred responses and release-grab buttons.
 - [ ] Implement SSH/rsync transfer client.
 - [ ] Implement stable-file detection.

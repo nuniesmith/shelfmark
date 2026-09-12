@@ -32,6 +32,11 @@ class ReleaseGrabRequest(BaseModel):
     release: dict[str, Any]
 
 
+class TransferRequest(BaseModel):
+    remote_path: str = Field(min_length=1, max_length=500)
+    local_path: str | None = Field(default=None, max_length=500)
+
+
 def _job_response(job: Job) -> dict[str, Any]:
     return {
         "id": job.id,
@@ -176,6 +181,16 @@ def grab_release(request: ReleaseGrabRequest, actor: str = Depends(_actor)) -> d
     if not settings.prowlarr_url or not settings.prowlarr_api_key:
         raise HTTPException(status_code=503, detail="Prowlarr integration is not configured")
     return _job_response(database.enqueue("grab_release", {"release": request.release}, actor=actor))
+
+
+@app.post("/api/v1/transfers/pull", status_code=status.HTTP_202_ACCEPTED)
+def pull_transfer(request: TransferRequest, actor: str = Depends(_actor)) -> dict[str, Any]:
+    if not settings.sullivan_host or not settings.sullivan_user:
+        raise HTTPException(status_code=503, detail="Sullivan transfer is not configured")
+    payload = {"remote_path": request.remote_path}
+    if request.local_path:
+        payload["local_path"] = request.local_path
+    return _job_response(database.enqueue("transfer_completed", payload, actor=actor))
 
 
 @app.get("/api/v1/jobs")
