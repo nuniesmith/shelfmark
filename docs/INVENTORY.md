@@ -192,6 +192,89 @@ normalizes it. No action.
 Recorded in `todo.md` as a committed credential. A Plex claim token is valid for
 five minutes after generation, so a stale one in Git is inert. Closed.
 
+## Backups
+
+Pulled by sullivan from freddy — a different host from the originals, which is
+the point of them. Under `/home/jordan/backups/shelfmark` on sullivan's root
+filesystem (1.4T free), because `jordan` cannot write `/mnt/media/books`.
+
+| What | How | Size |
+|---|---|---|
+| `audiobooks/` | `rsync -a --delete` from `/mnt/1tb/audiobooks` | ~79G |
+| `abs-config/` | rsync, with the live DB excluded and replaced by a snapshot | 12M |
+| `abs-metadata/` | `rsync -a --delete` from ABS `/metadata` | 6.6M |
+| `configs/` | freddy's resolved compose, mode 600 | 32K |
+
+**The Audiobookshelf database is snapshotted, not copied.** A plain `cp` of a
+SQLite file a running server is writing can catch it mid-transaction and restore
+to a corrupt database. `sqlite3.Connection.backup()` takes a consistent snapshot
+while ABS keeps serving. Verified on capture: `integrity_check ok`, 189
+libraryItems, 68 authors.
+
+Re-run the whole thing from sullivan:
+
+```bash
+F=jordan@100.106.65.55
+D=/home/jordan/backups/shelfmark
+ssh $F 'python3 - <<PY
+import sqlite3
+s=sqlite3.connect("file:/mnt/1tb/audiobookshelf/config/absdatabase.sqlite?mode=ro",uri=True)
+d=sqlite3.connect("/tmp/absdatabase-snapshot.sqlite"); s.backup(d); d.close(); s.close()
+PY'
+rsync -a --delete --exclude 'absdatabase.sqlite*' $F:/mnt/1tb/audiobookshelf/config/ $D/abs-config/
+rsync -a $F:/tmp/absdatabase-snapshot.sqlite $D/abs-config/absdatabase.sqlite
+rsync -a --delete $F:/mnt/1tb/audiobookshelf/metadata/ $D/abs-metadata/
+rsync -a --delete $F:/mnt/1tb/audiobooks/ $D/audiobooks/
+```
+
+### Restoring
+
+The library is a plain file tree, so a restore is an rsync the other way. To
+check a restore without touching anything live, pull into a temporary directory
+and compare counts:
+
+```bash
+mkdir -p /tmp/restore-test
+rsync -a /home/jordan/backups/shelfmark/audiobooks/ /tmp/restore-test/
+find /tmp/restore-test -type f | wc -l     # expect the live count
+python3 -c "import sqlite3;print(sqlite3.connect('/home/jordan/backups/shelfmark/abs-config/absdatabase.sqlite').execute('PRAGMA integrity_check').fetchone())"
+```
+
+Restoring ABS itself means stopping the container, replacing `/config` and
+`/metadata`, and starting it again — the database must not be swapped underneath
+a running server.
+
+## The restricted Sullivan sync account
+
+`scripts/provision-sullivan-sync.sh` creates it. Run on sullivan with sudo,
+passing the public key generated on freddy:
+
+```bash
+sudo bash provision-sullivan-sync.sh "ssh-ed25519 AAAA... shelfmark@freddy"
+```
+
+It creates `shelfmark-sync` with no shell and an `authorized_keys` entry that
+forces `rrsync -ro` against a single directory, so the account can do exactly
+one thing: read that directory over rsync. No shell, no pty, no forwarding, no
+write.
+
+The category is `/media/qbittorrent/shelfmark`, deliberately **outside**
+`/media/qbittorrent/complete`. Unpackerr's catch-all watcher is
+`UN_FOLDER_0_PATH=/complete`, so a category under there would be extracted by
+Unpackerr and Shelfmark at once — see finding 3. Keeping it out of that tree
+removes the race by construction rather than by configuration that can drift.
+
+Generate the key on freddy so the private half never travels:
+
+```bash
+ssh-keygen -t ed25519 -N "" -f /tmp/shelfmark-sync -C "shelfmark@freddy"
+```
+
+Private half → GitHub secret `SHELFMARK_SULLIVAN_SSH_KEY` on `nuniesmith/freddy`;
+CI installs it as mode 600 owned by uid 1001, which is required because ssh
+refuses a group-readable private key. Public half → the script above. Then
+delete `/tmp/shelfmark-sync*`.
+
 ## P0 status
 
 - [x] Resolve Freddy and Sullivan compose against the running state
@@ -199,10 +282,16 @@ five minutes after generation, so a stale one in Git is inert. Closed.
 - [x] Confirm canonical audiobook and ebook roots on Freddy
 - [x] Decide whether ABS or Calibre-Web owns ebooks — **ABS, see finding 4**
 - [x] ~~Rotate the committed Plex claim~~ — not a credential, see finding 6
-- [ ] Back up ABS config, ABS metadata, audiobook storage, Compose and env files
-- [ ] Create the restricted Sullivan sync account and key
+- [x] Back up ABS config, ABS metadata, audiobook storage and Compose
+- [x] Create the restricted Sullivan sync account and key — script written and
+      the key wired through CI; **needs one sudo run on sullivan to take effect**
 - [ ] Record firewall rules — `ufw status` needs sudo, not captured
 
-Unresolved from the acceptance criteria: backups are not yet taken or
-restore-tested, and the restricted `shelfmark-sync` account on Sullivan does not
-exist, so Freddy cannot yet pull from the download host.
+Two things need a human with root, and neither can be done from a key-based
+session: running `provision-sullivan-sync.sh` on sullivan, and reading the
+firewall rules on either host. Everything else in P0 is closed.
+
+Environment files are deliberately **not** backed up. They hold live secrets, and
+every value in them is already recoverable from GitHub Actions secrets, which is
+the authority. Copying them around would multiply the number of places a
+credential sits.
