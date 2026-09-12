@@ -30,6 +30,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import filecmp
 import os
 import re
 import shutil
@@ -56,6 +57,17 @@ ARCHIVE_EXT = {".zip", ".rar", ".7z", ".tar", ".tgz", ".gz"}
 COVER_STEMS = {"cover", "folder", "poster", "front", "albumart", "album"}
 COVER_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 KEEP_TEXT = {"desc.txt", "reader.txt"}
+# Audiobookshelf, Calibre, and common ebook tools write these beside media.
+# They are metadata, not disposable release clutter. Keep them when scanning a
+# library that has already been managed by another application.
+PRESERVE_SIDECAR_NAMES = {
+    "metadata.json",
+    "metadata.opf",
+    "content.opf",
+    "book.opf",
+    "calibre.metadata",
+    "metadata.db",
+}
 TRASH_EXT = {
     ".nfo", ".sfv", ".md5", ".url", ".torrent", ".m3u", ".m3u8", ".pls",
     ".html", ".htm", ".log", ".cue", ".txt", ".ini", ".db", ".ds_store",
@@ -1323,12 +1335,19 @@ def extract_archive(path: Path) -> Path:
 
 
 def multipart_key(path: Path) -> tuple[str, int] | None:
+    # The same release name can occur in multiple download folders. The parent
+    # directory is part of the identity so volumes from unrelated sets cannot
+    # be merged or sent to one another's trash.
+    parent = str(path.parent.resolve()).casefold()
     m = PART_RE.match(path.name)
     if m:
-        return (f"{m.group('base').casefold()}|{m.group('ext').casefold()}", int(m.group("num")))
+        return (
+            f"{parent}|{m.group('base').casefold()}|{m.group('ext').casefold()}",
+            int(m.group("num")),
+        )
     m = RVOL_RE.match(path.name)
     if m:
-        return (f"{m.group('base').casefold()}|rar", int(m.group("num")))
+        return (f"{parent}|{m.group('base').casefold()}|rar", int(m.group("num")))
     return None
 
 
@@ -1426,14 +1445,25 @@ def collect_sidecars(book_dir: Path, tracks: list[Path], source: Path) -> list[P
 
 
 def merge_duplicate_books(books: list[BookPlan], source: Path, keep_names: bool) -> list[BookPlan]:
-    """Combine books that resolved to the same Author/Title/Year (e.g. Disc 1..N of 1984)."""
-    buckets: dict[tuple[str, str, str], BookPlan] = {}
-    order: list[tuple[str, str, str]] = []
+    """Combine only compatible books (for example Disc 1..N of one audiobook)."""
+    buckets: dict[tuple[str, str, str, str, str], BookPlan] = {}
+    order: list[tuple[str, str, str, str, str]] = []
+
+    def media_kind(book: BookPlan) -> str:
+        kinds = {op.kind for op in book.tracks}
+        if kinds == {"ebook"}:
+            return "ebook"
+        if kinds == {"track"}:
+            return "audio"
+        return "mixed"
+
     for book in books:
         key = (
             book.meta.author.casefold().strip(),
             book.meta.title.casefold().strip(),
             (book.meta.year or "").strip(),
+            (book.meta.narrator or "").casefold().strip(),
+            media_kind(book),
         )
         if key not in buckets:
             buckets[key] = book
@@ -1451,8 +1481,10 @@ def merge_duplicate_books(books: list[BookPlan], source: Path, keep_names: bool)
     merged: list[BookPlan] = []
     for key in order:
         book = buckets[key]
-        # Re-sort and renumber continuously (preserve ebook vs audio)
-        is_ebook_book = any(op.kind == "ebook" for op in book.tracks)
+        # Re-sort and renumber continuously. Media type is part of the merge
+        # key, so an audiobook and ebook with the same metadata never become one
+        # set of ebook operations.
+        is_ebook_book = media_kind(book) == "ebook"
         srcs = [op.src for op in book.tracks]
         if is_ebook_book:
             srcs = sorted(set(srcs), key=lambda path: (
@@ -1463,12 +1495,36 @@ def merge_duplicate_books(books: list[BookPlan], source: Path, keep_names: bool)
                 FileOp(src, book.dest_dir / ebook_dest_name(src, book.meta), "ebook")
                 for src in srcs
             ]
-        else:
+        elif media_kind(book) == "audio":
             srcs = sorted(set(srcs), key=lambda path: track_sort_key(path, source))
             width = pad_width(len(srcs))
             new_tracks = [
                 FileOp(src, book.dest_dir / track_filename(i, src, width, keep_names), "track")
                 for i, src in enumerate(srcs, start=1)
+            ]
+        else:
+            # Defensive handling for a manually constructed mixed plan. Keep
+            # ebook files as ebooks and renumber only audio tracks.
+            audio_srcs = sorted(
+                [op.src for op in book.tracks if op.kind == "track"],
+                key=lambda path: track_sort_key(path, source),
+            )
+            ebook_srcs = sorted(
+                [op.src for op in book.tracks if op.kind == "ebook"],
+                key=lambda path: (
+                    EBOOK_PREF.index(path.suffix.lower())
+                    if path.suffix.lower() in EBOOK_PREF
+                    else 99,
+                    natural_key(path.name),
+                ),
+            )
+            width = pad_width(len(audio_srcs))
+            new_tracks = [
+                FileOp(src, book.dest_dir / track_filename(i, src, width, keep_names), "track")
+                for i, src in enumerate(audio_srcs, start=1)
+            ] + [
+                FileOp(src, book.dest_dir / ebook_dest_name(src, book.meta), "ebook")
+                for src in ebook_srcs
             ]
         book.tracks = new_tracks
         # Dedupe covers/extras by dest name, prefer cover
@@ -1493,6 +1549,7 @@ def build_plan(
     keep_names: bool,
     include_non_cover_images: bool,
     media_mode: str = "auto",
+    trash_unknown: bool = False,
 ) -> Plan:
     plan = Plan()
     files = [p for p in iter_files(source, source, dest, trash) if p.is_file()]
@@ -1547,6 +1604,12 @@ def build_plan(
         sidecars = collect_sidecars(book_dir, media_files, source)
         cover = pick_cover(sidecars)
         for sc in sidecars:
+            name = sc.name.casefold()
+            if name in PRESERVE_SIDECAR_NAMES or sc.suffix.casefold() == ".opf":
+                bp.extras.append(
+                    FileOp(sc, bp.dest_dir / sanitize_component(sc.name), "metadata", "metadata")
+                )
+                continue
             if cover is not None and sc == cover:
                 ext = sc.suffix.lower()
                 if ext == ".jpeg":
@@ -1561,8 +1624,12 @@ def build_plan(
                     FileOp(sc, bp.dest_dir / sanitize_component(sc.name), "keep", "image")
                 )
                 continue
-            if is_junk_file(sc) or sc.suffix.lower() in COVER_EXT or not is_media(sc):
+            if is_junk_file(sc) or sc.suffix.lower() in COVER_EXT:
                 bp.extras.append(FileOp(sc, trash / sc.name, "trash", "junk"))
+            elif trash_unknown:
+                bp.extras.append(FileOp(sc, trash / sc.name, "trash", "unknown"))
+            else:
+                plan.warnings.append(f"Unassigned sidecar (skipped): {sc}")
 
     if do_audio:
         groups = group_audio(audio, source)
@@ -1645,8 +1712,10 @@ def build_plan(
             plan.trash.append(FileOp(f, trash / f.name, "trash", "unassigned junk"))
         elif f.suffix.lower() in AUDIO_EXT or f.suffix.lower() in EBOOK_EXT:
             plan.warnings.append(f"Unassigned media (skipped): {f}")
-        else:
+        elif trash_unknown:
             plan.trash.append(FileOp(f, trash / f.name, "trash", "unassigned"))
+        else:
+            plan.warnings.append(f"Unassigned file (skipped): {f}")
 
     plan.books = merge_duplicate_books(plan.books, source, keep_names)
     # Recompute dest_dir uniqueness after merge
@@ -1675,6 +1744,16 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def files_identical(src: Path, dest: Path) -> bool:
+    """Return True when two regular files have identical content."""
+    try:
+        if src.stat().st_size != dest.stat().st_size:
+            return False
+        return filecmp.cmp(src, dest, shallow=False)
+    except OSError:
+        return False
+
+
 def unique_file(path: Path) -> Path:
     if not path.exists():
         return path
@@ -1694,6 +1773,12 @@ def move_file(src: Path, dest: Path) -> None:
     if src.resolve() == dest.resolve():
         return
     ensure_parent(dest)
+    if dest.exists() and files_identical(src, dest):
+        # A previous attempt may have completed the destination before the
+        # process stopped. Preserve move semantics without manufacturing a
+        # duplicate destination on retry.
+        src.unlink()
+        return
     dest = unique_file(dest)
     shutil.move(str(src), str(dest))
 
@@ -1702,6 +1787,8 @@ def copy_file(src: Path, dest: Path) -> None:
     if not src.exists():
         return
     ensure_parent(dest)
+    if dest.exists() and files_identical(src, dest):
+        return
     dest = unique_file(dest)
     shutil.copy2(str(src), str(dest))
 
@@ -1817,12 +1904,6 @@ def apply_plan(plan: Plan, trash: Path, dry_run: bool, copy: bool) -> None:
         if dry_run or copy:
             continue
         transfer(op.src, unique_trash_path(trash, op.src.name))
-    if not dry_run and not copy:
-        for op in plan.extracts:
-            if op.src.exists():
-                move_file(op.src, unique_trash_path(trash, op.src.name))
-
-
 def rel(path: Path, root: Path) -> str:
     try:
         return str(path.relative_to(root))
@@ -1914,6 +1995,7 @@ def run(args: argparse.Namespace) -> int:
         keep_names=args.keep_names,
         include_non_cover_images=args.keep_images,
         media_mode=getattr(args, "media", "auto"),
+        trash_unknown=args.trash_unknown,
     )
     print_plan(plan, source, dest)
 
@@ -1950,6 +2032,9 @@ def run(args: argparse.Namespace) -> int:
         errors = apply_extracts(plan, trash=trash, dry_run=False, copy=args.copy)
         for err in errors:
             eprint(f"  extract failed: {err}")
+        if errors:
+            eprint("Extraction failed; no files were moved into the library.")
+            return 1
         print("Re-scanning after extract…")
         before = len(plan.books)
         plan = build_plan(
@@ -1960,6 +2045,7 @@ def run(args: argparse.Namespace) -> int:
             keep_names=args.keep_names,
             include_non_cover_images=args.keep_images,
             media_mode=getattr(args, "media", "auto"),
+            trash_unknown=args.trash_unknown,
         )
         print_plan(plan, source, dest)
 
@@ -2040,6 +2126,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--trash-name", default="trash", help='Trash folder name (default: "trash").')
     p.add_argument("--trash", help="Full path for junk. Defaults to <source>/<trash-name>.")
+    p.add_argument(
+        "--trash-unknown",
+        action="store_true",
+        help="Move unrecognized non-media files to trash (default: leave them for review).",
+    )
     return p
 
 

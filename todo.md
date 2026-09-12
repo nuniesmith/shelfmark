@@ -11,7 +11,25 @@ The recommended deployment is:
 - Discord handles requests and job control.
 - A thin web UI handles metadata review, dense release selection, and large downloads.
 
-No implementation changes have been made as part of the review. The existing self-test passes with Python 3.14.4. Docker Compose was not executed because Docker is not installed in the review environment.
+At review time, no implementation changes had been made. The existing
+self-test passed with Python 3.14.4. Docker Compose was not executed because
+Docker is not installed in the review environment.
+
+## Current progress
+
+The first implementation slice is complete: organizer safety fixes, regression
+coverage, Python packaging metadata, and a reproducible CLI container have been
+added. No live Freddy or Sullivan deployment has been changed yet.
+
+Validation run locally with Python 3.14.4:
+
+```text
+python3 -m unittest discover -s tests -v   # 6 tests passed
+python3 src/main.py --self-test             # self-test OK
+```
+
+The remaining service work still needs the API, persistent jobs, integration
+clients, Discord adapter, and staged deployment checks described below.
 
 ## Current repository
 
@@ -330,13 +348,13 @@ Acceptance criteria:
 
 - [ ] Extract parser, metadata, archive, planning, and file-operation code into importable modules.
 - [ ] Add the expanded identity model.
-- [ ] Preserve managed-library sidecars.
+- [x] Preserve managed-library sidecars.
 - [ ] Add isolated extraction and archive safety checks.
 - [ ] Add manifests, checksums, atomic writes, quarantine, and resume logic.
-- [ ] Make repeated imports idempotent.
+- [x] Make repeated imports idempotent for identical move/copy retries.
 - [ ] Add structured JSON output and stable error codes.
-- [ ] Add fixtures for mixed media, alternate narrators, duplicate multipart archives, broken archives, malicious paths, symlinks, and repeated copy runs.
-- [ ] Keep CLI compatibility.
+- [x] Add regression fixtures for mixed media, multipart isolation, broken archives, unknown files, and repeated copy runs.
+- [x] Keep CLI compatibility.
 
 Acceptance criteria:
 
@@ -347,8 +365,8 @@ Acceptance criteria:
 
 ### P2 — service foundation
 
-- [ ] Add `pyproject.toml` and pinned dependencies.
-- [ ] Add a Python 3.13 Dockerfile and `.dockerignore`.
+- [x] Add `pyproject.toml` and pinned dependencies.
+- [x] Add a Python 3.13 Dockerfile and `.dockerignore`.
 - [ ] Add FastAPI and Uvicorn.
 - [ ] Add SQLite schema, migrations, and WAL mode.
 - [ ] Add the database-backed worker queue.

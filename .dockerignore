@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.py[cod]
+*.bak
+*.db
+.env
+.env.*
+!.env.example
+freddy.docker-compose.yml
+sullivan.docker-compose.yml
+todo.md
+tests

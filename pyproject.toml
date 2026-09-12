@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shelfmark"
+version = "0.1.0"
+description = "Organize audiobook and ebook dumps for Audiobookshelf-compatible libraries"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.13"
+dependencies = [
+    "rarfile==4.2",
+    "mutagen==1.47.0",
+]
+
+[project.scripts]
+shelfmark = "main:main"
+shelfmark-fix-metadata = "fix_metadata:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["main", "fix_metadata"]

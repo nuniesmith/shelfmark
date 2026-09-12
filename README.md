@@ -34,9 +34,11 @@ Author Name/
 
 ## Requirements
 
-- Python 3.9+
-- Optional: `unrar` / `unar` / `7z` for RAR/7z archives
-- Optional Python packages (see `requirements.txt`): `rarfile`, `mutagen`
+- Python 3.13+
+- Optional: `unrar` / `unar` / `7z` for RAR/7z archives (the Docker image
+  includes `unrar-free` and 7-Zip)
+- Python packages installed by `run.sh` (see `requirements.txt`): `rarfile`,
+  `mutagen`
 
 ## Quick start
 
@@ -73,6 +75,33 @@ In-place reorganize (no separate dest):
 ./run.sh "/path/to/library" --format year-title --apply
 ```
 
+### Docker
+
+The image currently packages the safe CLI organizer. It is a useful staging
+container while the API, worker, and Discord services are being built.
+
+```bash
+docker build -t shelfmark:dev .
+
+# Preview a dump (read-only)
+docker run --rm \
+  -v "/path/to/messy/dump:/incoming:ro" \
+  shelfmark:dev /incoming --dry-run
+
+# Apply into separate audiobook and ebook roots
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v "/path/to/messy/dump:/incoming" \
+  -v "/mnt/1tb/audiobooks:/audiobooks" \
+  shelfmark:dev /incoming --dest /audiobooks --apply --yes
+```
+
+The container includes `unrar-free` and 7-Zip for archive formats. Bind mounts
+must be writable by the container user for an apply run. The eventual Freddy
+compose deployment will mount the canonical library, incoming, work,
+quarantine, and data directories separately and run the API/worker services
+with the matching host UID/GID.
+
 ## CLI options
 
 | Flag | Description |
@@ -88,6 +117,7 @@ In-place reorganize (no separate dest):
 | `--keep-images` | Keep all images, not only cover |
 | `--yes` / `-y` | Skip confirmation. Required when there is no terminal (a pipe, cron, a script) — without it, `--apply` refuses rather than guessing |
 | `--trash-name NAME` | Junk folder name under source (default: `trash`) |
+| `--trash-unknown` | Move unrecognized non-media files to trash (default is to leave them for review) |
 | `--self-test` | Run built-in smoke tests |
 
 ```bash
@@ -106,7 +136,8 @@ In-place reorganize (no separate dest):
    author called "Top 100 Sci-Fi Books"
 6. Applies known title/author fixes (e.g. missing King years, Clark → Clarke)
 7. Builds `Author / Year - Title /` and renumbers audio tracks
-8. Moves leftovers into `trash/`
+8. Preserves known Audiobookshelf/ebook metadata sidecars and leaves unknown files for review
+9. Moves recognized junk into `trash/` (use `--trash-unknown` to opt into moving other files)
 
 ## Supported formats
 
@@ -189,15 +220,19 @@ Edit `src/main.py`:
   moving anything.
 - Install `unrar` for RAR sets: `sudo apt install unrar`
 - Point Audiobookshelf at the **clean** folder, not the dump or `trash/`.
-- After in-place runs, review and delete `trash/` before library scan.
+- After in-place runs, review `trash/` and the warnings before library scan.
 
 ## Project layout
 
 ```text
 run.sh              # venv + deps + entrypoint
 requirements.txt    # optional: rarfile, mutagen
+pyproject.toml      # package metadata and console entry points
+Dockerfile          # Python 3.13 CLI image (API image will supersede this)
+.dockerignore       # excludes credentials, state, and local build files
 src/main.py         # organizer — assigns the shelfmark
 src/fix_metadata.py # repair Audiobookshelf's metadata.json in place
+tests/              # regression tests for organizer safety and idempotence
 LICENSE             # MIT
 README.md
 .gitignore

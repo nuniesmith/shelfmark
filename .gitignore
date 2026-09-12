@@ -9,5 +9,11 @@ __pycache__/
 # Nothing this tool writes belongs in the repo
 *.bak
 
+# Local credentials and runtime state
+.env
+.env.*
+!.env.example
+*.db
+
 freddy.docker-compose.yml
 sullivan.docker-compose.yml

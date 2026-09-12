@@ -15,8 +15,8 @@ else
   echo "Python 3 is required. Install it from https://www.python.org/downloads/" >&2
   exit 1
 fi
-if ! "$PYTHON" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"; then
-  echo "Python 3.9 or newer is required." >&2
+if ! "$PYTHON" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 13) else 1)"; then
+  echo "Python 3.13 or newer is required." >&2
   "$PYTHON" --version >&2
   exit 1
 fi
