@@ -17,6 +17,12 @@ Docker is not installed in the review environment.
 
 ## Current progress
 
+**Deployed 2026-09-12.** Shelfmark runs on Freddy beside Audiobookshelf:
+`shelfmark-api` and `shelfmark-worker` from `ghcr.io/nuniesmith/shelfmark:latest`,
+published at `shelfmark.7gram.xyz` through Princess. The Discord bot sits behind a
+`discord` Compose profile until a token exists. P0 is largely closed — see
+[`docs/INVENTORY.md`](INVENTORY.md) for the configuration record and findings.
+
 The first implementation slices are complete: organizer safety fixes, regression
 coverage, Python packaging metadata, a reproducible CLI container, the initial
 API/SQLite worker foundation, and isolated transport clients for the three
@@ -332,12 +338,12 @@ Princess deployment tasks:
 
 ### P0 — inventory and safety
 
-- [ ] Resolve Freddy and Sullivan compose files with their real environment files.
-- [ ] Record private addresses, VPN routes, firewall rules, and SSH reachability.
-- [ ] Confirm canonical audiobook and ebook roots on Freddy.
-- [ ] Decide whether ABS or Calibre-Web owns ebooks.
+- [x] Resolve Freddy and Sullivan compose files with their real environment files.
+- [x] Record private addresses, VPN routes, and SSH reachability. (Firewall rules still need sudo.)
+- [x] Confirm canonical audiobook and ebook roots on Freddy.
+- [x] Decide whether ABS or Calibre-Web owns ebooks. **ABS** — Calibre-Web has never run and both ebook roots are empty, so there is nothing to migrate and no competing writer.
 - [ ] Back up ABS config, ABS metadata, current audiobook storage, Sullivan book storage, compose files, and environment files.
-- [ ] Rotate the committed Plex claim and any other credential exposed in Git history.
+- [x] ~~Rotate the committed Plex claim~~ — a claim token is valid five minutes after generation, so a stale one in Git is inert.
 - [ ] Create the restricted Sullivan sync account and key.
 
 Acceptance criteria:
