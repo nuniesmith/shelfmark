@@ -107,6 +107,31 @@ In-place reorganize (no separate dest):
 
 **Archives:** zip, rar, 7z, tar, tar.gz  
 
+## Repairing a library Audiobookshelf has already scanned
+
+Audiobookshelf writes a `metadata.json` into each book folder and reads it in
+preference to the folder structure. If it scanned the library while a pack was
+still mis-filed, fixing the folders afterwards changes nothing in the UI — the
+stale author and the raw title are in those files.
+
+`src/fix_metadata.py` repairs them in place, without touching a single audio
+file. The author comes from the folder, which the organiser has already made
+correct; the title is parsed out of the existing metadata title rather than the
+folder name, so punctuation the filesystem cannot hold survives
+(`2001: A Space Odyssey`, not `2001 A Space Odyssey`).
+
+```bash
+# preview
+python3 src/fix_metadata.py "/path/to/Audiobooks"
+
+# write, keeping a .bak beside each file
+python3 src/fix_metadata.py "/path/to/Audiobooks" --apply --backup
+```
+
+Only files whose `authors` list is empty are considered, so books that are
+already right are never rewritten and the command is safe to run twice. Rescan
+the library in Audiobookshelf afterwards.
+
 ## Customizing known titles and authors
 
 Edit `src/main.py`:
@@ -140,6 +165,7 @@ Edit `src/main.py`:
 run.sh              # venv + deps + entrypoint
 requirements.txt    # optional: rarfile, mutagen
 src/main.py         # organizer
+src/fix_metadata.py # repair Audiobookshelf's metadata.json in place
 README.md
 .gitignore
 ```
