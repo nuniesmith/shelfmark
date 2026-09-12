@@ -41,6 +41,17 @@ class Settings:
     api_token: str | None = None
     worker_id: str = "shelfmark-worker"
     poll_interval: float = 2.0
+    http_timeout: float = 15.0
+    http_retries: int = 3
+    audiobookshelf_url: str | None = None
+    audiobookshelf_token: str | None = None
+    audiobookshelf_library_id: str | None = None
+    prowlarr_url: str | None = None
+    prowlarr_api_key: str | None = None
+    qbittorrent_url: str | None = None
+    qbittorrent_username: str | None = None
+    qbittorrent_password: str | None = None
+    qbittorrent_api_key: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -54,6 +65,17 @@ class Settings:
             api_token=os.environ.get("SHELFMARK_API_TOKEN") or None,
             worker_id=os.environ.get("SHELFMARK_WORKER_ID") or socket.gethostname(),
             poll_interval=_float_from_env("SHELFMARK_WORKER_POLL_SECONDS", 2.0),
+            http_timeout=_float_from_env("SHELFMARK_HTTP_TIMEOUT_SECONDS", 15.0),
+            http_retries=max(0, int(os.environ.get("SHELFMARK_HTTP_RETRIES", "3"))),
+            audiobookshelf_url=os.environ.get("AUDIOBOOKSHELF_URL") or None,
+            audiobookshelf_token=os.environ.get("AUDIOBOOKSHELF_API_TOKEN") or None,
+            audiobookshelf_library_id=os.environ.get("AUDIOBOOKSHELF_LIBRARY_ID") or None,
+            prowlarr_url=os.environ.get("PROWLARR_URL") or None,
+            prowlarr_api_key=os.environ.get("PROWLARR_API_KEY") or None,
+            qbittorrent_url=os.environ.get("QBITTORRENT_URL") or None,
+            qbittorrent_username=os.environ.get("QBITTORRENT_USERNAME") or None,
+            qbittorrent_password=os.environ.get("QBITTORRENT_PASSWORD") or None,
+            qbittorrent_api_key=os.environ.get("QBITTORRENT_API_KEY") or None,
         )
 
     def configured_roots(self) -> dict[str, Path]:

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .clients import ProwlarrClient
 from .config import Settings
 from .db import Database, Job
 
@@ -79,6 +80,19 @@ class Worker:
         return True
 
     def execute(self, job: Job) -> dict[str, Any]:
+        if job.kind == "grab_release":
+            if not self.settings.prowlarr_url or not self.settings.prowlarr_api_key:
+                raise ValueError("Prowlarr integration is not configured")
+            release = job.payload.get("release")
+            if not isinstance(release, dict) or not release:
+                raise ValueError("job payload requires a release object")
+            client = ProwlarrClient(
+                self.settings.prowlarr_url,
+                self.settings.prowlarr_api_key,
+                timeout=self.settings.http_timeout,
+                retries=self.settings.http_retries,
+            )
+            return {"release": release, "upstream": client.grab(release), "submitted": True}
         if job.kind not in {"organize_preview", "organize_apply"}:
             raise ValueError(f"unsupported job kind: {job.kind}")
         payload = job.payload

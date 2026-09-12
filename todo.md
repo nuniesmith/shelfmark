@@ -26,7 +26,7 @@ been changed yet.
 Validation run locally with Python 3.14.4:
 
 ```text
-python3 -m unittest discover -s tests -v   # 8 tests passed
+python3 -m unittest discover -s tests -v   # 10 tests passed
 python3 src/main.py --self-test             # self-test OK
 ```
 
@@ -402,6 +402,7 @@ GET  /readyz
 - [x] Implement Audiobookshelf client transport wrapper.
 - [x] Implement Prowlarr search and grab client transport wrapper.
 - [x] Implement qBittorrent status and lifecycle client transport wrapper.
+- [x] Expose authenticated library/release search and asynchronous release-grab API routes.
 - [ ] Implement SSH/rsync transfer client.
 - [ ] Implement stable-file detection.
 - [ ] Implement checksum verification.

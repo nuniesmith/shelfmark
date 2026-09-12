@@ -112,6 +112,21 @@ cp docker-compose.shelfmark.example.yml docker-compose.shelfmark.yml
 docker compose -f docker-compose.shelfmark.yml up -d --build
 ```
 
+The initial internal API exposes health checks, job submission/status, current
+Audiobookshelf library search, Prowlarr release search, and asynchronous
+release grabs. Set `SHELFMARK_API_TOKEN` before using anything beyond
+`/healthz`:
+
+```bash
+curl http://127.0.0.1:8110/healthz
+curl -H "Authorization: Bearer $SHELFMARK_API_TOKEN" \
+  "http://127.0.0.1:8110/api/v1/releases/search?q=Ursula%20Le%20Guin"
+```
+
+The API and worker share only the SQLite database and mounted staging/library
+paths. Provider calls still require the corresponding `AUDIOBOOKSHELF_*` and
+`PROWLARR_*` settings in `.env`.
+
 ## CLI options
 
 | Flag | Description |

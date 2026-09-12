@@ -14,6 +14,7 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from .clients import AudiobookshelfClient, ProwlarrClient, ServiceError
 from .config import Settings
 from .db import Database, Job
 
@@ -23,8 +24,12 @@ database = Database(settings.database_path)
 
 
 class JobRequest(BaseModel):
-    kind: Literal["organize_preview", "organize_apply"]
+    kind: Literal["organize_preview", "organize_apply", "grab_release"]
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReleaseGrabRequest(BaseModel):
+    release: dict[str, Any]
 
 
 def _job_response(job: Job) -> dict[str, Any]:
@@ -57,6 +62,47 @@ def _actor(request: Request) -> str:
     return "bearer"
 
 
+def _abs_client() -> AudiobookshelfClient:
+    if not all(
+        (
+            settings.audiobookshelf_url,
+            settings.audiobookshelf_token,
+            settings.audiobookshelf_library_id,
+        )
+    ):
+        raise HTTPException(status_code=503, detail="Audiobookshelf integration is not configured")
+    return AudiobookshelfClient(
+        settings.audiobookshelf_url or "",
+        settings.audiobookshelf_token or "",
+        timeout=settings.http_timeout,
+        retries=settings.http_retries,
+    )
+
+
+def _prowlarr_client() -> ProwlarrClient:
+    if not settings.prowlarr_url or not settings.prowlarr_api_key:
+        raise HTTPException(status_code=503, detail="Prowlarr integration is not configured")
+    return ProwlarrClient(
+        settings.prowlarr_url,
+        settings.prowlarr_api_key,
+        timeout=settings.http_timeout,
+        retries=settings.http_retries,
+    )
+
+
+def _upstream_error(exc: ServiceError) -> HTTPException:
+    # Do not return upstream response bodies: they can contain release URLs,
+    # credentials, or other data that should stay in service logs.
+    return HTTPException(
+        status_code=502,
+        detail={
+            "service": exc.service,
+            "status": exc.status,
+            "message": "upstream request failed",
+        },
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     database.initialize()
@@ -81,6 +127,54 @@ def readyz() -> dict[str, Any]:
     if missing:
         raise HTTPException(status_code=503, detail={"status": "not_ready", "missing": missing})
     return {"status": "ready", "database": str(settings.database_path)}
+
+
+@app.get("/api/v1/library/search")
+def library_search(
+    q: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=12, ge=1, le=100),
+    _actor: str = Depends(_actor),
+) -> dict[str, Any]:
+    client = _abs_client()
+    try:
+        return {
+            "results": client.search(settings.audiobookshelf_library_id or "", q, limit)
+        }
+    except ServiceError as exc:
+        raise _upstream_error(exc) from exc
+
+
+@app.get("/api/v1/items/{item_id}")
+def library_item(item_id: str, _actor: str = Depends(_actor)) -> Any:
+    try:
+        return _abs_client().get_item(item_id, expanded=True)
+    except ServiceError as exc:
+        raise _upstream_error(exc) from exc
+
+
+@app.get("/api/v1/releases/search")
+def release_search(
+    q: str = Query(min_length=1, max_length=200),
+    search_type: str | None = Query(default=None, alias="type", max_length=40),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    _actor: str = Depends(_actor),
+) -> dict[str, Any]:
+    try:
+        return {
+            "results": _prowlarr_client().search(
+                q, search_type=search_type, limit=limit, offset=offset
+            )
+        }
+    except ServiceError as exc:
+        raise _upstream_error(exc) from exc
+
+
+@app.post("/api/v1/releases/grab", status_code=status.HTTP_202_ACCEPTED)
+def grab_release(request: ReleaseGrabRequest, actor: str = Depends(_actor)) -> dict[str, Any]:
+    if not settings.prowlarr_url or not settings.prowlarr_api_key:
+        raise HTTPException(status_code=503, detail="Prowlarr integration is not configured")
+    return _job_response(database.enqueue("grab_release", {"release": request.release}, actor=actor))
 
 
 @app.get("/api/v1/jobs")
