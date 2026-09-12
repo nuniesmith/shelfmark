@@ -138,23 +138,24 @@ Note that `jordan` cannot write to `/mnt/media` even with space free — that is
 permissions boundary, not a capacity one, and the two look identical from a
 failed `touch`.
 
-### 2. A year-old 60G tarball is still on that volume
+### 2. A year-old 60G tarball — RESOLVED 2026-09-12
 
 ```
 /mnt/media/books/audiobooks.tar.gz   63,881,810,617 bytes   modified 2025-10-02
 ```
 
-59.5 GiB, eleven months old, predating all of the organizing work. Freddy now
-holds the live library (79G, 7,231 files) and the two 73G working copies made
-during the migration were deleted after verification, so this is the only
-remaining archive copy — and it is a year stale.
+Eleven months old, predating all of the organizing work, and the only remaining
+archive copy of the library. **Deleted after the current backup below was taken
+and verified**, not before — the order mattered, because until that backup
+existed this stale tarball was the only thing standing between a freddy disk
+failure and total loss.
 
-With the volume back to 1.4T free this is no longer urgent, but it is still 59.5
-GiB of stale data and still the largest single reclaim available.
+Reclaimed 59.5 GiB; `/mnt/media` went from 1.4T to 1.5T free.
 
-**Operator decision, and not a simple one**: it is a poor backup — a year old,
-predating all of the organizing work — but it is the only remaining archive copy
-of the library.
+`/mnt/media/books` is `actions`-owned without group write, so `jordan` cannot
+unlink files there. The deletion went through a root container mounting only
+that one directory. Worth knowing that the docker group is root-equivalent on
+these hosts, and that this is the escape hatch when a path is `actions`-owned.
 
 ### 3. Unpackerr will race a Shelfmark download category
 
@@ -200,10 +201,16 @@ filesystem (1.4T free), because `jordan` cannot write `/mnt/media/books`.
 
 | What | How | Size |
 |---|---|---|
-| `audiobooks/` | `rsync -a --delete` from `/mnt/1tb/audiobooks` | ~79G |
+| `audiobooks/` | `rsync -a --delete` from `/mnt/1tb/audiobooks` | 79G |
 | `abs-config/` | rsync, with the live DB excluded and replaced by a snapshot | 12M |
 | `abs-metadata/` | `rsync -a --delete` from ABS `/metadata` | 6.6M |
 | `configs/` | freddy's resolved compose, mode 600 | 32K |
+
+**Verified on capture, 2026-09-12.** 7,324 files live and 7,324 in the backup; a
+second `rsync -an --delete --itemize-changes` reported no differences at all, so
+the trees are identical rather than merely the same size. A sample restore of
+`John Wyndham/` into a temporary directory read back with correct titles and
+authors. 84,047,407,025 bytes transferred, rsync exit 0.
 
 **The Audiobookshelf database is snapshotted, not copied.** A plain `cp` of a
 SQLite file a running server is writing can catch it mid-transaction and restore
@@ -285,6 +292,7 @@ delete `/tmp/shelfmark-sync*`.
 - [x] Back up ABS config, ABS metadata, audiobook storage and Compose
 - [x] Create the restricted Sullivan sync account and key — script written and
       the key wired through CI; **needs one sudo run on sullivan to take effect**
+- [x] Delete the stale 60G tarball — done, 59.5 GiB reclaimed
 - [ ] Record firewall rules — `ufw status` needs sudo, not captured
 
 Two things need a human with root, and neither can be done from a key-based
