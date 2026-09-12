@@ -86,14 +86,14 @@ docker build -t shelfmark:dev .
 # Preview a dump (read-only)
 docker run --rm \
   -v "/path/to/messy/dump:/incoming:ro" \
-  shelfmark:dev /incoming --dry-run
+  shelfmark:dev shelfmark /incoming --dry-run
 
 # Apply into separate audiobook and ebook roots
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   -v "/path/to/messy/dump:/incoming" \
   -v "/mnt/1tb/audiobooks:/audiobooks" \
-  shelfmark:dev /incoming --dest /audiobooks --apply --yes
+  shelfmark:dev shelfmark /incoming --dest /audiobooks --apply --yes
 ```
 
 The container includes `unrar-free` and 7-Zip for archive formats. Bind mounts
@@ -101,6 +101,16 @@ must be writable by the container user for an apply run. The eventual Freddy
 compose deployment will mount the canonical library, incoming, work,
 quarantine, and data directories separately and run the API/worker services
 with the matching host UID/GID.
+
+The image also installs `shelfmark-api` and `shelfmark-worker` entry points for
+the service layer. They are intentionally not added to the live Freddy Compose
+file yet; use the example service definition as the staging starting point:
+
+```bash
+cp .env.example .env
+cp docker-compose.shelfmark.example.yml docker-compose.shelfmark.yml
+docker compose -f docker-compose.shelfmark.yml up -d --build
+```
 
 ## CLI options
 
@@ -232,6 +242,7 @@ Dockerfile          # Python 3.13 CLI image (API image will supersede this)
 .dockerignore       # excludes credentials, state, and local build files
 src/main.py         # organizer — assigns the shelfmark
 src/fix_metadata.py # repair Audiobookshelf's metadata.json in place
+src/shelfmark_service/ # API, SQLite queue, and worker foundation
 tests/              # regression tests for organizer safety and idempotence
 LICENSE             # MIT
 README.md

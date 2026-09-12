@@ -17,14 +17,15 @@ Docker is not installed in the review environment.
 
 ## Current progress
 
-The first implementation slice is complete: organizer safety fixes, regression
-coverage, Python packaging metadata, and a reproducible CLI container have been
-added. No live Freddy or Sullivan deployment has been changed yet.
+The first implementation slices are complete: organizer safety fixes, regression
+coverage, Python packaging metadata, a reproducible CLI container, and the
+initial API/SQLite worker foundation have been added. No live Freddy or Sullivan
+deployment has been changed yet.
 
 Validation run locally with Python 3.14.4:
 
 ```text
-python3 -m unittest discover -s tests -v   # 6 tests passed
+python3 -m unittest discover -s tests -v   # 8 tests passed
 python3 src/main.py --self-test             # self-test OK
 ```
 
@@ -367,13 +368,13 @@ Acceptance criteria:
 
 - [x] Add `pyproject.toml` and pinned dependencies.
 - [x] Add a Python 3.13 Dockerfile and `.dockerignore`.
-- [ ] Add FastAPI and Uvicorn.
-- [ ] Add SQLite schema, migrations, and WAL mode.
-- [ ] Add the database-backed worker queue.
+- [x] Add FastAPI and Uvicorn.
+- [x] Add SQLite schema, migrations, and WAL mode.
+- [x] Add the database-backed worker queue.
 - [ ] Add health/readiness endpoints and worker heartbeat.
 - [ ] Add structured logs, correlation IDs, and redaction.
 - [ ] Add API authentication and role checks.
-- [ ] Add the audit log.
+- [x] Add the audit log.
 
 Suggested API surface:
 

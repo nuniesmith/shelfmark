@@ -2,3 +2,5 @@
 # Zip/tar extraction is stdlib. These extras help with RAR and audio tags.
 rarfile==4.2
 mutagen==1.47.0
+fastapi==0.115.6
+uvicorn==0.34.0

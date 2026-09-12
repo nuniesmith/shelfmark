@@ -5,6 +5,8 @@ venv/
 # Bytecode / cache
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
 
 # Nothing this tool writes belongs in the repo
 *.bak

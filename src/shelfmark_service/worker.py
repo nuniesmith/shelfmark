@@ -1,0 +1,138 @@
+"""Database-backed worker for organizer jobs."""
+
+from __future__ import annotations
+
+import logging
+import os
+import signal
+import time
+from pathlib import Path
+from typing import Any
+
+from .config import Settings
+from .db import Database, Job
+
+logger = logging.getLogger("shelfmark.worker")
+
+
+class JobCancelled(RuntimeError):
+    pass
+
+
+def _path(payload: dict[str, Any], name: str, default: Path | None = None) -> Path:
+    value = payload.get(name)
+    if value is None:
+        if default is None:
+            raise ValueError(f"job payload requires {name}")
+        return default
+    return Path(str(value)).expanduser().resolve()
+
+
+def _plan_summary(plan: Any) -> dict[str, Any]:
+    return {
+        "books": len(plan.books),
+        "tracks": sum(len(book.tracks) for book in plan.books),
+        "archives": len(plan.extracts),
+        "trash": len(plan.trash),
+        "warnings": list(plan.warnings),
+        "items": [
+            {
+                "author": book.meta.author,
+                "title": book.meta.title,
+                "year": book.meta.year,
+                "narrator": book.meta.narrator,
+                "destination": str(book.dest_dir),
+                "files": len(book.tracks),
+            }
+            for book in plan.books
+        ],
+    }
+
+
+class Worker:
+    def __init__(self, database: Database, settings: Settings):
+        self.database = database
+        self.settings = settings
+        self.worker_id = settings.worker_id
+
+    def run_once(self) -> bool:
+        job = self.database.claim_next(self.worker_id)
+        if job is None:
+            return False
+        logger.info("job claimed id=%s kind=%s", job.id, job.kind)
+        try:
+            result = self.execute(job)
+            if self.database.cancellation_requested(job.id):
+                self.database.cancel_running(job.id, worker_id=self.worker_id)
+                logger.info("job cancelled id=%s", job.id)
+            else:
+                self.database.complete(job.id, self.worker_id, result)
+                logger.info("job completed id=%s", job.id)
+        except JobCancelled as exc:
+            self.database.cancel_running(job.id, worker_id=self.worker_id)
+            logger.info("job cancelled id=%s reason=%s", job.id, exc)
+        except Exception as exc:  # noqa: BLE001 - failure belongs in the job record
+            self.database.fail(job.id, self.worker_id, str(exc))
+            logger.exception("job failed id=%s", job.id)
+        return True
+
+    def execute(self, job: Job) -> dict[str, Any]:
+        if job.kind not in {"organize_preview", "organize_apply"}:
+            raise ValueError(f"unsupported job kind: {job.kind}")
+        payload = job.payload
+        source = _path(payload, "source")
+        if not source.is_dir():
+            raise ValueError(f"source is not a directory: {source}")
+        dest = _path(payload, "dest", source)
+        trash = _path(payload, "trash", source / "trash")
+        from main import apply_extracts, apply_plan, build_plan
+
+        options = {
+            "source": source,
+            "dest": dest,
+            "trash": trash,
+            "folder_format": str(payload.get("format", "year-title")),
+            "keep_names": bool(payload.get("keep_names", False)),
+            "include_non_cover_images": bool(payload.get("keep_images", False)),
+            "media_mode": str(payload.get("media", "auto")),
+            "trash_unknown": bool(payload.get("trash_unknown", False)),
+        }
+        plan = build_plan(**options)
+        if job.kind == "organize_preview":
+            return _plan_summary(plan)
+
+        if self.database.cancellation_requested(job.id):
+            raise JobCancelled("cancel requested before apply")
+        if plan.extracts:
+            errors = apply_extracts(plan, trash=trash, dry_run=False, copy=bool(payload.get("copy", False)))
+            if errors:
+                raise RuntimeError("; ".join(errors))
+            plan = build_plan(**options)
+        apply_plan(plan, trash=trash, dry_run=False, copy=bool(payload.get("copy", False)))
+        return _plan_summary(plan) | {"applied": True}
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("SHELFMARK_LOG_LEVEL", "INFO"),
+        format='{"level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}',
+    )
+    settings = Settings.from_env()
+    database = Database(settings.database_path)
+    database.initialize()
+    worker = Worker(database, settings)
+    stopping = False
+
+    def stop(_signum: int, _frame: Any) -> None:
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while not stopping:
+        if not worker.run_once():
+            time.sleep(settings.poll_interval)
+
+
+if __name__ == "__main__":
+    main()

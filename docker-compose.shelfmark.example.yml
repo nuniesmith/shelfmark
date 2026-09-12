@@ -1,0 +1,58 @@
+# Staging-only service definition. Merge the services into the Freddy Compose
+# project after the API, worker, and bind mounts have been validated there.
+services:
+  shelfmark-api:
+    build: .
+    image: shelfmark:dev
+    container_name: shelfmark-api
+    command: ["shelfmark-api"]
+    env_file:
+      - .env
+    environment:
+      SHELFMARK_DB_PATH: /data/shelfmark.db
+      SHELFMARK_AUDIOBOOKS_ROOT: /audiobooks
+      SHELFMARK_EBOOKS_ROOT: /ebooks
+      SHELFMARK_INCOMING_ROOT: /incoming
+      SHELFMARK_WORK_ROOT: /work
+      SHELFMARK_QUARANTINE_ROOT: /quarantine
+    ports:
+      - "127.0.0.1:8110:8000"
+    volumes:
+      - /mnt/1tb/shelfmark/data:/data
+      - /mnt/1tb/audiobooks:/audiobooks
+      - /mnt/1tb/ebooks:/ebooks
+      - /mnt/1tb/shelfmark/incoming:/incoming
+      - /mnt/1tb/shelfmark/work:/work
+      - /mnt/1tb/shelfmark/quarantine:/quarantine
+    user: "${PUID:-1001}:${PGID:-1001}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  shelfmark-worker:
+    build: .
+    image: shelfmark:dev
+    container_name: shelfmark-worker
+    command: ["shelfmark-worker"]
+    env_file:
+      - .env
+    environment:
+      SHELFMARK_DB_PATH: /data/shelfmark.db
+      SHELFMARK_AUDIOBOOKS_ROOT: /audiobooks
+      SHELFMARK_EBOOKS_ROOT: /ebooks
+      SHELFMARK_INCOMING_ROOT: /incoming
+      SHELFMARK_WORK_ROOT: /work
+      SHELFMARK_QUARANTINE_ROOT: /quarantine
+      SHELFMARK_WORKER_ID: shelfmark-worker
+    volumes:
+      - /mnt/1tb/shelfmark/data:/data
+      - /mnt/1tb/audiobooks:/audiobooks
+      - /mnt/1tb/ebooks:/ebooks
+      - /mnt/1tb/shelfmark/incoming:/incoming
+      - /mnt/1tb/shelfmark/work:/work
+      - /mnt/1tb/shelfmark/quarantine:/quarantine
+    user: "${PUID:-1001}:${PGID:-1001}"
+    restart: unless-stopped
