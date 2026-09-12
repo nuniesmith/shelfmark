@@ -130,7 +130,7 @@ paths. Provider calls still require the corresponding `AUDIOBOOKSHELF_*` and
 The initial Discord adapter registers guild-scoped commands when
 `SHELFMARK_DISCORD_GUILD_ID` is set, which makes development changes appear
 quickly. It currently provides `/library-search`, `/release-search` with grab
-buttons, `/job`, and `/organize-preview`. The bot defers each command before
+buttons, `/job`, `/metadata-match`, `/scan`, and `/organize-preview`. The bot defers each command before
 calling the API and sends the resulting job ID as a follow-up. Invite the
 application with both the `bot` and `applications.commands` scopes, then keep
 `DISCORD_BOT_TOKEN` only in the staging `.env`.
