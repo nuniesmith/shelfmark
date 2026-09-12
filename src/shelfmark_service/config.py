@@ -33,6 +33,7 @@ class Settings:
     """
 
     database_path: Path = Path("/data/shelfmark.db")
+    manifest_root: Path = Path("/data/manifests")
     audio_root: Path | None = None
     ebook_root: Path | None = None
     incoming_root: Path | None = None
@@ -66,6 +67,7 @@ class Settings:
     def from_env(cls) -> "Settings":
         return cls(
             database_path=_path_from_env("SHELFMARK_DB_PATH") or Path("/data/shelfmark.db"),
+            manifest_root=_path_from_env("SHELFMARK_MANIFEST_ROOT") or Path("/data/manifests"),
             audio_root=_path_from_env("SHELFMARK_AUDIOBOOKS_ROOT"),
             ebook_root=_path_from_env("SHELFMARK_EBOOKS_ROOT"),
             incoming_root=_path_from_env("SHELFMARK_INCOMING_ROOT"),

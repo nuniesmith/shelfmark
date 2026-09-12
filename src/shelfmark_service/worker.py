@@ -13,6 +13,7 @@ from typing import Any
 from .clients import AudiobookshelfClient, ProwlarrClient
 from .config import Settings
 from .db import Database, Job
+from .manifest import JsonlManifest, sha256_file
 from .transfer import RsyncTransfer, wait_until_stable
 
 logger = logging.getLogger("shelfmark.worker")
@@ -62,6 +63,10 @@ class Worker:
         job = self.database.claim_next(self.worker_id)
         if job is None:
             return False
+        manifest = JsonlManifest(
+            self.settings.manifest_root / f"{job.id}.jsonl", actor=self.worker_id
+        )
+        manifest.event("job_started", job_id=job.id, kind=job.kind, worker_id=self.worker_id)
         logger.info("job claimed id=%s kind=%s", job.id, job.kind)
         try:
             self.database.heartbeat(job.id, self.worker_id)
@@ -69,15 +74,19 @@ class Worker:
             self.database.heartbeat(job.id, self.worker_id)
             if self.database.cancellation_requested(job.id):
                 self.database.cancel_running(job.id, worker_id=self.worker_id)
+                manifest.event("job_cancelled", job_id=job.id)
                 logger.info("job cancelled id=%s", job.id)
             else:
                 self.database.complete(job.id, self.worker_id, result)
+                manifest.event("job_succeeded", job_id=job.id, result=result)
                 logger.info("job completed id=%s", job.id)
         except JobCancelled as exc:
             self.database.cancel_running(job.id, worker_id=self.worker_id)
+            manifest.event("job_cancelled", job_id=job.id, reason=str(exc))
             logger.info("job cancelled id=%s reason=%s", job.id, exc)
         except Exception as exc:  # noqa: BLE001 - failure belongs in the job record
             self.database.fail(job.id, self.worker_id, str(exc))
+            manifest.event("job_failed", job_id=job.id, error=str(exc))
             logger.exception("job failed id=%s", job.id)
         return True
 
@@ -189,18 +198,52 @@ class Worker:
             "trash_unknown": bool(payload.get("trash_unknown", False)),
         }
         plan = build_plan(**options)
+        manifest = JsonlManifest(
+            self.settings.manifest_root / f"{job.id}.jsonl", actor=self.worker_id
+        )
+        manifest.event("plan_created", summary=_plan_summary(plan))
         if job.kind == "organize_preview":
             return _plan_summary(plan)
 
         if self.database.cancellation_requested(job.id):
             raise JobCancelled("cancel requested before apply")
         if plan.extracts:
+            self._record_plan(manifest, plan)
             errors = apply_extracts(plan, trash=trash, dry_run=False, copy=bool(payload.get("copy", False)))
             if errors:
                 raise RuntimeError("; ".join(errors))
             plan = build_plan(**options)
+            manifest.event("plan_recreated", summary=_plan_summary(plan))
+        self._record_plan(manifest, plan)
         apply_plan(plan, trash=trash, dry_run=False, copy=bool(payload.get("copy", False)))
         return _plan_summary(plan) | {"applied": True}
+
+    @staticmethod
+    def _record_plan(manifest: JsonlManifest, plan: Any) -> None:
+        for book in plan.books:
+            for operation in book.tracks + book.extras:
+                if operation.kind == "trash":
+                    continue
+                checksum = None
+                try:
+                    if operation.src.is_file():
+                        checksum = sha256_file(operation.src)
+                except OSError:
+                    pass
+                manifest.event(
+                    "operation_planned",
+                    source=str(operation.src),
+                    destination=str(operation.dest),
+                    kind=operation.kind,
+                    checksum=checksum,
+                )
+        for operation in plan.extracts:
+            manifest.event(
+                "extract_planned",
+                source=str(operation.src),
+                destination=str(operation.dest),
+                kind=operation.kind,
+            )
 
 
 def main() -> None:

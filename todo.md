@@ -71,7 +71,7 @@ These should be fixed before allowing an unattended service to move or delete fi
 - [ ] Extract archives into an isolated staging directory before importing their contents.
 - [ ] Leave failed archives in place and mark the job failed; never move a failed archive to trash and return success.
 - [ ] Make move/copy operations resumable and idempotent. If the destination already contains the same file, compare size/checksum and skip it instead of creating `01 (2).mp3`.
-- [ ] Add a transaction manifest for every import: source, destination, operation, checksum, timestamp, actor, and result.
+- [x] Add an append-only transaction manifest for every worker import: source, destination, operation, checksum, timestamp, actor, and result.
 - [ ] Write destination files atomically, then rename the completed destination directory into place.
 - [ ] Use a quarantine directory for failed or ambiguous jobs instead of deleting source material.
 - [ ] Review all archive extractors for path traversal and symlink behavior. External extractors should run in staging with post-extraction validation.
@@ -352,7 +352,7 @@ Acceptance criteria:
 - [ ] Add the expanded identity model.
 - [x] Preserve managed-library sidecars.
 - [ ] Add isolated extraction and archive safety checks.
-- [ ] Add manifests, checksums, atomic writes, quarantine, and resume logic.
+- [x] Add manifests and operation checksums; atomic writes, quarantine, and resume logic remain.
 - [x] Make repeated imports idempotent for identical move/copy retries.
 - [ ] Add structured JSON output and stable error codes.
 - [x] Add regression fixtures for mixed media, multipart isolation, broken archives, unknown files, and repeated copy runs.
