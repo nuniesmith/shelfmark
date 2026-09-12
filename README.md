@@ -127,6 +127,14 @@ The API and worker share only the SQLite database and mounted staging/library
 paths. Provider calls still require the corresponding `AUDIOBOOKSHELF_*` and
 `PROWLARR_*` settings in `.env`.
 
+The initial Discord adapter registers guild-scoped commands when
+`SHELFMARK_DISCORD_GUILD_ID` is set, which makes development changes appear
+quickly. It currently provides `/library-search`, `/release-search` with grab
+buttons, `/job`, and `/organize-preview`. The bot defers each command before
+calling the API and sends the resulting job ID as a follow-up. Invite the
+application with both the `bot` and `applications.commands` scopes, then keep
+`DISCORD_BOT_TOKEN` only in the staging `.env`.
+
 ## CLI options
 
 | Flag | Description |

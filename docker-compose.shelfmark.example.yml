@@ -56,3 +56,17 @@ services:
       - /mnt/1tb/shelfmark/quarantine:/quarantine
     user: "${PUID:-1001}:${PGID:-1001}"
     restart: unless-stopped
+
+  shelfmark-bot:
+    build: .
+    image: shelfmark:dev
+    container_name: shelfmark-bot
+    command: ["shelfmark-bot"]
+    env_file:
+      - .env
+    environment:
+      SHELFMARK_API_URL: http://shelfmark-api:8000
+    depends_on:
+      shelfmark-api:
+        condition: service_healthy
+    restart: unless-stopped

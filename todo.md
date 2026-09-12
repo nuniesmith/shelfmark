@@ -403,6 +403,7 @@ GET  /readyz
 - [x] Implement Prowlarr search and grab client transport wrapper.
 - [x] Implement qBittorrent status and lifecycle client transport wrapper.
 - [x] Expose authenticated library/release search and asynchronous release-grab API routes.
+- [x] Add initial Discord slash-command adapter with deferred responses and release-grab buttons.
 - [ ] Implement SSH/rsync transfer client.
 - [ ] Implement stable-file detection.
 - [ ] Implement checksum verification.
@@ -472,7 +473,7 @@ Acceptance criteria:
 
 - [ ] Create and configure the Discord application.
 - [ ] Register guild-scoped slash commands.
-- [ ] Implement immediate defer and persistent job IDs.
+- [x] Implement initial slash commands with immediate defer and persistent job IDs.
 - [ ] Implement library search embeds.
 - [ ] Implement Prowlarr result pagination and selection.
 - [ ] Implement confirmation buttons.

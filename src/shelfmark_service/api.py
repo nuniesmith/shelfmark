@@ -59,7 +59,8 @@ def _actor(request: Request) -> str:
     scheme, _, token = header.partition(" ")
     if scheme.casefold() != "bearer" or not secrets.compare_digest(token, expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
-    return "bearer"
+    actor = request.headers.get("x-shelfmark-actor", "bearer").strip()
+    return actor[:200] or "bearer"
 
 
 def _abs_client() -> AudiobookshelfClient:
