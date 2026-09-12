@@ -35,6 +35,40 @@ jobs:
       - name: Build CLI and service image
         run: docker build --tag shelfmark:ci .
 
+      # The unit tests inject a fake subprocess runner, so a binary missing from
+      # the image passes every test and then fails on a real transfer with
+      # "rsync: not found". Assert against the image itself instead.
+      - name: Required binaries are present in the image
+        run: |
+          missing=0
+          for bin in rsync ssh tar; do
+            if docker run --rm --entrypoint sh shelfmark:ci -c "command -v $bin" >/dev/null 2>&1; then
+              echo "  ok       $bin"
+            else
+              echo "  MISSING  $bin"; missing=1
+            fi
+          done
+          # Archive extraction has a fallback chain, so any one of these will do.
+          if docker run --rm --entrypoint sh shelfmark:ci \
+               -c 'command -v 7z || command -v 7za || command -v 7zz' >/dev/null 2>&1; then
+            echo "  ok       7z (one of 7z/7za/7zz)"
+          else
+            echo "  MISSING  7z family"; missing=1
+          fi
+          if docker run --rm --entrypoint sh shelfmark:ci \
+               -c 'command -v unrar || command -v unar' >/dev/null 2>&1; then
+            echo "  ok       unrar (one of unrar/unar)"
+          else
+            echo "  MISSING  unrar family"; missing=1
+          fi
+          exit $missing
+
+      - name: Console entry points run
+        run: |
+          docker run --rm shelfmark:ci --help > /dev/null
+          docker run --rm --entrypoint shelfmark-fix-metadata shelfmark:ci --help > /dev/null
+          echo "  ok       CLI entry points"
+
   # Freddy pulls this image; it has no copy of the source and cannot build it
   # itself. Without this job the Compose services there have nothing to start.
   publish:
