@@ -77,15 +77,29 @@ def same_person(parsed: str, folder: str) -> bool:
     return len(a & b) >= max(1, min(len(a), len(b)) / 2)
 
 
-def plan_one(meta_path: Path, parse_name) -> dict | None:
+def _author_names(data: dict) -> list[str]:
+    out = []
+    for a in data.get("authors") or []:
+        out.append(a.get("name", "") if isinstance(a, dict) else str(a))
+    return [a for a in out if a]
+
+
+def plan_one(meta_path: Path, parse_name, bogus: set[str] | None = None) -> dict | None:
     """Return the change for one file, or None if it needs none."""
     try:
         data = json.loads(meta_path.read_text())
     except Exception as exc:
         return {"path": meta_path, "skip": f"unreadable: {exc}"}
 
-    if data.get("authors"):
-        return None  # already correct — never touched
+    names = _author_names(data)
+    bogus = {b.casefold() for b in (bogus or set())}
+    # An author is "missing" either because the list is empty, or because every
+    # name in it is one the caller has declared bogus. Audiobookshelf writes its
+    # own database back into these files on scan, so a library it has already
+    # seen will carry the invented pack name rather than an empty list — the
+    # state this tool has to repair is whichever of the two it finds.
+    if names and not all(n.casefold() in bogus for n in names):
+        return None  # a real author — never touched
 
     book_dir = meta_path.parent
     folder_author = book_dir.parent.name
@@ -121,6 +135,16 @@ def main() -> int:
     ap.add_argument("library", help="library root (the folder holding the author dirs)")
     ap.add_argument("--apply", action="store_true", help="write changes (default: preview)")
     ap.add_argument("--backup", action="store_true", help="keep metadata.json.bak beside each file")
+    ap.add_argument(
+        "--replace-author",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="treat this author value as missing and rebuild it from the folder "
+        "(repeatable). Use for an invented name Audiobookshelf assigned to a whole "
+        "pack, e.g. --replace-author 'Top 100 Sci-Fi Books'. Any author NOT named "
+        "here is left alone, so real pen names such as Richard Bachman are safe.",
+    )
     args = ap.parse_args()
 
     parse_name = load_parser()
@@ -133,7 +157,7 @@ def main() -> int:
     changes, skips = [], []
     untouched = 0
     for m in metas:
-        r = plan_one(m, parse_name)
+        r = plan_one(m, parse_name, set(args.replace_author))
         if r is None:
             untouched += 1
         elif "skip" in r:

@@ -129,8 +129,31 @@ python3 src/fix_metadata.py "/path/to/Audiobooks" --apply --backup
 ```
 
 Only files whose `authors` list is empty are considered, so books that are
-already right are never rewritten and the command is safe to run twice. Rescan
-the library in Audiobookshelf afterwards.
+already right are never rewritten and the command is safe to run twice.
+
+**If Audiobookshelf has already re-scanned the library, the authors will not be
+empty — they will hold the invented name.** ABS writes its own database back
+into these files on scan, so a pack it has seen carries e.g.
+`"authors": ["Top 100 Sci-Fi Books"]` rather than `[]`. Name that value
+explicitly to have it rebuilt from the folder:
+
+```bash
+python3 src/fix_metadata.py "/path/to/Audiobooks" \
+  --replace-author "Top 100 Sci-Fi Books" --apply --backup
+```
+
+`--replace-author` is repeatable, and any author *not* named is left alone — so
+real pen names such as Richard Bachman are never collapsed into the folder's
+author.
+
+Afterwards, force Audiobookshelf to re-read the files. A restart is not enough:
+it re-initialises the watcher but does not re-read metadata for items it already
+knows. Use **Library → ⋮ → Force Re-Scan**, or the API:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ABS_API_KEY" \
+  "https://your-abs-host/api/libraries/$LIBRARY_ID/scan?force=1"
+```
 
 ## Customizing known titles and authors
 
