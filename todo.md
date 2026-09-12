@@ -18,9 +18,10 @@ Docker is not installed in the review environment.
 ## Current progress
 
 The first implementation slices are complete: organizer safety fixes, regression
-coverage, Python packaging metadata, a reproducible CLI container, and the
-initial API/SQLite worker foundation have been added. No live Freddy or Sullivan
-deployment has been changed yet.
+coverage, Python packaging metadata, a reproducible CLI container, the initial
+API/SQLite worker foundation, and isolated transport clients for the three
+existing media APIs have been added. No live Freddy or Sullivan deployment has
+been changed yet.
 
 Validation run locally with Python 3.14.4:
 
@@ -371,7 +372,7 @@ Acceptance criteria:
 - [x] Add FastAPI and Uvicorn.
 - [x] Add SQLite schema, migrations, and WAL mode.
 - [x] Add the database-backed worker queue.
-- [ ] Add health/readiness endpoints and worker heartbeat.
+- [x] Add health/readiness endpoints and worker heartbeat.
 - [ ] Add structured logs, correlation IDs, and redaction.
 - [ ] Add API authentication and role checks.
 - [x] Add the audit log.
@@ -398,9 +399,9 @@ GET  /readyz
 
 ### P3 — integration clients
 
-- [ ] Implement Audiobookshelf client.
-- [ ] Implement Prowlarr search and grab client.
-- [ ] Implement qBittorrent status and lifecycle client.
+- [x] Implement Audiobookshelf client transport wrapper.
+- [x] Implement Prowlarr search and grab client transport wrapper.
+- [x] Implement qBittorrent status and lifecycle client transport wrapper.
 - [ ] Implement SSH/rsync transfer client.
 - [ ] Implement stable-file detection.
 - [ ] Implement checksum verification.

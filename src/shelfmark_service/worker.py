@@ -61,7 +61,9 @@ class Worker:
             return False
         logger.info("job claimed id=%s kind=%s", job.id, job.kind)
         try:
+            self.database.heartbeat(job.id, self.worker_id)
             result = self.execute(job)
+            self.database.heartbeat(job.id, self.worker_id)
             if self.database.cancellation_requested(job.id):
                 self.database.cancel_running(job.id, worker_id=self.worker_id)
                 logger.info("job cancelled id=%s", job.id)
