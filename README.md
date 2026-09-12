@@ -92,9 +92,12 @@ In-place reorganize (no separate dest):
 2. Extracts zip/rar/7z (multipart RAR treated as one set)
 3. Merges Disc/CD and “Part One” style section folders into one book
 4. Parses author / title / year from folders, filenames, and tags when possible
-5. Applies known title/author fixes (e.g. missing King years, Clark → Clarke)
-6. Builds `Author / Year - Title /` and renumbers audio tracks
-7. Moves leftovers into `trash/`
+5. Unwraps numbered listicle packs — `Top 100 Sci-Fi Books/43 - Title - Author - Year/`
+   becomes `Author/Year - Title/`, rather than filing all 100 books under an
+   author called "Top 100 Sci-Fi Books"
+6. Applies known title/author fixes (e.g. missing King years, Clark → Clarke)
+7. Builds `Author / Year - Title /` and renumbers audio tracks
+8. Moves leftovers into `trash/`
 
 ## Supported formats
 
@@ -114,6 +117,10 @@ Edit `src/main.py`:
 ## Tips
 
 - Always `--dry-run` first on a large library.
+- Re-running over an already-clean library is safe and is how you repair one
+  that was filed wrong. A second pass reads its own `Year - Title` folders back
+  without losing the year, so you can point it at the library itself:
+  `./run.sh "/path/to/Audiobooks" --format year-title --dry-run`
 - Use `--dest --copy` if you want to keep the original dump. `--dest` on its own
   moves the files out of it.
 - `--copy` removes nothing — not the junk, not the archives, not empty folders.

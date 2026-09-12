@@ -128,7 +128,28 @@ READ_BY_RE = re.compile(
     r"\b(?:read|narrated)\s+by\s+(.+)$",
     re.I,
 )
-YEAR_RE = re.compile(r"\b((?:19|20)\d{2})\b")
+# 1500-2099. It used to be 19xx/20xx only, which silently broke every classic:
+# a "Title - Author - 1818" folder has no recognisable year, so the right-hand
+# side reads as "Mary Shelley - 1818" rather than a person, and the parser falls
+# through to treating the TITLE as the author. Frankenstein 1818, Verne 1864 and
+# 1870, Wells 1895/1896/1898, Abbott 1884 — a top-100 science-fiction list is
+# mostly pre-1900 at the front, so the swap hit a quarter of the pack.
+YEAR_RE = re.compile(r"\b((?:1[5-9]|20)\d{2})\b")
+SEPARATOR_DOT_RE = re.compile(r"\.(?=\S)")
+# Listicle / bundle folder names. These wrap a pack of unrelated books, so the
+# folder is never the author — but "Top 100 Sci Fi Books" is four capitalised
+# words and looks_like_person says yes, which puts the whole pack under one
+# invented author. Matching the shape is what stops that.
+COLLECTION_RE = re.compile(
+    r"""(?:
+        \btop\s*\d+
+        | \bbest\s+of\b
+        | \b\d+\s+(?:greatest|best)\b
+        | \b\d+\s+(?:books?|novels?|classics?|reads?|titles?)\b
+        | \b(?:box\s?set|boxset|mega\s?pack|megapack)\b
+    )""",
+    re.I | re.X,
+)
 NARRATOR_RE = re.compile(r"\{([^{}]+)\}")
 ASIN_RE = re.compile(r"\[(B0[0-9A-Z]{8})\]", re.I)
 BRACKET_RE = re.compile(r"[\[(][^\[\]()]{0,80}[\])]")
@@ -372,6 +393,8 @@ def is_non_author_folder(name: str) -> bool:
         return True
     if re.fullmatch(r"(?:book|vol|volume|#)?\s*\d{1,4}", n, re.I):
         return True
+    if COLLECTION_RE.search(humanize(n)):
+        return True
     return False
 
 
@@ -399,8 +422,15 @@ def is_junk_file(path: Path) -> bool:
 
 def humanize(name: str) -> str:
     stem = re.sub(r"\.part\d+$", "", name, flags=re.I)
-    if stem.count(".") >= 2:
-        stem = stem.replace(".", " ")
+    # A scene dump separates every word with a dot ("The.Book.Name.2020"), so two
+    # or more of THOSE means the dots are separators and have to go. An initial
+    # is different: its dot is followed by a space ("A. E. van Vogt"). Collapsing
+    # both kinds turned the initial into a bare "A", which looks_like_person then
+    # read as the article "a" and refused the whole name — so A. E. van Vogt
+    # parsed as author "E van Vogt", title "Slan A". Count and replace only the
+    # separator kind; a dot before whitespace is left alone.
+    if len(SEPARATOR_DOT_RE.findall(stem)) >= 2:
+        stem = SEPARATOR_DOT_RE.sub(" ", stem)
     stem = stem.replace("_", " ")
     stem = re.sub(r"\s+", " ", stem).strip()
     return stem
@@ -478,8 +508,15 @@ def peel_trailing_author(title: str) -> tuple[str | None, str]:
 
 
 def peel_index_prefix(text: str) -> str:
+    """Drop a leading list number ("43 - Title"), but never a leading YEAR.
+
+    This tool's own output format is "1978 - The Stand", so peeling any leading
+    four-digit run made a second pass over its own library throw the year away.
+    """
     text = text.strip()
-    text = re.sub(r"^\d{1,4}\s*[-.)]\s+", "", text)
+    m = re.match(r"^(\d{1,4})\s*[-.)]\s+", text)
+    if m and not YEAR_RE.fullmatch(m.group(1)):
+        text = text[m.end() :]
     return text.strip()
 
 
@@ -557,9 +594,14 @@ def parse_name(raw: str) -> Meta:
     title = text
     year: str | None = None
 
-    # Split on " - " but skip a pure numeric first segment (series index)
+    # Split on " - " but skip a pure numeric first segment (series index).
+    # A four-digit year is NOT an index, and this tool writes "1978 - The Stand"
+    # itself: without the year guard, a second pass over its own library read the
+    # year as a series number and dropped it, so every book silently became
+    # "Unknown - The Stand". Re-running the organiser has to be safe, because
+    # re-running it is exactly how a mis-filed library gets repaired.
     parts = [p.strip() for p in re.split(r"\s+-\s+", text) if p.strip()]
-    if parts and INDEX_RE.match(parts[0]):
+    if parts and INDEX_RE.match(parts[0]) and not YEAR_RE.fullmatch(parts[0]):
         parts = parts[1:]
         text = " - ".join(parts) if parts else text
 
@@ -626,14 +668,18 @@ def parse_name(raw: str) -> Meta:
         author = re.sub(r"\s+", " ", author).strip(" -_|") or None
         if author and INDEX_RE.match(author):
             author = None
-    # Prefer explicit "Read by X" when X looks like a person
+    # "Read by X" names the NARRATOR. It used to overwrite the author whenever X
+    # looked like a person, so "The Stand - Stephen King - Read by Grover Gardner"
+    # filed the book under Grover Gardner. Only fall back to it as the author when
+    # the name yielded none at all, which is the case it was really there for
+    # ("Some Title Audiobook Read by X" with no other credit).
     if read_by_author:
         rb = strip_quality(read_by_author)
         rb = re.sub(r"\s+", " ", rb).strip(" -_|")
-        if looks_like_person(rb):
-            author = rb
-        elif not author:
-            author = rb
+        if rb:
+            narrator = narrator or rb
+            if not author:
+                author = rb
     return Meta(author=author or "Unknown Author", title=title, year=year, narrator=narrator)
 
 
@@ -2092,6 +2138,103 @@ def self_test() -> int:
     assert (prune / "Some Author - The Book (2001)") in emptied, emptied
     for own in ("my-notes", "to-sort-later", "keep", "keep/nested"):
         assert (prune / own) not in emptied, f"{own} is not the tool's to remove"
+
+    # ── a numbered listicle pack ───────────────────────────────────────────
+    # "Top 100 Sci-Fi Books/43 - Title - Author - Year/" is how these torrents
+    # arrive. Three separate faults put the whole pack under one invented author
+    # in Audiobookshelf, so each is pinned here:
+    #   * the pack folder is four capitalised words, so looks_like_person said
+    #     yes and every book was filed under "Top 100 Sci-Fi Books"
+    #   * YEAR_RE only knew 19xx/20xx, so a pre-1900 classic had no year, the
+    #     right-hand side stopped looking like a person, and author and title
+    #     swapped — which is most of the front of any such list
+    #   * humanize collapsed the dots in "A. E." to bare "A", which reads as the
+    #     article "a", so the name was refused and the initial leaked into the title
+    pack = tmp / "pack"
+    listicle = pack / "Top 100 Sci-Fi Books"
+    expected = {
+        "1 - Frankenstein - Mary Shelley - 1818": ("Mary Shelley", "Frankenstein", "1818"),
+        "8 - The Time Machine - H. G. Wells - 1895": ("H G Wells", "The Time Machine", "1895"),
+        "19 - Slan - A. E. van Vogt - 1940": ("A. E. van Vogt", "Slan", "1940"),
+        "43 - The Day of the Triffids - John Wyndham - 1951": (
+            "John Wyndham",
+            "The Day of the Triffids",
+            "1951",
+        ),
+    }
+    for folder in expected:
+        for part in (1, 2):
+            touch(listicle / folder / f"{folder} - Part {part:02d}.mp3", f"{folder}-{part}")
+    pack_plan = build_plan(
+        source=pack,
+        dest=tmp / "pack-out",
+        trash=pack / "trash",
+        folder_format="year-title",
+        keep_names=False,
+        include_non_cover_images=False,
+        media_mode="audio",
+    )
+    got = {b.meta.title: (b.meta.author, b.meta.title, b.meta.year) for b in pack_plan.books}
+    assert len(pack_plan.books) == len(expected), [b.meta.title for b in pack_plan.books]
+    for author, title, year in expected.values():
+        assert title in got, f"{title!r} missing from {sorted(got)}"
+        assert got[title] == (author, title, year), f"{title}: got {got[title]}"
+    for b in pack_plan.books:
+        assert "Top 100" not in b.meta.author, b.meta.author
+        assert not b.meta.title[0].isdigit(), f"index prefix left on {b.meta.title!r}"
+
+    # The listicle wrapper is never an author, however capitalised it is.
+    assert is_non_author_folder("Top 100 Sci-Fi Books")
+    assert is_non_author_folder("Top 100 Sci Fi Books")
+    assert not is_non_author_folder("Isaac Asimov")
+    assert not is_non_author_folder("Ursula K Le Guin")
+
+    # Separator dots still collapse; an initial's dot survives.
+    assert humanize("The.Book.Name.2020") == "The Book Name 2020"
+    assert humanize("A. E. van Vogt") == "A. E. van Vogt"
+
+    # "Read by" is the narrator. Overwriting the author with it filed
+    # "The Stand - Stephen King - Read by Grover Gardner" under the narrator.
+    read_by = parse_name("The Stand - Stephen King - Read by Grover Gardner")
+    assert read_by.author == "Stephen King", read_by
+    assert read_by.narrator == "Grover Gardner", read_by
+
+    # ── a second pass must not degrade the first ───────────────────────────
+    # Repairing a mis-filed library means re-running the organiser over it, so
+    # reading its own output has to be lossless. It was not: the tool writes
+    # "1978 - The Stand" and then read that year back as a series index and
+    # dropped it, quietly turning every book in the library into a year-less one.
+    already = tmp / "already-clean"
+    for author, folder in (
+        ("Stephen King", "1978 - The Stand"),
+        ("Mary Shelley", "1818 - Frankenstein"),
+        ("John Wyndham", "1951 - The Day of the Triffids"),
+    ):
+        touch(already / author / folder / "01.mp3", folder)
+    second = build_plan(
+        source=already,
+        dest=already,
+        trash=already / "trash",
+        folder_format="year-title",
+        keep_names=False,
+        include_non_cover_images=False,
+        media_mode="audio",
+    )
+    seen = {(b.meta.author, b.meta.year, b.meta.title) for b in second.books}
+    assert seen == {
+        ("Stephen King", "1978", "The Stand"),
+        ("Mary Shelley", "1818", "Frankenstein"),
+        ("John Wyndham", "1951", "The Day of the Triffids"),
+    }, sorted(seen)
+    # And the folders it would write are the ones already there — a no-op pass.
+    for b in second.books:
+        assert book_folder_name(b.meta, "year-title") == f"{b.meta.year} - {b.meta.title}", b.meta
+
+    # A list number still peels; only a year is protected.
+    assert parse_name("43 - The Day of the Triffids - John Wyndham - 1951").title == (
+        "The Day of the Triffids"
+    )
+    assert parse_name("01 - Chapter One").title == "Chapter One"
 
     print("self-test OK")
     shutil.rmtree(tmp, ignore_errors=True)
