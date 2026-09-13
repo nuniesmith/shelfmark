@@ -63,10 +63,13 @@ jobs:
           fi
           exit $missing
 
+      # The image sets ENTRYPOINT [], so arguments REPLACE the CMD rather than
+      # appending to it — `docker run image --help` tries to exec "--help" as a
+      # binary. Name the console script explicitly.
       - name: Console entry points run
         run: |
-          docker run --rm shelfmark:ci --help > /dev/null
-          docker run --rm --entrypoint shelfmark-fix-metadata shelfmark:ci --help > /dev/null
+          docker run --rm shelfmark:ci shelfmark --help > /dev/null
+          docker run --rm shelfmark:ci shelfmark-fix-metadata --help > /dev/null
           echo "  ok       CLI entry points"
 
   # Freddy pulls this image; it has no copy of the source and cannot build it
