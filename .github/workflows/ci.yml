@@ -72,6 +72,19 @@ jobs:
           docker run --rm shelfmark:ci shelfmark-fix-metadata --help > /dev/null
           echo "  ok       CLI entry points"
 
+      # This one runs against Sullivan in production, so CI can only confirm it
+      # is on PATH, parses, and refuses to run unconfigured rather than
+      # silently reporting success — which is the exact failure it exists to
+      # catch in the account it checks.
+      - name: Sync verification script is shipped and sound
+        run: |
+          docker run --rm --entrypoint bash shelfmark:ci -n /usr/local/bin/verify-sullivan-sync
+          echo "  ok       verify-sullivan-sync parses"
+          if docker run --rm --entrypoint verify-sullivan-sync shelfmark:ci >/dev/null 2>&1; then
+            echo "  FAIL     verify-sullivan-sync exited 0 with no host configured"; exit 1
+          fi
+          echo "  ok       verify-sullivan-sync refuses an unconfigured run"
+
   # Freddy pulls this image; it has no copy of the source and cannot build it
   # itself. Without this job the Compose services there have nothing to start.
   publish:

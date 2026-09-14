@@ -237,9 +237,9 @@ Reference: <https://github.com/qbittorrent/qBittorrent/wiki/Web-API-Documentatio
 
 ### Sullivan-to-Freddy transfer
 
-- [ ] Create a restricted Sullivan account such as `shelfmark-sync`.
-- [ ] Limit its SSH/rsync access to the Shelfmark qBittorrent category.
-- [ ] Use a dedicated SSH key stored as a Docker secret on Freddy.
+- [x] Create a restricted Sullivan account such as `shelfmark-sync`.
+- [x] Limit its SSH/rsync access to the Shelfmark qBittorrent category, via a forced `rrsync -ro` command in `authorized_keys`. Verify with `docker exec shelfmark-worker verify-sullivan-sync` — never by hand, since three of its four checks pass by failing.
+- [x] Use a dedicated SSH key stored as a Docker secret on Freddy.
 - [ ] Pull completed files from Freddy after qBittorrent reports completion.
 - [ ] Verify size and checksum before organization.
 - [ ] Leave the Sullivan source available for seeding and recovery until the Freddy import is verified.
@@ -339,12 +339,12 @@ Princess deployment tasks:
 ### P0 — inventory and safety
 
 - [x] Resolve Freddy and Sullivan compose files with their real environment files.
-- [x] Record private addresses, VPN routes, and SSH reachability. (Firewall rules still need sudo.)
+- [x] Record private addresses, VPN routes, and SSH reachability, including firewall rules — see INVENTORY finding 8: ufw does not filter Docker-published ports.
 - [x] Confirm canonical audiobook and ebook roots on Freddy.
 - [x] Decide whether ABS or Calibre-Web owns ebooks. **ABS** — Calibre-Web has never run and both ebook roots are empty, so there is nothing to migrate and no competing writer.
-- [ ] Back up ABS config, ABS metadata, current audiobook storage, Sullivan book storage, compose files, and environment files.
+- [x] Back up ABS config, ABS metadata, current audiobook storage, Sullivan book storage, compose files, and environment files. 79G on sullivan, verified by file count and a zero-difference `rsync --itemize-changes` pass.
 - [x] ~~Rotate the committed Plex claim~~ — a claim token is valid five minutes after generation, so a stale one in Git is inert.
-- [ ] Create the restricted Sullivan sync account and key.
+- [x] Create the restricted Sullivan sync account and key. Account and key are in place; it was dead on arrival until the login shell was corrected — see INVENTORY finding 7.
 
 Acceptance criteria:
 

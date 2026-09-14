@@ -39,6 +39,13 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
 
 COPY src ./src
 COPY LICENSE README.md pyproject.toml ./
+
+# The sync-account check has to run from the side that holds the private key,
+# which is this container. Shipping it on PATH is what makes it runnable as
+# `docker exec shelfmark-worker verify-sullivan-sync` after provisioning.
+COPY scripts/verify-sullivan-sync.sh /usr/local/bin/verify-sullivan-sync
+RUN chmod 0755 /usr/local/bin/verify-sullivan-sync
+
 RUN python -m pip install --no-cache-dir --no-deps . \
     && chown --recursive shelfmark:shelfmark /app /data
 
