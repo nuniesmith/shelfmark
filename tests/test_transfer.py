@@ -48,7 +48,13 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         command = calls[0][0]
         self.assertEqual(command[0], "rsync")
-        self.assertIn("--protect-args", command)
+        # NOT --protect-args: rrsync refuses it ("option -s has been disabled
+        # on this server") and every transfer dies in the protocol handshake.
+        self.assertNotIn("--protect-args", command)
+        self.assertNotIn("-s", command)
+        # The path keeps its spaces, raw and unescaped. A forced command has no
+        # shell to word-split them, and escaping them makes rrsync look for a
+        # filename containing literal backslashes.
         self.assertIn("shelfmark-sync@sullivan.internal:/complete/shelfmark-books/Book Name/", command)
         ssh = command[command.index("-e") + 1]
         self.assertIn("BatchMode=yes", ssh)
@@ -155,3 +161,39 @@ class VerificationTests(unittest.TestCase):
             transfer = RsyncTransfer("sullivan", "shelfmark-sync", retries=0, runner=runner)
             with self.assertRaises(TransferError):
                 transfer.verify("/Book", Path(tmp))
+
+
+class RrsyncCompatibilityTests(unittest.TestCase):
+    """Options the restricted forced command will not accept.
+
+    The account is reached only through `rrsync -ro`, which allows a fixed set
+    of options and refuses the rest before rsync's protocol handshake even
+    completes. An option added for good reasons elsewhere can therefore break
+    every transfer, and the failure reads as a protocol error rather than as a
+    rejected flag.
+    """
+
+    def _command_for(self, method: str) -> list[str]:
+        captured: list[list[str]] = []
+
+        def runner(command: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+            captured.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory(prefix="shelfmark-rrsync-") as tmp:
+            transfer = RsyncTransfer("sullivan", "shelfmark-sync", retries=0, runner=runner)
+            getattr(transfer, method)("/Book Name", Path(tmp))
+        return captured[0]
+
+    def test_neither_call_uses_an_option_rrsync_refuses(self) -> None:
+        refused = {"--protect-args", "-s", "--secluded-args"}
+        for method in ("pull", "verify"):
+            with self.subTest(method=method):
+                self.assertEqual(refused & set(self._command_for(method)), set())
+
+    def test_spaces_in_the_remote_path_are_left_alone(self) -> None:
+        for method in ("pull", "verify"):
+            with self.subTest(method=method):
+                spec = [a for a in self._command_for(method) if a.startswith("shelfmark-sync@")]
+                self.assertEqual(spec, ["shelfmark-sync@sullivan:/Book Name/"])
+                self.assertNotIn("\\", spec[0])
