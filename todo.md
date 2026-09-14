@@ -74,13 +74,13 @@ These should be fixed before allowing an unattended service to move or delete fi
 - [ ] Preserve `metadata.json`, OPF files, manifests, embedded metadata, and recognized sidecars when scanning an already-managed library.
 - [ ] Make unknown-file trashing explicit and disabled by default for managed libraries.
 - [ ] Include parent-directory context in multipart archive identity so unrelated folders cannot be conflated.
-- [ ] Extract archives into an isolated staging directory before importing their contents.
-- [ ] Leave failed archives in place and mark the job failed; never move a failed archive to trash and return success.
+- [x] Extract archives into an isolated staging directory before importing their contents. Staged beside the destination so the finished tree moves into place with an atomic `rename` — a staging root on another filesystem would make that a copy, with an observable half-done state.
+- [x] Leave failed archives in place and mark the job failed; never move a failed archive to trash and return success. The archive is trashed only after a successful extract.
 - [ ] Make move/copy operations resumable and idempotent. If the destination already contains the same file, compare size/checksum and skip it instead of creating `01 (2).mp3`.
 - [x] Add an append-only transaction manifest for every worker import: source, destination, operation, checksum, timestamp, actor, and result.
 - [ ] Write destination files atomically, then rename the completed destination directory into place.
-- [ ] Use a quarantine directory for failed or ambiguous jobs instead of deleting source material.
-- [ ] Review all archive extractors for path traversal and symlink behavior. External extractors should run in staging with post-extraction validation.
+- [ ] Use a quarantine directory for failed or ambiguous jobs instead of deleting source material. **Done for extraction failures** (`--quarantine`, default `<source>/.shelfmark-quarantine`); still open for the other job types.
+- [x] Review all archive extractors for path traversal and symlink behavior. External extractors should run in staging with post-extraction validation. `_safe_target` screens member names; `_reject_escaping_links` runs after extraction, which is the only point unrar/unar/7z can be held to the same rule.
 - [ ] Keep the CLI dry-run/apply behavior compatible with the existing README.
 - [ ] Treat `fix_metadata.py` as a migration utility, not as the live metadata path. Revisit its assumption that metadata always exists at exactly two directory levels.
 - [ ] Align the Python version requirement. Use Python 3.13 or newer in Docker and update the README and `run.sh` check accordingly.
@@ -357,7 +357,7 @@ Acceptance criteria:
 - [ ] Extract parser, metadata, archive, planning, and file-operation code into importable modules.
 - [ ] Add the expanded identity model.
 - [x] Preserve managed-library sidecars.
-- [ ] Add isolated extraction and archive safety checks.
+- [x] Add isolated extraction and archive safety checks.
 - [x] Add manifests and operation checksums; atomic writes, quarantine, and resume logic remain.
 - [x] Make repeated imports idempotent for identical move/copy retries.
 - [ ] Add structured JSON output and stable error codes.

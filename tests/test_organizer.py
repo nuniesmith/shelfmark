@@ -4,9 +4,19 @@ import contextlib
 import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest import mock
 
-from src.main import apply_plan, build_plan, main
+from src import main as main_module
+from src.main import (
+    STAGING_DIR_NAME,
+    UnsafeArchive,
+    apply_plan,
+    build_plan,
+    extract_archive,
+    main,
+)
 
 
 class OrganizerSafetyTests(unittest.TestCase):
@@ -122,6 +132,164 @@ class OrganizerSafetyTests(unittest.TestCase):
 
         files = sorted(path.name for path in dest.rglob("*.mp3"))
         self.assertEqual(files, ["01.mp3"])
+
+
+class IsolatedExtractionTests(unittest.TestCase):
+    """Extraction stages, validates, then moves into place in one step.
+
+    The property under test is not "extraction works" but "a FAILED extraction
+    leaves the source exactly as it found it". Extraction used to write
+    straight into the dump beside the archive, and the organiser re-scans the
+    dump the moment extracting finishes — so fragments of a half-opened archive
+    were picked up and filed as a book, with nothing reported as wrong.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-extract-")
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "dump"
+        self.source.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def make_zip(self, path: Path, names: dict[str, bytes]) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, payload in names.items():
+                archive.writestr(name, payload)
+        return path
+
+    def visible_entries(self) -> list[str]:
+        """What a scan of the source would see — the walker skips dotted
+        directories, so staging must not appear here even mid-extraction."""
+        return sorted(
+            str(p.relative_to(self.source))
+            for p in self.source.rglob("*")
+            if not any(part.startswith(".") for part in p.relative_to(self.source).parts)
+        )
+
+    def test_successful_extraction_leaves_no_staging_behind(self) -> None:
+        archive = self.make_zip(self.source / "book.zip", {"01.mp3": b"audio"})
+
+        extracted = extract_archive(archive)
+
+        self.assertEqual(extracted, self.source / "book")
+        self.assertEqual((extracted / "01.mp3").read_bytes(), b"audio")
+        self.assertFalse((self.source / STAGING_DIR_NAME).exists())
+
+    def test_failure_part_way_leaves_nothing_in_the_source(self) -> None:
+        archive = self.make_zip(
+            self.source / "book.zip", {"01.mp3": b"audio", "02.mp3": b"audio"}
+        )
+        quarantine = self.root / "quarantine"
+
+        # Fail AFTER writing a file. That is the case that matters: an
+        # extractor that dies before touching the disk was never the problem.
+        def half_extract(path: Path, dest: Path) -> None:
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "01.mp3").write_bytes(b"audio")
+            raise RuntimeError("disk full")
+
+        with mock.patch.object(main_module, "extract_zip", half_extract):
+            with self.assertRaises(RuntimeError):
+                extract_archive(archive, quarantine=quarantine)
+
+        # The archive is the only remaining copy of that content. It stays.
+        self.assertTrue(archive.exists())
+        # And the fragment is NOT in the dump, under any name.
+        self.assertEqual(self.visible_entries(), ["book.zip"])
+        self.assertFalse((self.source / "book").exists())
+        self.assertFalse((self.source / STAGING_DIR_NAME).exists())
+        # It is held for inspection instead.
+        held = list(quarantine.rglob("01.mp3"))
+        self.assertEqual(len(held), 1, f"expected the partial file in quarantine, got {held}")
+
+    def corrupt_zip(self, path: Path) -> Path:
+        """A zip whose second member fails its CRC check.
+
+        This is the realistic shape of the failure, and the reason the bug
+        mattered. Python writes each member to disk and verifies its CRC
+        afterwards, so a corrupt member raises with BOTH files already on
+        disk — real, plausible-looking media files, one of them quietly
+        damaged. A truncated archive is the gentler case: it usually fails
+        while reading the header, before anything is written.
+        """
+        self.make_zip(
+            path,
+            {
+                "Some Author - The Book (2001)/01.mp3": b"audio" * 2000,
+                "Some Author - The Book (2001)/02.mp3": b"audio" * 2000,
+            },
+        )
+        raw = bytearray(path.read_bytes())
+        start = raw.rfind(b"audio" * 50)  # inside the second member's data
+        for i in range(start, start + 200):
+            raw[i] ^= 0xFF
+        path.write_bytes(raw)
+        return path
+
+    def test_fragments_do_not_survive_into_the_next_run(self) -> None:
+        """The end-to-end consequence, through main() rather than the helper.
+
+        A failed extraction is reported and stops the run, so the damage is
+        not in that run — it is that the fragments used to STAY in the dump.
+        Nothing afterwards knows they came from a broken archive, so the next
+        pass over the same dump files them as an ordinary book, one track of
+        it silently corrupt.
+        """
+        archive_path = self.corrupt_zip(self.source / "book.zip")
+        library = self.root / "library"
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main([str(self.source), "--dest", str(library), "--apply", "--yes"])
+
+        self.assertEqual(code, 1, stderr.getvalue())
+        self.assertTrue(archive_path.exists(), "a failed extract must not trash the archive")
+        self.assertEqual(self.visible_entries(), ["book.zip"])
+
+        # The operator clears the download they now know is broken, and runs
+        # again. There must be nothing left for that run to find.
+        archive_path.unlink()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            main([str(self.source), "--dest", str(library), "--apply", "--yes"])
+
+        self.assertFalse(
+            library.exists() and any(library.rglob("*.mp3")),
+            "fragments of a failed extraction were filed into the library",
+        )
+
+    def test_escaping_symlink_is_rejected_and_leaves_nothing(self) -> None:
+        """An escaping link is caught, and the rejected tree does not survive.
+
+        Stood up through a patched extractor rather than a crafted archive on
+        purpose: Python's `zipfile` never creates symlinks — it writes the link
+        target as ordinary file content — so a zip cannot exercise this path at
+        all. The check exists for unrar/unar/7z, which are handed the archive
+        whole and honour links by their own rules, and it runs after extraction
+        because that is the only point where every extractor can be held to the
+        same rule.
+        """
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_bytes(b"secret")
+
+        archive = self.make_zip(self.source / "evil.zip", {"placeholder": b""})
+
+        def extract_with_escaping_link(path: Path, dest: Path) -> None:
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "01.mp3").write_bytes(b"audio")
+            (dest / "link").symlink_to(outside)
+
+        with mock.patch.object(main_module, "extract_zip", extract_with_escaping_link):
+            with self.assertRaises(UnsafeArchive):
+                extract_archive(archive)
+
+        self.assertEqual(self.visible_entries(), ["evil.zip"])
+        self.assertFalse((self.source / STAGING_DIR_NAME).exists())
+        self.assertTrue((outside / "secret.txt").exists())
 
 
 if __name__ == "__main__":
