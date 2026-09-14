@@ -28,6 +28,7 @@ from src.shelfmark_service.worker import (
     Worker,
     _is_torrent_complete,
     _maybe_enqueue_reconcile,
+    _release_download_source,
     _split_webhook_url,
 )
 
@@ -111,32 +112,195 @@ class MetadataJobErrorCodeTests(WorkerTestCase):
         self.assertNotIn(leaking_body, ctx.exception.message)
 
 
+class ReleaseDownloadSourceTests(unittest.TestCase):
+    """`_release_download_source` is the fix itself: PR #17's `grab_release`
+    called `ProwlarrClient.grab()`, which POSTs to Prowlarr's own
+    `/api/v1/search` and lets PROWLARR route the release to whatever download
+    client it has configured -- on the live system, one client fixed to
+    category `prowlarr`, never `shelfmark-books`, so the reconciler (which
+    only watches the latter) never saw it. This function is what lets
+    `execute()` skip Prowlarr's routing and hand qBittorrent the release
+    directly instead."""
+
+    BASE = "http://prowlarr:9696"
+
+    def test_rewrites_scheme_and_host_but_keeps_path_and_full_query_string(self) -> None:
+        # apikey and link both live in the query string and are what actually
+        # authorizes the download -- see the docstring on the function under
+        # test for why only scheme+host may change.
+        release = {
+            "downloadUrl": "http://sullivan:9696/1/download?apikey=SECRET-KEY&link=abcDEF123%2F"
+        }
+        result = _release_download_source(release, self.BASE)
+        self.assertEqual(
+            result, "http://prowlarr:9696/1/download?apikey=SECRET-KEY&link=abcDEF123%2F"
+        )
+
+    def test_rewrites_to_a_custom_configured_base(self) -> None:
+        release = {"downloadUrl": "http://sullivan:9696/1/download?apikey=k&link=x"}
+        result = _release_download_source(release, "https://100.87.125.19:9696")
+        self.assertEqual(result, "https://100.87.125.19:9696/1/download?apikey=k&link=x")
+
+    def test_magnet_url_passes_through_completely_unchanged(self) -> None:
+        # A magnet URI has no proxying host in front of it -- nothing to
+        # rewrite, and rewriting it would corrupt the info-hash.
+        release = {"magnetUrl": "magnet:?xt=urn:btih:abc123&dn=Some+Book"}
+        result = _release_download_source(release, self.BASE)
+        self.assertEqual(result, "magnet:?xt=urn:btih:abc123&dn=Some+Book")
+
+    def test_download_url_is_preferred_over_magnet_url_when_both_are_present(self) -> None:
+        release = {
+            "downloadUrl": "http://sullivan:9696/1/download?apikey=k&link=x",
+            "magnetUrl": "magnet:?xt=urn:btih:should-not-be-used",
+        }
+        result = _release_download_source(release, self.BASE)
+        self.assertEqual(result, "http://prowlarr:9696/1/download?apikey=k&link=x")
+
+    def test_magnet_url_is_used_when_download_url_is_absent(self) -> None:
+        release = {"magnetUrl": "magnet:?xt=urn:btih:fallback"}
+        result = _release_download_source(release, self.BASE)
+        self.assertEqual(result, "magnet:?xt=urn:btih:fallback")
+
+    def test_missing_both_urls_reports_invalid_payload(self) -> None:
+        with self.assertRaises(ShelfmarkError) as ctx:
+            _release_download_source({"guid": "abc"}, self.BASE)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_PAYLOAD)
+
+    def test_malformed_download_url_reports_invalid_payload_without_leaking_it(self) -> None:
+        # "not-a-url" has no scheme/netloc for urlsplit to find -- and it
+        # still carries an apikey-shaped query string, so the failure message
+        # must describe the problem without ever echoing the value back.
+        release = {"downloadUrl": "not-a-url?apikey=SECRET-KEY"}
+        with self.assertRaises(ShelfmarkError) as ctx:
+            _release_download_source(release, self.BASE)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_PAYLOAD)
+        self.assertNotIn("SECRET-KEY", ctx.exception.message)
+        self.assertNotIn("SECRET-KEY", str(ctx.exception.details))
+
+    def test_malformed_configured_base_reports_provider_not_configured(self) -> None:
+        release = {"downloadUrl": "http://sullivan:9696/1/download?apikey=k&link=x"}
+        with self.assertRaises(ShelfmarkError) as ctx:
+            _release_download_source(release, "not-a-url")
+        self.assertEqual(ctx.exception.code, ErrorCode.PROVIDER_NOT_CONFIGURED)
+
+
 class GrabReleaseErrorCodeTests(WorkerTestCase):
-    def test_without_config_reports_provider_not_configured(self) -> None:
-        worker = self.make_worker()  # prowlarr_url/api_key both unset
-        job = self.make_job("grab_release", {"release": {"guid": "abc"}})
+    def _release(self) -> dict[str, object]:
+        return {"guid": "abc", "downloadUrl": "http://sullivan:9696/1/download?apikey=k&link=x"}
+
+    def test_without_qbittorrent_url_reports_provider_not_configured(self) -> None:
+        worker = self.make_worker()  # qbittorrent_url/credentials all unset
+        job = self.make_job("grab_release", {"release": self._release()})
+        with self.assertRaises(ShelfmarkError) as ctx:
+            worker.execute(job)
+        self.assertEqual(ctx.exception.code, ErrorCode.PROVIDER_NOT_CONFIGURED)
+
+    def test_without_qbittorrent_credentials_reports_provider_not_configured(self) -> None:
+        worker = self.make_worker(qbittorrent_url="http://qbit.internal")  # no key, no user/pass
+        job = self.make_job("grab_release", {"release": self._release()})
         with self.assertRaises(ShelfmarkError) as ctx:
             worker.execute(job)
         self.assertEqual(ctx.exception.code, ErrorCode.PROVIDER_NOT_CONFIGURED)
 
     def test_missing_release_object_reports_invalid_payload(self) -> None:
-        worker = self.make_worker(prowlarr_url="http://prowlarr.internal", prowlarr_api_key="k")
+        worker = self.make_worker(qbittorrent_url="http://qbit.internal", qbittorrent_api_key="k")
         job = self.make_job("grab_release", {})  # no release
         with self.assertRaises(ShelfmarkError) as ctx:
             worker.execute(job)
         self.assertEqual(ctx.exception.code, ErrorCode.INVALID_PAYLOAD)
 
-    def test_upstream_failure_reports_upstream_unavailable(self) -> None:
-        worker = self.make_worker(prowlarr_url="http://prowlarr.internal", prowlarr_api_key="secret-key")
+    def test_non_dict_release_reports_invalid_payload(self) -> None:
+        # NOTE on mutation testing: an empty/absent `release` (the test
+        # above) turns out to raise INVALID_PAYLOAD even with the
+        # `isinstance(release, dict)` guard deleted, because
+        # `_release_download_source` independently rejects a release with
+        # neither URL -- that test alone would not have proven this guard
+        # does anything. THIS case is the one that actually distinguishes
+        # it: a non-dict `release` (a string here) has no `.get()`, and
+        # without the guard this becomes an unhandled AttributeError ->
+        # ErrorCode.INTERNAL instead of INVALID_PAYLOAD.
+        worker = self.make_worker(qbittorrent_url="http://qbit.internal", qbittorrent_api_key="k")
+        job = self.make_job("grab_release", {"release": "not-a-dict"})
+        with self.assertRaises(ShelfmarkError) as ctx:
+            worker.execute(job)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_PAYLOAD)
+
+    def test_release_missing_both_urls_reports_invalid_payload(self) -> None:
+        worker = self.make_worker(qbittorrent_url="http://qbit.internal", qbittorrent_api_key="k")
         job = self.make_job("grab_release", {"release": {"guid": "abc"}})
+        with self.assertRaises(ShelfmarkError) as ctx:
+            worker.execute(job)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_PAYLOAD)
+
+    def test_adds_to_qbittorrent_using_the_reconciler_s_own_configured_category(self) -> None:
+        # The exact bug: a release grabbed through Prowlarr's own routing
+        # landed in category "prowlarr", which the reconciler never watches.
+        # Reading `qbittorrent_category` here (the SAME setting
+        # `_reconcile_downloads` reads) is what makes that impossible to
+        # repeat -- the two can no longer drift apart.
+        worker = self.make_worker(
+            qbittorrent_url="http://qbit.internal",
+            qbittorrent_api_key="k",
+            qbittorrent_category="a-custom-category",
+        )
+        job = self.make_job("grab_release", {"release": self._release()})
         with mock.patch(
-            "src.shelfmark_service.worker.ProwlarrClient.grab",
-            side_effect=ServiceError("prowlarr", "secret-key rejected", status=401),
+            "src.shelfmark_service.worker.QBittorrentClient.login", return_value="api-key"
+        ), mock.patch(
+            "src.shelfmark_service.worker.QBittorrentClient.add_urls", return_value="Ok."
+        ) as add_urls:
+            result = worker.execute(job)
+        add_urls.assert_called_once_with(
+            ["http://prowlarr:9696/1/download?apikey=k&link=x"], category="a-custom-category"
+        )
+        self.assertTrue(result["submitted"])
+
+    def test_upstream_failure_reports_upstream_unavailable_without_leaking_the_apikey(self) -> None:
+        worker = self.make_worker(qbittorrent_url="http://qbit.internal", qbittorrent_api_key="k")
+        job = self.make_job("grab_release", {"release": self._release()})
+        with mock.patch(
+            "src.shelfmark_service.worker.QBittorrentClient.login", return_value="api-key"
+        ), mock.patch(
+            "src.shelfmark_service.worker.QBittorrentClient.add_urls",
+            # Worst case: the upstream error text itself echoes back the
+            # secret-bearing URL it was given -- _upstream_failure must still
+            # keep it out of the raised ShelfmarkError regardless.
+            side_effect=ServiceError("qbittorrent", "rejected apikey=k", status=400),
         ):
             with self.assertRaises(ShelfmarkError) as ctx:
                 worker.execute(job)
         self.assertEqual(ctx.exception.code, ErrorCode.UPSTREAM_UNAVAILABLE)
-        self.assertNotIn("secret-key", ctx.exception.message)
+        self.assertNotIn("apikey=k", ctx.exception.message)
+
+    def test_grab_failure_does_not_leak_the_apikey_into_the_stored_job_row_or_manifest(
+        self,
+    ) -> None:
+        """The brief's specific constraint: the apikey lives in the query
+        string of EVERY download URL, and a job row plus its manifest are
+        both persisted -- so a grab failure must not write it to either."""
+        secret = "top-secret-prowlarr-key"
+        worker = self.make_worker(
+            qbittorrent_url="http://qbit.internal",
+            qbittorrent_api_key="k",
+            manifest_root=Path(self.tmp.name) / "manifests",
+        )
+        release = {
+            "downloadUrl": f"http://sullivan:9696/1/download?apikey={secret}&link=x"
+        }
+        self.database.enqueue("grab_release", {"release": release})
+        with mock.patch(
+            "src.shelfmark_service.worker.QBittorrentClient.login", return_value="api-key"
+        ), mock.patch(
+            "src.shelfmark_service.worker.QBittorrentClient.add_urls",
+            side_effect=ServiceError("qbittorrent", f"rejected: {secret}", status=400),
+        ):
+            self.assertTrue(worker.run_once())
+        failed = self.database.list_jobs(status="failed")
+        self.assertEqual(len(failed), 1)
+        self.assertNotIn(secret, failed[0].error or "")
+        self.assertNotIn(secret, str(failed[0].error_code))
+        manifest_path = Path(self.tmp.name) / "manifests" / f"{failed[0].id}.jsonl"
+        self.assertNotIn(secret, manifest_path.read_text())
 
 
 class TransferCompletedErrorCodeTests(WorkerTestCase):

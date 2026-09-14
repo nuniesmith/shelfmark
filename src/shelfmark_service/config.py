@@ -87,6 +87,21 @@ class Settings:
     # manual `/downloads` look at the same category unless both are told
     # otherwise.
     qbittorrent_category: str = "shelfmark-books"
+    # Prowlarr's `downloadUrl` proxies the real .torrent from the tracker
+    # using PROWLARR's own credentials -- that's what lets a private-tracker
+    # release (IPTorrents) work with no tracker auth of its own. But the
+    # host in that URL is Prowlarr's OWN view of itself, which is not
+    # necessarily reachable from qBittorrent's network namespace: verified
+    # live from inside the qBittorrent container on Sullivan, `sullivan:9696`
+    # (Prowlarr's own hostname) refused the connection while `prowlarr:9696`
+    # -- the name qBittorrent and Prowlarr both resolve on their shared
+    # `sullivan_download` Docker network -- answered fine. grab_release
+    # rewrites just the scheme+host of `downloadUrl` to this base (see
+    # worker.py) before handing it to qBittorrent directly; the path and
+    # full query string (apikey and link both live there) are left alone,
+    # since that is what actually authorizes the download. Defaults to the
+    # same container-name convention PROWLARR_URL already uses.
+    qbittorrent_prowlarr_base_url: str = "http://prowlarr:9696"
     sullivan_host: str | None = None
     sullivan_user: str | None = None
     sullivan_identity_file: Path | None = None
@@ -138,6 +153,9 @@ class Settings:
             qbittorrent_password=os.environ.get("QBITTORRENT_PASSWORD") or None,
             qbittorrent_api_key=os.environ.get("QBITTORRENT_API_KEY") or None,
             qbittorrent_category=os.environ.get("QBITTORRENT_CATEGORY", "shelfmark-books"),
+            qbittorrent_prowlarr_base_url=os.environ.get(
+                "QBITTORRENT_PROWLARR_BASE_URL", "http://prowlarr:9696"
+            ),
             sullivan_host=os.environ.get("SULLIVAN_SSH_HOST") or None,
             sullivan_user=os.environ.get("SULLIVAN_SSH_USER") or None,
             sullivan_identity_file=_path_from_env("SULLIVAN_SSH_IDENTITY_FILE"),
