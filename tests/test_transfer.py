@@ -64,3 +64,94 @@ class TransferTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostKeyTests(unittest.TestCase):
+    """The transfer failed every time with "Host key verification failed".
+
+    The container has no known_hosts entry for Sullivan and BatchMode=yes
+    correctly refuses to prompt for one. The bug survived because every
+    hand-run check passes StrictHostKeyChecking and UserKnownHostsFile on the
+    command line — proving the ACCOUNT works while the CODE PATH stayed broken.
+    """
+
+    @staticmethod
+    def _ssh_for(**kwargs: object) -> str:
+        captured: list[list[str]] = []
+
+        def runner(command: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+            captured.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory(prefix="shelfmark-hostkey-") as tmp:
+            transfer = RsyncTransfer(
+                host="sullivan", user="shelfmark-sync", retries=0, runner=runner, **kwargs
+            )
+            transfer.pull("/Book", Path(tmp) / "incoming")
+        return captured[0][captured[0].index("-e") + 1]
+
+    def test_host_key_checking_is_always_specified(self) -> None:
+        ssh = self._ssh_for()
+        self.assertIn("StrictHostKeyChecking=", ssh)
+
+    def test_default_accepts_a_new_host_then_pins_it(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="shelfmark-hostkey-") as tmp:
+            known = Path(tmp) / "nested" / "known_hosts"
+            ssh = self._ssh_for(known_hosts=known)
+            self.assertIn("StrictHostKeyChecking=accept-new", ssh)
+            self.assertIn(f"UserKnownHostsFile={known}", ssh)
+            # Created eagerly: ssh will not write into a directory that is not
+            # there, and would fail the transfer rather than record the key.
+            self.assertTrue(known.parent.is_dir())
+
+    def test_strict_mode_refuses_an_unknown_host(self) -> None:
+        ssh = self._ssh_for(strict_host_key=True)
+        self.assertIn("StrictHostKeyChecking=yes", ssh)
+
+
+class VerificationTests(unittest.TestCase):
+    """`rsync --checksum --dry-run` exits 0 whether or not anything differs.
+
+    The differences are in the OUTPUT. Reading the exit status instead would
+    report every transfer as verified, including a corrupt one.
+    """
+
+    def _verify_with(self, stdout: str) -> list[str]:
+        def runner(command: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn("--checksum", command)
+            self.assertIn("--dry-run", command)
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        with tempfile.TemporaryDirectory(prefix="shelfmark-verify-") as tmp:
+            transfer = RsyncTransfer("sullivan", "shelfmark-sync", retries=0, runner=runner)
+            return transfer.verify("/Book", Path(tmp))
+
+    def test_identical_tree_reports_no_differences(self) -> None:
+        self.assertEqual(self._verify_with(""), [])
+
+    def test_a_changed_checksum_is_reported(self) -> None:
+        # Exactly what rrsync returned for a locally corrupted file.
+        out = ">fcst...... Ursula K Le Guin - The Dispossessed (1974)/01.mp3"
+        self.assertEqual(
+            self._verify_with(out), ["Ursula K Le Guin - The Dispossessed (1974)/01.mp3"]
+        )
+
+    def test_a_missing_file_is_reported(self) -> None:
+        self.assertEqual(self._verify_with(">f+++++++++ book/02.mp3"), ["book/02.mp3"])
+
+    def test_directory_mtime_alone_is_not_a_difference(self) -> None:
+        """A directory timestamp is not a corrupt transfer. Treating it as one
+        would fail verification on essentially every pull."""
+        self.assertEqual(self._verify_with(".d..t...... ./"), [])
+
+    def test_file_permission_change_alone_is_not_a_difference(self) -> None:
+        self.assertEqual(self._verify_with(".f....p.... book/01.mp3"), [])
+
+    def test_a_failed_verification_run_raises_rather_than_passing(self) -> None:
+        def runner(command: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 255, "", "Host key verification failed.")
+
+        with tempfile.TemporaryDirectory(prefix="shelfmark-verify-") as tmp:
+            transfer = RsyncTransfer("sullivan", "shelfmark-sync", retries=0, runner=runner)
+            with self.assertRaises(TransferError):
+                transfer.verify("/Book", Path(tmp))

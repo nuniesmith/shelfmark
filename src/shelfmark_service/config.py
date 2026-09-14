@@ -13,6 +13,13 @@ def _path_from_env(name: str) -> Path | None:
     return Path(value).expanduser() if value else None
 
 
+def _bool_from_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "").strip().casefold()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
 def _float_from_env(name: str, default: float) -> float:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -57,6 +64,8 @@ class Settings:
     sullivan_user: str | None = None
     sullivan_identity_file: Path | None = None
     sullivan_ssh_port: int = 22
+    sullivan_known_hosts: Path | None = Path("/data/known_hosts")
+    sullivan_strict_host_key: bool = False
     sullivan_completed_root: str = "/complete/shelfmark-books"
     transfer_settle_seconds: float = 30.0
     transfer_poll_seconds: float = 5.0
@@ -91,6 +100,12 @@ class Settings:
             sullivan_user=os.environ.get("SULLIVAN_SSH_USER") or None,
             sullivan_identity_file=_path_from_env("SULLIVAN_SSH_IDENTITY_FILE"),
             sullivan_ssh_port=int(os.environ.get("SULLIVAN_SSH_PORT", "22")),
+            # Persistent, so the key learned on first contact is pinned for
+            # every later transfer rather than re-trusted each time.
+            sullivan_known_hosts=(
+                _path_from_env("SULLIVAN_SSH_KNOWN_HOSTS") or Path("/data/known_hosts")
+            ),
+            sullivan_strict_host_key=_bool_from_env("SULLIVAN_SSH_STRICT_HOST_KEY", False),
             sullivan_completed_root=os.environ.get(
                 "SULLIVAN_COMPLETED_ROOT", "/complete/shelfmark-books"
             ),

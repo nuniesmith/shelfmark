@@ -240,10 +240,10 @@ Reference: <https://github.com/qbittorrent/qBittorrent/wiki/Web-API-Documentatio
 - [x] Create a restricted Sullivan account such as `shelfmark-sync`.
 - [x] Limit its SSH/rsync access to the Shelfmark qBittorrent category, via a forced `rrsync -ro` command in `authorized_keys`. Verify with `docker exec shelfmark-worker verify-sullivan-sync` — never by hand, since three of its four checks pass by failing.
 - [x] Use a dedicated SSH key stored as a Docker secret on Freddy.
-- [ ] Pull completed files from Freddy after qBittorrent reports completion.
-- [ ] Verify size and checksum before organization.
-- [ ] Leave the Sullivan source available for seeding and recovery until the Freddy import is verified.
-- [ ] Only remove remote data through an explicit retention policy after successful import.
+- [~] Pull completed files from Freddy after qBittorrent reports completion. **The pull works and is verified end to end; nothing watches qBittorrent for completion yet** — the job has to be started by hand. This is the orchestration gap, and it is what P3 still needs.
+- [x] Verify size and checksum before organization. A mismatch fails the job rather than handing a partial tree to the organiser, which is destructive.
+- [x] Leave the Sullivan source available for seeding and recovery until the Freddy import is verified. True by construction: the sync account is `rrsync -ro`, so Shelfmark cannot delete anything on sullivan even if asked to.
+- [ ] Only remove remote data through an explicit retention policy after successful import. Nothing removes remote data today, and the read-only account means nothing can.
 
 ## Download workflow
 
@@ -414,12 +414,12 @@ GET  /readyz
 - [x] Add initial Discord slash-command adapter with deferred responses and release-grab buttons.
 - [x] Add Discord metadata-match and library-scan job commands.
 - [x] Add qBittorrent Shelfmark-category status to the API and Discord adapter.
-- [ ] Implement SSH/rsync transfer client.
-- [ ] Implement stable-file detection.
-- [ ] Implement checksum verification.
-- [ ] Implement organizer preview/apply jobs.
-- [ ] Implement ABS scan and metadata jobs.
-- [ ] Add client timeouts, retries, backoff, and circuit breaking.
+- [x] Implement SSH/rsync transfer client. `RsyncTransfer` in `transfer.py`, driven by `POST /api/v1/transfers/pull`.
+- [x] Implement stable-file detection. `wait_until_stable` — two identical snapshots AND a minimum age, so a file written twice inside one filesystem timestamp tick is not called settled.
+- [x] Implement checksum verification. A second `rsync --checksum --dry-run` pass after the tree settles. **The differences are in the OUTPUT, not the exit status** — rsync exits 0 either way, so reading the status would report every transfer as verified, corrupt ones included.
+- [x] Implement organizer preview/apply jobs. `organize_preview` and `organize_apply` in `worker.execute`.
+- [x] Implement ABS scan and metadata jobs. `library_scan`, `metadata_match`, `metadata_update`.
+- [~] Add client timeouts, retries, backoff, and circuit breaking. Timeouts, bounded retries and backoff are in `HttpClient`; **circuit breaking is not implemented** — a provider that is down is retried on every job.
 
 Acceptance criteria:
 
