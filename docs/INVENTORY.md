@@ -193,6 +193,65 @@ normalizes it. No action.
 Recorded in `todo.md` as a committed credential. A Plex claim token is valid for
 five minutes after generation, so a stale one in Git is inert. Closed.
 
+### 7. The sync account was dead on arrival — nologin blocks the forced command
+
+Found 2026-09-14, the first time the account was exercised from freddy rather
+than reasoned about.
+
+`provision-sullivan-sync.sh` created `shelfmark-sync` with
+`--shell /usr/sbin/nologin`, on the assumption that "no shell" was the
+hardening. It is not: **sshd runs a forced command as `$SHELL -c "<command>"`**,
+so `nologin` intercepts it and answers *"This account is currently not
+available"*. `rrsync` never ran. The account could do nothing whatsoever.
+
+What makes this worth a finding rather than a one-line fix is how it presents.
+Of the four properties that define the account, three are prohibitions:
+
+```
+  FAIL  read of the download category succeeds     <- the only informative one
+  PASS  interactive command is refused
+  PASS  write to Sullivan is refused
+  PASS  read outside the category is refused
+```
+
+A totally broken account satisfies every prohibition. Checked by hand, in the
+order a person naturally checks them, it reads as *hardened* — and the failure
+surfaces only later, as a transfer that never happens. The read check is the
+single one that distinguishes "locked down" from "inert", which is why
+verification now lives in `scripts/verify-sullivan-sync.sh` with captured exit
+codes rather than in a list of commands to run and eyeball.
+
+The fix is `usermod --shell /bin/sh shelfmark-sync`. It gives up nothing: the
+forced command in `authorized_keys` replaces whatever the client asks for, so
+interactive use stays unreachable. The shell was never what prevented it.
+
+### 8. ufw does not filter Docker-published ports
+
+The operator captured `ufw status` on both hosts on 2026-09-13. The operative
+conclusion, re-verified 2026-09-14 from sullivan against freddy:
+
+```
+  10.0.0.96:8110       /healthz -> 200    (LAN)
+  100.106.65.55:8110   /healthz -> 200    (tailnet)
+```
+
+Docker installs its own iptables rules in `DOCKER-USER` and the `nat` table,
+which are consulted **before** ufw's chains. A published port is therefore
+reachable from any host that can route to the address, whatever `ufw status`
+lists. This is standard Docker behaviour, not a misconfiguration of these
+hosts, and it applies to every published port on both machines — not only
+Shelfmark's.
+
+Shelfmark's own exposure is now bounded by authentication rather than by the
+firewall: `SHELFMARK_API_TOKEN` is set, and `/api/v1/*` returns 401 without it
+(`/healthz` stays open by design). Addresses are private in both cases — RFC1918
+on the LAN and 100.64.0.0/10 CGNAT on the tailnet — so nothing here is
+internet-reachable.
+
+**Not changed.** Restricting these ports means editing live firewall rules on
+two hosts that serve other services, which is its own task with its own
+rollback plan. Recorded so the decision is explicit rather than overlooked.
+
 ## Backups
 
 Pulled by sullivan from freddy — a different host from the originals, which is
@@ -260,10 +319,35 @@ passing the public key generated on freddy:
 sudo bash provision-sullivan-sync.sh "ssh-ed25519 AAAA... shelfmark@freddy"
 ```
 
-It creates `shelfmark-sync` with no shell and an `authorized_keys` entry that
-forces `rrsync -ro` against a single directory, so the account can do exactly
-one thing: read that directory over rsync. No shell, no pty, no forwarding, no
-write.
+It creates `shelfmark-sync` with an `authorized_keys` entry that forces
+`rrsync -ro` against a single directory, so the account can do exactly one
+thing: read that directory over rsync. No interactive shell, no pty, no
+forwarding, no write.
+
+**The login shell must be a real one — `/bin/sh`, not `/usr/sbin/nologin`.**
+An SSH forced command is not executed directly; sshd runs it as
+`$SHELL -c "<command>"`. With `nologin` the account answers every connection
+with *"This account is currently not available"* and `rrsync` never starts, so
+the one operation the account exists for is blocked while the three that must
+fail still fail. Nothing is given up by `/bin/sh`: the forced command replaces
+whatever the client asks for, so interactive use is unreachable regardless.
+The first version of the provisioning script shipped `nologin` and was dead on
+arrival — verified 2026-09-14 and fixed.
+
+### Verifying it
+
+Run from freddy, inside the worker, where the private key lives:
+
+```bash
+docker exec shelfmark-worker verify-sullivan-sync
+```
+
+Four properties, and **the asymmetry matters**: one must succeed and three must
+fail. A wholly broken account — wrong shell, missing `rrsync`, revoked key —
+still fails all three of the checks that are supposed to fail, so a hand-run
+session reads as "everything refused, looks locked down" when nothing works at
+all. Only the read check separates those two states, which is why this is a
+script with captured exit codes and not a list of commands to eyeball.
 
 The category is `/media/qbittorrent/shelfmark`, deliberately **outside**
 `/media/qbittorrent/complete`. Unpackerr's catch-all watcher is
@@ -290,14 +374,16 @@ delete `/tmp/shelfmark-sync*`.
 - [x] Decide whether ABS or Calibre-Web owns ebooks — **ABS, see finding 4**
 - [x] ~~Rotate the committed Plex claim~~ — not a credential, see finding 6
 - [x] Back up ABS config, ABS metadata, audiobook storage and Compose
-- [x] Create the restricted Sullivan sync account and key — script written and
-      the key wired through CI; **needs one sudo run on sullivan to take effect**
+- [x] Create the restricted Sullivan sync account and key — account exists on
+      sullivan and the key is wired through CI. **The account was dead on
+      arrival** (finding 7); the shell fix needs one `usermod` with root, after
+      which `verify-sullivan-sync` must report all four checks holding.
 - [x] Delete the stale 60G tarball — done, 59.5 GiB reclaimed
-- [ ] Record firewall rules — `ufw status` needs sudo, not captured
+- [x] Record firewall rules — captured 2026-09-13, see finding 8
 
-Two things need a human with root, and neither can be done from a key-based
-session: running `provision-sullivan-sync.sh` on sullivan, and reading the
-firewall rules on either host. Everything else in P0 is closed.
+One item remains open, and it is the sync account: provisioned, key in place,
+but blocked on a one-line shell change with root on sullivan. Everything else
+in P0 is closed.
 
 Environment files are deliberately **not** backed up. They hold live secrets, and
 every value in them is already recoverable from GitHub Actions secrets, which is
