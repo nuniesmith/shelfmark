@@ -83,6 +83,10 @@ class Settings:
     qbittorrent_username: str | None = None
     qbittorrent_password: str | None = None
     qbittorrent_api_key: str | None = None
+    # Matches /api/v1/downloads' own default, so a reconciler pass and a
+    # manual `/downloads` look at the same category unless both are told
+    # otherwise.
+    qbittorrent_category: str = "shelfmark-books"
     sullivan_host: str | None = None
     sullivan_user: str | None = None
     sullivan_identity_file: Path | None = None
@@ -94,6 +98,13 @@ class Settings:
     transfer_poll_seconds: float = 5.0
     transfer_timeout_seconds: float = 3600.0
     worker_stale_seconds: float = 900.0
+    # Off switch for the whole grab->transfer->organize->scan chain: an
+    # operator who needs to stop automatic imports (a bad release flooding
+    # retries, a library reorganization in progress) flips one env var and
+    # restarts, rather than needing a redeploy of different code.
+    download_automation_enabled: bool = True
+    reconcile_interval_seconds: float = 60.0
+    discord_webhook_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -126,6 +137,7 @@ class Settings:
             qbittorrent_username=os.environ.get("QBITTORRENT_USERNAME") or None,
             qbittorrent_password=os.environ.get("QBITTORRENT_PASSWORD") or None,
             qbittorrent_api_key=os.environ.get("QBITTORRENT_API_KEY") or None,
+            qbittorrent_category=os.environ.get("QBITTORRENT_CATEGORY", "shelfmark-books"),
             sullivan_host=os.environ.get("SULLIVAN_SSH_HOST") or None,
             sullivan_user=os.environ.get("SULLIVAN_SSH_USER") or None,
             sullivan_identity_file=_path_from_env("SULLIVAN_SSH_IDENTITY_FILE"),
@@ -143,6 +155,9 @@ class Settings:
             transfer_poll_seconds=_float_from_env("SHELFMARK_TRANSFER_POLL_SECONDS", 5.0),
             transfer_timeout_seconds=_float_from_env("SHELFMARK_TRANSFER_TIMEOUT_SECONDS", 3600.0),
             worker_stale_seconds=_float_from_env("SHELFMARK_WORKER_STALE_SECONDS", 900.0),
+            download_automation_enabled=_bool_from_env("SHELFMARK_DOWNLOAD_AUTOMATION_ENABLED", True),
+            reconcile_interval_seconds=_float_from_env("SHELFMARK_RECONCILE_INTERVAL_SECONDS", 60.0),
+            discord_webhook_url=os.environ.get("SHELFMARK_DISCORD_WEBHOOK_URL") or None,
         )
 
     def configured_roots(self) -> dict[str, Path]:

@@ -24,7 +24,12 @@ from src.shelfmark_service.config import Settings
 from src.shelfmark_service.db import Database
 from src.shelfmark_service.errors import ErrorCode, ShelfmarkError
 from src.shelfmark_service.transfer import TransferError
-from src.shelfmark_service.worker import Worker
+from src.shelfmark_service.worker import (
+    Worker,
+    _is_torrent_complete,
+    _maybe_enqueue_reconcile,
+    _split_webhook_url,
+)
 
 
 class WorkerTestCase(unittest.TestCase):
@@ -265,6 +270,297 @@ class RunOnceErrorPersistenceTests(WorkerTestCase):
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0].error_code, ErrorCode.INTERNAL.value)
         self.assertIn("disk exploded", failed[0].error or "")
+
+
+class TorrentCompleteStateTests(unittest.TestCase):
+    """`_is_torrent_complete` is what stands between the reconciler and
+    pulling a torrent qBittorrent is still writing to. See the comment on
+    `_QBITTORRENT_COMPLETE_STATES` in worker.py for why `progress == 1` alone
+    is not sufficient."""
+
+    def test_seeding_at_full_progress_is_complete(self) -> None:
+        self.assertTrue(_is_torrent_complete({"progress": 1.0, "state": "uploading"}))
+
+    def test_stalled_seeding_is_complete(self) -> None:
+        self.assertTrue(_is_torrent_complete({"progress": 1, "state": "stalledUP"}))
+
+    def test_both_paused_and_stopped_naming_are_complete(self) -> None:
+        # qBittorrent 5.x renamed pausedUP -> stoppedUP; both must be accepted
+        # since this codebase does not pin a version.
+        self.assertTrue(_is_torrent_complete({"progress": 1.0, "state": "pausedUP"}))
+        self.assertTrue(_is_torrent_complete({"progress": 1.0, "state": "stoppedUP"}))
+
+    def test_checking_at_full_progress_is_not_complete(self) -> None:
+        # The exact trap named in the brief: 100% progress while qBittorrent
+        # re-hashes files already on disk after its own restart.
+        self.assertFalse(_is_torrent_complete({"progress": 1.0, "state": "checkingUP"}))
+
+    def test_moving_at_full_progress_is_not_complete(self) -> None:
+        # Content is being relocated to its final save path -- not yet at
+        # content_path, so pulling now would race the move.
+        self.assertFalse(_is_torrent_complete({"progress": 1.0, "state": "moving"}))
+
+    def test_partial_progress_is_not_complete_even_in_an_up_state(self) -> None:
+        self.assertFalse(_is_torrent_complete({"progress": 0.9, "state": "uploading"}))
+
+    def test_missing_fields_are_not_complete(self) -> None:
+        self.assertFalse(_is_torrent_complete({}))
+
+
+class ReconcileDownloadsJobTests(WorkerTestCase):
+    def _worker(self) -> Worker:
+        return self.make_worker(qbittorrent_url="http://qbit.internal", qbittorrent_api_key="key")
+
+    def test_without_url_reports_provider_not_configured(self) -> None:
+        worker = self.make_worker()  # qbittorrent_url unset
+        job = self.make_job("reconcile_downloads", {})
+        with self.assertRaises(ShelfmarkError) as ctx:
+            worker.execute(job)
+        self.assertEqual(ctx.exception.code, ErrorCode.PROVIDER_NOT_CONFIGURED)
+
+    def test_without_credentials_reports_provider_not_configured(self) -> None:
+        worker = self.make_worker(qbittorrent_url="http://qbit.internal")  # no key, no user/pass
+        job = self.make_job("reconcile_downloads", {})
+        with self.assertRaises(ShelfmarkError) as ctx:
+            worker.execute(job)
+        self.assertEqual(ctx.exception.code, ErrorCode.PROVIDER_NOT_CONFIGURED)
+
+    def test_login_failure_reports_upstream_unavailable(self) -> None:
+        worker = self._worker()
+        job = self.make_job("reconcile_downloads", {})
+        with mock.patch(
+            "src.shelfmark_service.worker.QBittorrentClient.login",
+            side_effect=ServiceError("qbittorrent", "bad credentials", status=403),
+        ):
+            with self.assertRaises(ShelfmarkError) as ctx:
+                worker.execute(job)
+        self.assertEqual(ctx.exception.code, ErrorCode.UPSTREAM_UNAVAILABLE)
+
+    def test_only_genuinely_complete_torrents_are_claimed(self) -> None:
+        worker = self._worker()
+        job = self.make_job("reconcile_downloads", {})
+        torrents = [
+            {"hash": "h1", "name": "Book One", "progress": 1.0, "state": "uploading"},
+            {"hash": "h2", "name": "Book Two", "progress": 1.0, "state": "checkingUP"},
+            {"hash": "h3", "name": "Book Three", "progress": 1.0, "state": "stalledUP"},
+            {"hash": "h4", "name": "Book Four", "progress": 0.5, "state": "downloading"},
+        ]
+        with mock.patch("src.shelfmark_service.worker.QBittorrentClient.login", return_value="Ok."), mock.patch(
+            "src.shelfmark_service.worker.QBittorrentClient.torrents", return_value=torrents
+        ):
+            result = worker.execute(job)
+        self.assertEqual(result["seen"], 4)
+        self.assertEqual(result["completed"], 2)
+        self.assertEqual(len(result["claimed_jobs"]), 2)
+        queued = {j.payload["remote_path"]: j for j in self.database.list_jobs(status="queued", limit=50)}
+        self.assertIn("Book One", queued)
+        self.assertIn("Book Three", queued)
+        self.assertNotIn("Book Two", queued)
+        self.assertNotIn("Book Four", queued)
+        self.assertEqual(queued["Book One"].payload["_reconcile_hash"], "h1")
+
+    def test_the_same_hash_is_never_claimed_twice(self) -> None:
+        """The idempotency requirement from the brief, exercised at the job
+        level: a second reconcile pass over the same still-seeding torrent
+        must not enqueue a second transfer_completed job."""
+        worker = self._worker()
+        torrents = [{"hash": "h1", "name": "Book One", "progress": 1.0, "state": "uploading"}]
+        with mock.patch("src.shelfmark_service.worker.QBittorrentClient.login", return_value="Ok."), mock.patch(
+            "src.shelfmark_service.worker.QBittorrentClient.torrents", return_value=torrents
+        ):
+            first_job = self.make_job("reconcile_downloads", {})
+            first_result = worker.execute(first_job)
+            # claim_torrent_import enqueued a transfer_completed job as a side
+            # effect of the first pass. Drain it the way run_once() would
+            # before the next reconcile job runs, so claim_next()'s FIFO
+            # order (both rows share the same second-precision created_at)
+            # can't hand it to make_job() below instead of a fresh
+            # reconcile_downloads job.
+            leftover = self.database.claim_next("test-worker")
+            assert leftover is not None
+            self.assertEqual(leftover.kind, "transfer_completed")
+            second_job = self.make_job("reconcile_downloads", {})
+            second_result = worker.execute(second_job)
+        self.assertEqual(len(first_result["claimed_jobs"]), 1)
+        self.assertEqual(second_result["claimed_jobs"], [])
+        transfer_jobs = [j for j in self.database.list_jobs(limit=50) if j.kind == "transfer_completed"]
+        self.assertEqual(len(transfer_jobs), 1)
+
+
+class ChainAfterSuccessTests(WorkerTestCase):
+    """`_chain_after_success` is the wiring between the three separate job
+    kinds -- see the module docstring on it in worker.py."""
+
+    def test_transfer_completed_chains_to_organize_apply(self) -> None:
+        worker = self.make_worker()
+        job = self.make_job(
+            "transfer_completed",
+            {"remote_path": "Book One", "_reconcile_hash": "h1", "_reconcile_name": "Book One"},
+        )
+        worker._chain_after_success(job, {"verified": True, "local_path": "/incoming/Book One"})
+        queued = self.database.list_jobs(status="queued", limit=50)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].kind, "organize_apply")
+        self.assertEqual(queued[0].payload["source"], "/incoming/Book One")
+        self.assertEqual(queued[0].payload["_reconcile_hash"], "h1")
+
+    def test_unverified_transfer_does_not_chain(self) -> None:
+        # Defense in depth: execute() already raises VERIFICATION_FAILED
+        # rather than returning a result when verify() finds a mismatch, so
+        # this path should be unreachable in production -- but organize_apply
+        # is destructive, so it is checked again here rather than trusted.
+        worker = self.make_worker()
+        job = self.make_job(
+            "transfer_completed", {"remote_path": "Book One", "_reconcile_hash": "h1"}
+        )
+        worker._chain_after_success(job, {"verified": False, "local_path": "/incoming/Book One"})
+        self.assertEqual(self.database.list_jobs(status="queued", limit=50), [])
+
+    def test_manual_transfer_job_without_reconcile_marker_does_not_chain(self) -> None:
+        # A job submitted through POST /api/v1/transfers/pull has no
+        # _reconcile_hash key -- this feature must not start auto-organizing
+        # transfers nobody asked it to chain.
+        worker = self.make_worker()
+        job = self.make_job("transfer_completed", {"remote_path": "Book One"})
+        worker._chain_after_success(job, {"verified": True, "local_path": "/incoming/Book One"})
+        self.assertEqual(self.database.list_jobs(status="queued", limit=50), [])
+
+    def test_organize_apply_chains_to_library_scan_when_abs_is_configured(self) -> None:
+        worker = self.make_worker(
+            audiobookshelf_url="http://abs.internal",
+            audiobookshelf_token="tok",
+            audiobookshelf_library_id="lib-1",
+        )
+        job = self.make_job(
+            "organize_apply",
+            {"source": "/incoming/Book One", "_reconcile_hash": "h1", "_reconcile_name": "Book One"},
+        )
+        worker._chain_after_success(job, {"applied": True})
+        queued = self.database.list_jobs(status="queued", limit=50)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].kind, "library_scan")
+        self.assertEqual(queued[0].payload["library_id"], "lib-1")
+        self.assertEqual(queued[0].payload["_reconcile_hash"], "h1")
+
+    def test_organize_apply_notifies_instead_of_scanning_when_abs_is_not_configured(self) -> None:
+        worker = self.make_worker()  # no audiobookshelf_* settings
+        worker._notify = mock.Mock()  # type: ignore[method-assign]
+        job = self.make_job(
+            "organize_apply", {"source": "/incoming/Book One", "_reconcile_hash": "h1", "_reconcile_name": "Book One"}
+        )
+        worker._chain_after_success(job, {"applied": True})
+        self.assertEqual(self.database.list_jobs(status="queued", limit=50), [])
+        worker._notify.assert_called_once()
+        self.assertIn("Book One", worker._notify.call_args[0][0])
+
+    def test_library_scan_success_sends_the_completion_notification(self) -> None:
+        worker = self.make_worker()
+        worker._notify = mock.Mock()  # type: ignore[method-assign]
+        job = self.make_job(
+            "library_scan", {"library_id": "lib-1", "_reconcile_hash": "h1", "_reconcile_name": "Book One"}
+        )
+        worker._chain_after_success(job, {"scan_started": True})
+        worker._notify.assert_called_once()
+        message = worker._notify.call_args[0][0]
+        self.assertIn("Book One", message)
+        self.assertIn("library", message)
+
+
+class ChainFailureNotificationTests(WorkerTestCase):
+    def test_reconciler_originated_failure_is_notified(self) -> None:
+        worker = self.make_worker(manifest_root=Path(self.tmp.name) / "manifests")
+        worker._notify = mock.Mock()  # type: ignore[method-assign]
+        missing = Path(self.tmp.name) / "missing"
+        self.database.enqueue(
+            "organize_apply",
+            {"source": str(missing), "_reconcile_hash": "h1", "_reconcile_name": "Book One"},
+        )
+        self.assertTrue(worker.run_once())
+        worker._notify.assert_called_once()
+        message = worker._notify.call_args[0][0]
+        self.assertIn("Book One", message)
+        self.assertIn("organize_apply", message)
+        self.assertIn(ErrorCode.SOURCE_MISSING.value, message)
+
+    def test_manually_submitted_failure_is_not_notified(self) -> None:
+        # Regression guard: a job with no _reconcile_hash (anything submitted
+        # through the existing API/Discord commands) must not start paging
+        # Discord just because this feature now exists.
+        worker = self.make_worker(manifest_root=Path(self.tmp.name) / "manifests")
+        worker._notify = mock.Mock()  # type: ignore[method-assign]
+        missing = Path(self.tmp.name) / "missing"
+        self.database.enqueue("organize_apply", {"source": str(missing)})
+        self.assertTrue(worker.run_once())
+        worker._notify.assert_not_called()
+
+
+class SplitWebhookUrlTests(unittest.TestCase):
+    def test_splits_the_token_off_a_normal_webhook_url(self) -> None:
+        base, path = _split_webhook_url("https://discord.com/api/webhooks/123/tok")
+        self.assertEqual(base, "https://discord.com/api/webhooks/123")
+        self.assertEqual(path, "tok")
+
+    def test_trailing_slash_is_ignored(self) -> None:
+        base, path = _split_webhook_url("https://discord.com/api/webhooks/123/tok/")
+        self.assertEqual(base, "https://discord.com/api/webhooks/123")
+        self.assertEqual(path, "tok")
+
+
+class NotifyWebhookTests(WorkerTestCase):
+    def test_no_webhook_configured_makes_no_request(self) -> None:
+        worker = self.make_worker()  # discord_webhook_url unset
+        with mock.patch("src.shelfmark_service.worker.HttpClient") as http_client:
+            worker._notify("hello")
+        http_client.assert_not_called()
+
+    def test_configured_webhook_posts_the_split_url_and_content(self) -> None:
+        worker = self.make_worker(discord_webhook_url="https://discord.com/api/webhooks/123/tok")
+        with mock.patch("src.shelfmark_service.worker.HttpClient") as http_client_cls:
+            instance = http_client_cls.return_value
+            worker._notify("a book arrived")
+        http_client_cls.assert_called_once()
+        self.assertEqual(http_client_cls.call_args[0][0], "https://discord.com/api/webhooks/123")
+        instance.request.assert_called_once_with(
+            "tok", method="POST", json_body={"content": "a book arrived"}
+        )
+
+    def test_malformed_webhook_url_does_not_raise(self) -> None:
+        worker = self.make_worker(discord_webhook_url="https://discord.com")
+        worker._notify("hello")  # must not raise
+
+    def test_webhook_failure_does_not_raise(self) -> None:
+        worker = self.make_worker(discord_webhook_url="https://discord.com/api/webhooks/123/tok")
+        with mock.patch("src.shelfmark_service.worker.HttpClient") as http_client_cls:
+            http_client_cls.return_value.request.side_effect = ServiceError("discord-webhook", "boom")
+            worker._notify("hello")  # must not raise
+
+
+class MaybeEnqueueReconcileTests(WorkerTestCase):
+    def test_enqueues_when_due_and_nothing_active(self) -> None:
+        settings = Settings(download_automation_enabled=True, reconcile_interval_seconds=60.0)
+        result = _maybe_enqueue_reconcile(self.database, settings, now=100.0, last_reconcile=0.0)
+        self.assertEqual(result, 100.0)
+        self.assertTrue(self.database.has_active_job("reconcile_downloads"))
+
+    def test_does_not_enqueue_before_the_interval_elapses(self) -> None:
+        settings = Settings(download_automation_enabled=True, reconcile_interval_seconds=60.0)
+        result = _maybe_enqueue_reconcile(self.database, settings, now=30.0, last_reconcile=0.0)
+        self.assertEqual(result, 0.0)
+        self.assertFalse(self.database.has_active_job("reconcile_downloads"))
+
+    def test_does_not_enqueue_a_second_job_while_one_is_active(self) -> None:
+        settings = Settings(download_automation_enabled=True, reconcile_interval_seconds=60.0)
+        self.database.enqueue("reconcile_downloads", {})
+        result = _maybe_enqueue_reconcile(self.database, settings, now=100.0, last_reconcile=0.0)
+        self.assertEqual(result, 0.0)  # unchanged, so the next tick retries promptly
+        jobs = [j for j in self.database.list_jobs(limit=50) if j.kind == "reconcile_downloads"]
+        self.assertEqual(len(jobs), 1)
+
+    def test_disabled_automation_never_enqueues(self) -> None:
+        settings = Settings(download_automation_enabled=False, reconcile_interval_seconds=60.0)
+        result = _maybe_enqueue_reconcile(self.database, settings, now=1000.0, last_reconcile=0.0)
+        self.assertEqual(result, 0.0)
+        self.assertFalse(self.database.has_active_job("reconcile_downloads"))
 
 
 if __name__ == "__main__":

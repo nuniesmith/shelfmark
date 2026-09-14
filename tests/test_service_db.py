@@ -168,6 +168,95 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(job.error, "old style failure text")
         self.assertIsNone(job.error_code)
 
+    def test_migration_3_is_recorded_and_creates_the_ledger_table(self) -> None:
+        with self.database.connect() as conn:
+            self.assertIsNotNone(
+                conn.execute("SELECT 1 FROM schema_migrations WHERE version = 3").fetchone()
+            )
+            # Must not raise: the table migration 3 adds has to actually exist.
+            conn.execute("SELECT hash, name, transfer_job_id, created_at FROM reconciled_torrents")
+
+
+class TorrentImportLedgerTests(unittest.TestCase):
+    """`claim_torrent_import` is the reconciler's idempotency gate: see the
+    docstring on the method itself for why the ledger row and the job row
+    have to commit together rather than as two separate calls."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-ledger-test-")
+        self.database = Database(Path(self.tmp.name) / "state" / "shelfmark.db")
+        self.database.initialize()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_first_claim_enqueues_a_job(self) -> None:
+        job = self.database.claim_torrent_import(
+            "abc123", "Some Book (2020)", "transfer_completed", {"remote_path": "Some Book (2020)"}
+        )
+        self.assertIsNotNone(job)
+        assert job is not None
+        self.assertEqual(job.kind, "transfer_completed")
+        self.assertEqual(job.status, "queued")
+        self.assertEqual(job.payload["remote_path"], "Some Book (2020)")
+
+    def test_second_claim_of_the_same_hash_is_refused(self) -> None:
+        """The exact scenario the brief calls out: a hash must never be
+        imported twice, including across what would be a worker restart --
+        modeled here as simply calling claim_torrent_import again with a
+        fresh Database handle pointed at the same file."""
+        first = self.database.claim_torrent_import(
+            "abc123", "Some Book (2020)", "transfer_completed", {"remote_path": "Some Book (2020)"}
+        )
+        assert first is not None
+        reopened = Database(self.database.path)
+        second = reopened.claim_torrent_import(
+            "abc123", "Some Book (2020)", "transfer_completed", {"remote_path": "Some Book (2020)"}
+        )
+        self.assertIsNone(second)
+        # Exactly one job was ever created for this hash -- not a second,
+        # abandoned one from the refused claim.
+        jobs = [j for j in self.database.list_jobs(limit=50) if j.kind == "transfer_completed"]
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].id, first.id)
+
+    def test_different_hashes_both_claim_successfully(self) -> None:
+        first = self.database.claim_torrent_import("hash-a", "Book A", "transfer_completed", {})
+        second = self.database.claim_torrent_import("hash-b", "Book B", "transfer_completed", {})
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertNotEqual(first.id, second.id)
+
+
+class HasActiveJobTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-active-job-test-")
+        self.database = Database(Path(self.tmp.name) / "state" / "shelfmark.db")
+        self.database.initialize()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_false_when_nothing_of_that_kind_exists(self) -> None:
+        self.assertFalse(self.database.has_active_job("reconcile_downloads"))
+
+    def test_true_for_a_queued_job(self) -> None:
+        self.database.enqueue("reconcile_downloads", {})
+        self.assertTrue(self.database.has_active_job("reconcile_downloads"))
+
+    def test_true_for_a_running_job(self) -> None:
+        self.database.enqueue("reconcile_downloads", {})
+        self.database.claim_next("worker-a")
+        self.assertTrue(self.database.has_active_job("reconcile_downloads"))
+
+    def test_false_once_the_job_finished(self) -> None:
+        self.database.enqueue("reconcile_downloads", {})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        self.database.complete(claimed.id, "worker-a", {})
+        self.assertFalse(self.database.has_active_job("reconcile_downloads"))
+
 
 if __name__ == "__main__":
     unittest.main()

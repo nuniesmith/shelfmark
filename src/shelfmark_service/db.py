@@ -137,6 +137,26 @@ class Database:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (2, utc_now()),
                 )
+            # Migration 3: the reconciler's idempotency ledger. `CREATE TABLE
+            # IF NOT EXISTS` is itself safe to re-run (unlike migration 2's
+            # ALTER TABLE), but it is still gated on schema_migrations so the
+            # table shows up in that history like every other schema change,
+            # rather than being the one silent exception to it.
+            if conn.execute("SELECT 1 FROM schema_migrations WHERE version = 3").fetchone() is None:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS reconciled_torrents (
+                        hash TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        transfer_job_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (3, utc_now()),
+                )
 
     @staticmethod
     def _audit(
@@ -188,6 +208,68 @@ class Database:
             )
         return self.get_job(job_id)  # type: ignore[return-value]
 
+    def claim_torrent_import(
+        self,
+        torrent_hash: str,
+        name: str,
+        kind: str,
+        payload: dict[str, Any],
+        actor: str = "reconciler",
+    ) -> Job | None:
+        """Atomically claim a torrent hash for the download pipeline and enqueue its first job.
+
+        The ledger write (`reconciled_torrents`) and the job write happen in
+        ONE transaction, not two separate calls. qBittorrent reports a
+        finished torrent as complete indefinitely while it seeds, so the
+        reconciler sees the same hash again on every future pass -- if a
+        crash landed between "hash recorded" and "job enqueued", the choice
+        would be between silently dropping the book forever (ledger written,
+        no job ever created) or importing it again every single tick
+        (job enqueued, ledger never written). Committing both together means
+        a crash at any point before COMMIT leaves neither write in effect, so
+        the next reconcile pass claims it fresh instead of in a half state.
+
+        Returns the created Job, or None if this hash was already claimed
+        (by an earlier reconcile pass, before or after a restart) -- the
+        caller's signal to skip it rather than start the pipeline twice.
+        """
+        if not torrent_hash:
+            raise ValueError("torrent_hash is required")
+        job_id = str(uuid.uuid4())
+        created = utc_now()
+        payload_json = json.dumps(payload, sort_keys=True)
+        with closing(self.connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            inserted = conn.execute(
+                """
+                INSERT OR IGNORE INTO reconciled_torrents(hash, name, transfer_job_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (torrent_hash, name, job_id, created),
+            ).rowcount
+            if inserted != 1:
+                # Already claimed by a previous pass -- roll back so this call
+                # leaves no trace, not even the job row.
+                conn.rollback()
+                return None
+            conn.execute(
+                """
+                INSERT INTO jobs(id, kind, payload_json, status, created_at)
+                VALUES (?, ?, ?, 'queued', ?)
+                """,
+                (job_id, kind, payload_json, created),
+            )
+            self._audit(
+                conn,
+                actor=actor,
+                action="job.queued",
+                target_type="job",
+                target_id=job_id,
+                details={"kind": kind, "torrent_hash": torrent_hash},
+            )
+            conn.commit()
+        return self.get_job(job_id)
+
     def get_job(self, job_id: str) -> Job | None:
         with closing(self.connect()) as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -208,6 +290,22 @@ class Database:
                     "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
                 ).fetchall()
         return [Job.from_row(row) for row in rows]
+
+    def has_active_job(self, kind: str) -> bool:
+        """Whether a job of this kind is already queued or running.
+
+        The periodic reconciler (see worker.py's `_maybe_enqueue_reconcile`)
+        checks this before enqueuing another `reconcile_downloads` pass, so a
+        slow qBittorrent response or the worker being busy on a big organize
+        job never piles up duplicate reconcile jobs that would all list the
+        exact same category for no benefit.
+        """
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM jobs WHERE kind = ? AND status IN ('queued', 'running') LIMIT 1",
+                (kind,),
+            ).fetchone()
+        return row is not None
 
     def claim_next(self, worker_id: str) -> Job | None:
         with closing(self.connect()) as conn:

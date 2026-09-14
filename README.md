@@ -225,6 +225,68 @@ Host keys: the worker keeps a persistent `known_hosts` (default
 contact and pinned thereafter. Set `SULLIVAN_SSH_STRICT_HOST_KEY=true` once
 that file holds a key you have checked and even first contact must match.
 
+## Automatic download pipeline
+
+Grabbing a release used to be the end of the automated part: a human had to
+notice qBittorrent finished, call `/transfers/pull`, run the organizer, and
+trigger a library scan by hand. The worker now does all four stages on its
+own once a grab lands.
+
+**A reconciler, not a per-torrent watcher.** The worker enqueues its own
+`reconcile_downloads` job on a timer (default every
+`SHELFMARK_RECONCILE_INTERVAL_SECONDS=60`, driven from the same `while`
+loop in `worker.py` that already re-queues stale jobs — no threads, no
+second process). Each pass asks qBittorrent "what's finished in the
+`QBITTORRENT_CATEGORY` (default `shelfmark-books`) that I haven't imported
+yet?" and acts on the answer, rather than tracking one grab end-to-end in a
+long-lived task. A long-lived watcher would be stranded by a worker restart
+mid-watch — and this process restarts on every deploy — whereas a
+reconciler that re-derives its answer from scratch each pass self-heals
+from any failure, including one of its own.
+
+**"Complete" is a qBittorrent state, not just 100% progress.** A torrent
+sitting at `progress == 1` can still be re-checking its files
+(`checkingUP`/`checkingResumeData`, e.g. after qBittorrent's own restart) or
+being moved to its final save path (`moving`). Both report full progress
+while the content is not yet safe to pull. Only qBittorrent's seeding states
+— `uploading`, `stalledUP`, `queuedUP`, `pausedUP`/`stoppedUP`, `forcedUP`
+(both the pre- and post-5.x names) — count as genuinely done.
+
+**Idempotency key: the torrent hash.** A `reconciled_torrents` table (schema
+migration 3, following the same `schema_migrations`-gated pattern as
+migration 2's `error_code` column) records every hash the reconciler has
+ever claimed. Claiming a hash and enqueuing its first job commit in one SQLite
+transaction, so a crash between the two can never happen — either both took
+effect or neither did, and the next reconcile pass claims a half-written hash
+fresh instead of dropping it or importing it again. Since qBittorrent reports
+a finished, still-seeding torrent as complete forever, this is what stops
+every future pass from re-importing the same book, restarts included.
+
+**Three separate jobs, chained on success.** The reconciler enqueues
+`transfer_completed`; once it reports `verified: true`, its success enqueues
+`organize_apply`; that job's success enqueues `library_scan` (only if
+Audiobookshelf is configured — otherwise the book is already filed and picked
+up on the next scheduled scan). Each stage is an ordinary row in `jobs`,
+independently retryable and visible through `/job` with its structured error
+code — a failure at any stage stops the chain there rather than leaving a
+partially-organized book. An unverified transfer never reaches the
+organizer: it is destructive, and `transfer_completed` already fails the job
+outright on a checksum mismatch rather than returning normally.
+
+**Notifications, without the worker depending on discord.py.** A Discord
+webhook (`SHELFMARK_DISCORD_WEBHOOK_URL`) is a plain HTTP POST, so the
+worker posts to it directly through the same `HttpClient` every other
+integration in this file uses — no gateway connection, no `discord.py`
+import in the worker process. A completed book and a failed stage each get
+a message; a Discord outage only ever logs a warning; it never fails or
+retries the job that triggered it, since the jobs table (not Discord) is
+the source of truth.
+
+**The off switch.** `SHELFMARK_DOWNLOAD_AUTOMATION_ENABLED=false` (default
+`true`) stops the periodic reconcile from ever being enqueued. Existing
+manual paths — `/transfers/pull`, `/organize-preview`, `/scan` — are
+unaffected either way.
+
 ## CLI options
 
 | Flag | Description |
