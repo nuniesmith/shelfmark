@@ -8,15 +8,19 @@ has been staged on Freddy.
 from __future__ import annotations
 
 import secrets
+import urllib.parse
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .clients import AudiobookshelfClient, ProwlarrClient, QBittorrentClient, ServiceError
 from .config import Settings
 from .db import Database, Job
+from .ebooks import EbookNotFound, list_ebooks, resolve_ebook
 
 
 settings = Settings.from_env()
@@ -144,6 +148,12 @@ def _qbittorrent_client() -> QBittorrentClient:
     )
 
 
+def _ebook_root() -> Path:
+    if not settings.ebook_root:
+        raise HTTPException(status_code=503, detail="The ebooks folder is not configured")
+    return settings.ebook_root
+
+
 def _upstream_error(exc: ServiceError) -> HTTPException:
     # Do not return upstream response bodies: they can contain release URLs,
     # credentials, or other data that should stay in service logs.
@@ -251,18 +261,75 @@ def scan_library(
 def release_search(
     q: str = Query(min_length=1, max_length=200),
     search_type: str | None = Query(default=None, alias="type", max_length=40),
+    categories: list[int] | None = Query(default=None),
+    book_only: bool = Query(
+        default=False,
+        description=(
+            "Restrict to the configured book categories (PROWLARR_BOOK_CATEGORIES, "
+            "default 7000) instead of naming a category id the indexer may not advertise."
+        ),
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     _actor: str = Depends(_actor),
 ) -> dict[str, Any]:
+    # `/ebook-request` sends book_only=true rather than a hardcoded category
+    # id: the one indexer configured here advertises 7000/7010/7030/7050 but
+    # neither 7020 (EBook) nor 7060 (Audiobook), so a literal 7020 filter
+    # would silently return zero results every time.
+    if book_only and categories is None:
+        categories = list(settings.prowlarr_book_categories)
     try:
         return {
             "results": _prowlarr_client().search(
-                q, search_type=search_type, limit=limit, offset=offset
+                q, search_type=search_type, categories=categories, limit=limit, offset=offset
             )
         }
     except ServiceError as exc:
         raise _upstream_error(exc) from exc
+
+
+@app.get("/api/v1/ebooks/search")
+def ebook_search(
+    q: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=10, ge=1, le=25),
+    _actor: str = Depends(_actor),
+) -> dict[str, Any]:
+    root = _ebook_root()
+    return {
+        "results": [
+            {
+                "id": book.id,
+                "title": book.title,
+                "author": book.author,
+                "relpath": book.relpath,
+                "size": book.size,
+                "ext": book.ext,
+            }
+            for book in list_ebooks(root, q, limit)
+        ]
+    }
+
+
+@app.get("/api/v1/ebooks/{ebook_id}/download")
+def ebook_download(ebook_id: str, actor: str = Depends(_actor)) -> FileResponse:
+    root = _ebook_root()
+    try:
+        path = resolve_ebook(root, ebook_id)
+    except EbookNotFound as exc:
+        # Deliberately the same 404 whether the id is malformed, unknown, or
+        # named a file whose resolved location fell outside the root — never
+        # confirm anything about what does or doesn't exist on disk.
+        raise HTTPException(status_code=404, detail="ebook not found") from exc
+    response = FileResponse(path, filename=path.name, media_type="application/octet-stream")
+    # The bot fetches this over plain urllib (see discord_bot.fetch_ebook),
+    # not the shared HttpClient, because HttpClient decodes every response as
+    # UTF-8 text and that corrupts binary epub/pdf/mobi bytes. Content-
+    # Disposition parsing to recover a filename is unnecessary work when a
+    # dedicated header can just carry it, percent-encoded in case of accents
+    # in an author or title.
+    response.headers["X-Shelfmark-Filename"] = urllib.parse.quote(path.name)
+    return response
 
 
 @app.get("/api/v1/downloads")

@@ -30,6 +30,22 @@ def _float_from_env(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number") from exc
 
 
+def _int_tuple_from_env(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    result: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.append(int(part))
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a comma-separated list of integers") from exc
+    return tuple(result) if result else default
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime paths and service settings.
@@ -58,6 +74,11 @@ class Settings:
     audiobookshelf_library_id: str | None = None
     prowlarr_url: str | None = None
     prowlarr_api_key: str | None = None
+    # The user's one configured indexer advertises the general Books buckets
+    # (7000/7010/7030/7050) but neither 7020 (EBook specifically) nor 7060
+    # (Audiobook) — filtering to 7020 alone would return zero results, so
+    # `/ebook-request` defaults to the bucket that indexer actually has.
+    prowlarr_book_categories: tuple[int, ...] = (7000,)
     qbittorrent_url: str | None = None
     qbittorrent_username: str | None = None
     qbittorrent_password: str | None = None
@@ -100,6 +121,7 @@ class Settings:
             audiobookshelf_library_id=os.environ.get("AUDIOBOOKSHELF_LIBRARY_ID") or None,
             prowlarr_url=os.environ.get("PROWLARR_URL") or None,
             prowlarr_api_key=os.environ.get("PROWLARR_API_KEY") or None,
+            prowlarr_book_categories=_int_tuple_from_env("PROWLARR_BOOK_CATEGORIES", (7000,)),
             qbittorrent_url=os.environ.get("QBITTORRENT_URL") or None,
             qbittorrent_username=os.environ.get("QBITTORRENT_USERNAME") or None,
             qbittorrent_password=os.environ.get("QBITTORRENT_PASSWORD") or None,

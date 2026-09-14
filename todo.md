@@ -285,8 +285,8 @@ Implement:
 
 - [ ] Discord application and bot registration.
 - [ ] Guild-scoped slash commands during development.
-- [ ] Buttons, select menus, and modals for release and metadata selection.
-- [x] Role/user allowlists for download, organize, metadata, and scan actions. **Fails closed** — an unset `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` refuses everyone rather than permitting everyone, which is what it did before.
+- [~] Buttons, select menus, and modals for release and metadata selection. Buttons only (no select menus/modals yet), but now cover ebooks too: `/ebook-search` sends the on-server file straight to the requester's phone as an ephemeral attachment (path-traversal-safe opaque id, size checked against Discord's limit before any upload is attempted), and `/ebook-request` reuses the existing grab-button/job path against Prowlarr restricted to `PROWLARR_BOOK_CATEGORIES` (default 7000 — the one indexer here doesn't advertise 7020/EBook).
+- [x] Role/user allowlists for download, organize, metadata, and scan actions. **Fails closed** — an unset `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` refuses everyone rather than permitting everyone, which is what it did before. Applies to `/ebook-search` and `/ebook-request` the same as every other command.
 - [ ] Per-user and per-guild rate limits.
 - [ ] Audit records containing Discord user, guild, channel, and message IDs.
 - [ ] Immediate interaction deferral, followed by persistent job notifications.

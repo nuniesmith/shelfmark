@@ -8,8 +8,12 @@ the interaction token is never used as a long-running task channel.
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Collection, Iterable, Sequence
 from typing import Any
 
@@ -18,6 +22,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from .clients import HttpClient, ServiceError
+
+DEFAULT_MAX_ATTACHMENT_MB = 10.0
 
 
 def _int_set(value: str | None) -> set[int]:
@@ -31,6 +37,46 @@ def _int_set(value: str | None) -> set[int]:
         except ValueError as exc:
             raise ValueError("SHELFMARK_DISCORD_ALLOWED_ROLE_IDS must contain integer IDs") from exc
     return result
+
+
+def _max_attachment_bytes(value: str | None) -> int:
+    """Parse SHELFMARK_DISCORD_MAX_ATTACHMENT_MB, given in MB for a human to set.
+
+    Discord caps attachments at 10 MB on an unboosted server, but a boosted
+    one raises that — so this has to be adjustable per-deployment rather than
+    a hardcoded 10, and it must fail closed on garbage input rather than
+    silently uploading nothing (an unparsable limit) or blocking every send
+    (a zero limit taken as-is), which is why the input is clamped rather than
+    passed straight through.
+    """
+    text = (value or "").strip()
+    if not text:
+        return int(DEFAULT_MAX_ATTACHMENT_MB * 1_000_000)
+    try:
+        megabytes = float(text)
+    except ValueError as exc:
+        raise ValueError("SHELFMARK_DISCORD_MAX_ATTACHMENT_MB must be a number") from exc
+    return int(max(0.1, megabytes) * 1_000_000)
+
+
+def _too_large(size: Any, limit: int) -> bool:
+    """Whether a file this size must be refused before any network call.
+
+    Split out from the button callback so the decision can be tested without
+    standing up a Discord object graph — the same reason `is_permitted` below
+    is tested this way rather than through a fake interaction. A search
+    result missing a size (not a number) is treated as fine to attempt rather
+    than refused, since there's nothing to compare against.
+    """
+    return isinstance(size, (int, float)) and size > limit
+
+
+def _human_size(num_bytes: int) -> str:
+    if num_bytes >= 1_000_000:
+        return f"{num_bytes / 1_000_000:.1f} MB"
+    if num_bytes >= 1_000:
+        return f"{num_bytes / 1_000:.1f} KB"
+    return f"{num_bytes} B"
 
 
 def _idle(reasons: Sequence[str]) -> None:
@@ -80,6 +126,36 @@ class ShelfmarkApi:
 
     async def post(self, path: str, *, json_body: Any, actor: str | None = None) -> Any:
         return await asyncio.to_thread(self.request, path, method="POST", json_body=json_body, actor=actor)
+
+    def fetch_ebook(self, ebook_id: str, actor: str) -> tuple[bytes, str]:
+        """Fetch raw file bytes for one ebook, bypassing HttpClient.
+
+        HttpClient._decode() always treats a response as UTF-8 text (see
+        clients.py), which would corrupt an epub/pdf/mobi's binary content.
+        This is the one place the bot needs the actual bytes back, so it
+        talks to urllib directly instead.
+        """
+        url = f"{self.http.base_url}/api/v1/ebooks/{urllib.parse.quote(ebook_id, safe='')}/download"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "X-Shelfmark-Actor": actor,
+                "Accept": "application/octet-stream",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.http.timeout) as response:
+                data = response.read()
+                filename_header = response.headers.get("X-Shelfmark-Filename", "")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+            exc.close()
+            raise ServiceError("shelfmark-api", detail or exc.reason or f"HTTP {exc.code}", status=exc.code) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ServiceError("shelfmark-api", str(exc)) from exc
+        filename = urllib.parse.unquote(filename_header) if filename_header else ebook_id
+        return data, filename
 
 
 def _actor(interaction: discord.Interaction) -> str:
@@ -144,6 +220,15 @@ def _job_status_message(payload: dict[str, Any], job_id: str) -> str:
     return "\n".join(lines)
 
 
+def _ebook_label(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or "untitled")
+    author = item.get("author")
+    author_text = f" — {author}" if author else ""
+    size = item.get("size")
+    size_text = f" · {_human_size(int(size))}" if isinstance(size, (int, float)) else ""
+    return f"{title[:70]}{author_text}{size_text}"
+
+
 def _library_label(item: dict[str, Any]) -> str:
     media = item.get("media") if isinstance(item.get("media"), dict) else item
     metadata = media.get("metadata") if isinstance(media, dict) and isinstance(media.get("metadata"), dict) else media
@@ -193,6 +278,81 @@ class ReleaseView(discord.ui.View):
         return callback
 
 
+class EbookView(discord.ui.View):
+    """Buttons that fetch an on-server ebook and attach it to the reply.
+
+    Follows ReleaseView's defer/act/followup shape, but the action is a
+    binary file fetch rather than a job enqueue. The size guard below runs
+    BEFORE that fetch: letting a too-large file reach `interaction.followup
+    .send(file=...)` means discord.py raises its own HTTPException there,
+    whose message ("Payload Too Large") means nothing to someone reading it
+    on a phone and does not say what to do about it.
+    """
+
+    def __init__(
+        self,
+        api: ShelfmarkApi,
+        books: list[dict[str, Any]],
+        actor: str,
+        max_attachment_bytes: int,
+    ):
+        super().__init__(timeout=900)
+        self.api = api
+        self.books = books
+        self.actor = actor
+        self.max_attachment_bytes = max_attachment_bytes
+        for index, book in enumerate(books[:5]):
+            button = discord.ui.Button(
+                label=f"Send {index + 1}",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"shelfmark:ebook-send:{index}",
+            )
+            button.callback = self._callback(index)  # type: ignore[method-assign]
+            self.add_item(button)
+
+    def _callback(self, index: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.response.is_done():
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            book = self.books[index]
+            title = str(book.get("title") or "That book")
+            size = book.get("size")
+            if _too_large(size, self.max_attachment_bytes):
+                await interaction.followup.send(
+                    f"**{title}** is {_human_size(int(size))}, over this server's "
+                    f"{_human_size(self.max_attachment_bytes)} attachment limit. "
+                    "It can't be sent through Discord this way.",
+                    ephemeral=True,
+                )
+                return
+            book_id = str(book.get("id") or "")
+            try:
+                data, filename = await asyncio.to_thread(self.api.fetch_ebook, book_id, self.actor)
+            except ServiceError:
+                await interaction.followup.send(
+                    "That book could not be fetched from the server.", ephemeral=True
+                )
+                return
+            if _too_large(len(data), self.max_attachment_bytes):
+                # The search result's size can be stale by the time this
+                # button is pressed (someone re-downloaded a different
+                # format in between) — trust the bytes actually read over
+                # the number quoted in the earlier search response.
+                await interaction.followup.send(
+                    f"**{filename}** turned out to be {_human_size(len(data))}, over the "
+                    f"{_human_size(self.max_attachment_bytes)} limit. It can't be sent this way.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.followup.send(
+                file=discord.File(io.BytesIO(data), filename=filename),
+                ephemeral=True,
+            )
+
+        return callback
+
+
 def is_permitted(member_role_ids: Iterable[int], allowed_roles: Collection[int]) -> bool:
     """Decide access from role IDs alone.
 
@@ -214,7 +374,12 @@ def is_permitted(member_role_ids: Iterable[int], allowed_roles: Collection[int])
     return bool(set(member_role_ids) & set(allowed_roles))
 
 
-def install_commands(bot: commands.Bot, api: ShelfmarkApi, allowed_roles: set[int]) -> None:
+def install_commands(
+    bot: commands.Bot,
+    api: ShelfmarkApi,
+    allowed_roles: set[int],
+    max_attachment_bytes: int = int(DEFAULT_MAX_ATTACHMENT_MB * 1_000_000),
+) -> None:
     def permitted(interaction: discord.Interaction) -> bool:
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if member is None:
@@ -253,6 +418,54 @@ def install_commands(bot: commands.Bot, api: ShelfmarkApi, allowed_roles: set[in
             await interaction.followup.send(embed=embed, ephemeral=True)
         except ServiceError:
             await interaction.followup.send("Audiobookshelf search is unavailable.", ephemeral=True)
+
+    @bot.tree.command(name="ebook-search", description="Search ebooks already on the server and send one to your phone")
+    @app_commands.describe(query="Title or author to search for")
+    async def ebook_search(interaction: discord.Interaction, query: str) -> None:
+        if not await guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            payload = await api.get("/api/v1/ebooks/search", params={"q": query, "limit": 10}, actor=_actor(interaction))
+            results = _result_list(payload)[:5]
+            if not results:
+                await interaction.followup.send("No ebooks on the server matched that search.", ephemeral=True)
+                return
+            embed = discord.Embed(title=f"Ebook matches for {query}")
+            embed.description = "\n".join(f"{index + 1}. {_ebook_label(item)}" for index, item in enumerate(results))
+            await interaction.followup.send(
+                embed=embed,
+                view=EbookView(api, results, _actor(interaction), max_attachment_bytes),
+                ephemeral=True,
+            )
+        except ServiceError:
+            await interaction.followup.send("Ebook search is unavailable.", ephemeral=True)
+
+    @bot.tree.command(name="ebook-request", description="Search for a new ebook to download onto the server")
+    @app_commands.describe(query="Title, author, or ISBN to search for")
+    async def ebook_request(interaction: discord.Interaction, query: str) -> None:
+        if not await guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            payload = await api.get(
+                "/api/v1/releases/search",
+                params={"q": query, "book_only": "true", "limit": 25},
+                actor=_actor(interaction),
+            )
+            results = _result_list(payload)[:5]
+            if not results:
+                await interaction.followup.send("No matching ebooks were found to download.", ephemeral=True)
+                return
+            embed = discord.Embed(title=f"Ebook downloads for {query}")
+            embed.description = "\n".join(f"{index + 1}. {_release_label(item)}" for index, item in enumerate(results))
+            await interaction.followup.send(
+                embed=embed,
+                view=ReleaseView(api, results, _actor(interaction)),
+                ephemeral=True,
+            )
+        except ServiceError:
+            await interaction.followup.send("Prowlarr search is unavailable.", ephemeral=True)
 
     @bot.tree.command(name="release-search", description="Search Prowlarr for new audiobook or ebook releases")
     @app_commands.describe(query="Title, author, ISBN, or other release query", type="Prowlarr search type")
@@ -446,8 +659,18 @@ def build_bot() -> commands.Bot:
             "refused. Set it to the ID of the role permitted to use Shelfmark.",
             flush=True,
         )
+    try:
+        max_attachment_bytes = _max_attachment_bytes(
+            os.environ.get("SHELFMARK_DISCORD_MAX_ATTACHMENT_MB")
+        )
+    except ValueError as exc:
+        # Same reasoning as the allow-list above: garbage input must not
+        # silently become "no limit" — fall back to Discord's own default
+        # rather than trust a value that failed to parse.
+        print(f"{exc}. Using the {DEFAULT_MAX_ATTACHMENT_MB:g} MB default.", flush=True)
+        max_attachment_bytes = _max_attachment_bytes(None)
     bot = ShelfmarkBot(command_prefix=commands.when_mentioned, intents=intents)
-    install_commands(bot, ShelfmarkApi(api_url, api_token), allowed_roles)
+    install_commands(bot, ShelfmarkApi(api_url, api_token), allowed_roles, max_attachment_bytes)
     return bot
 
 

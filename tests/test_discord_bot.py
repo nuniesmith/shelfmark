@@ -4,8 +4,12 @@ import unittest
 from unittest import mock
 
 from src.shelfmark_service.discord_bot import (
+    _ebook_label,
+    _human_size,
     _int_set,
     _job_status_message,
+    _max_attachment_bytes,
+    _too_large,
     blocking_problems,
     is_permitted,
 )
@@ -147,6 +151,52 @@ class JobStatusMessageTests(unittest.TestCase):
         )
         self.assertIn("Code: `cancelled`", message)
         self.assertNotIn("Error:", message)
+class AttachmentLimitTests(unittest.TestCase):
+    """The 10 MB Discord default must stay overridable for a boosted server."""
+
+    def test_unset_falls_back_to_the_ten_megabyte_default(self) -> None:
+        self.assertEqual(_max_attachment_bytes(None), 10_000_000)
+        self.assertEqual(_max_attachment_bytes(""), 10_000_000)
+
+    def test_a_boosted_server_can_raise_the_limit(self) -> None:
+        self.assertEqual(_max_attachment_bytes("50"), 50_000_000)
+
+    def test_garbage_input_is_rejected_not_silently_unlimited(self) -> None:
+        """Falling back to "no limit" here would let an oversized upload through
+        and fail as a confusing Discord exception instead of the clear message
+        the size guard is there to produce."""
+        with self.assertRaises(ValueError):
+            _max_attachment_bytes("not-a-number")
+
+    def test_human_size_reads_in_the_units_the_message_promises(self) -> None:
+        self.assertEqual(_human_size(500), "500 B")
+        self.assertEqual(_human_size(12_500_000), "12.5 MB")
+
+
+class TooLargeTests(unittest.TestCase):
+    """Checked BEFORE the fetch, so a Discord upload can never even be attempted
+    for a file that would be refused — see EbookView._callback."""
+
+    def test_a_file_under_the_limit_is_not_too_large(self) -> None:
+        self.assertFalse(_too_large(5_000_000, 10_000_000))
+
+    def test_a_file_over_the_limit_is_too_large(self) -> None:
+        self.assertTrue(_too_large(15_000_000, 10_000_000))
+
+    def test_a_missing_size_is_not_treated_as_too_large(self) -> None:
+        self.assertFalse(_too_large(None, 10_000_000))
+
+
+class EbookLabelTests(unittest.TestCase):
+    def test_label_includes_title_author_and_size(self) -> None:
+        label = _ebook_label({"title": "Dune", "author": "Frank Herbert", "size": 2_500_000})
+        self.assertIn("Dune", label)
+        self.assertIn("Frank Herbert", label)
+        self.assertIn("2.5 MB", label)
+
+    def test_missing_author_is_left_out_rather_than_shown_as_none(self) -> None:
+        label = _ebook_label({"title": "Dune", "size": 2_500_000})
+        self.assertNotIn("None", label)
 
 
 if __name__ == "__main__":

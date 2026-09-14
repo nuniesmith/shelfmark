@@ -113,9 +113,10 @@ docker compose -f docker-compose.shelfmark.yml up -d --build
 ```
 
 The initial internal API exposes health checks, job submission/status, current
-Audiobookshelf library search, Prowlarr release search, and asynchronous
-release grabs. Set `SHELFMARK_API_TOKEN` before using anything beyond
-`/healthz`:
+Audiobookshelf library search, Prowlarr release search, asynchronous release
+grabs, and an ebooks index (`/api/v1/ebooks/search`,
+`/api/v1/ebooks/{id}/download`) that walks `SHELFMARK_EBOOKS_ROOT` directly.
+Set `SHELFMARK_API_TOKEN` before using anything beyond `/healthz`:
 
 ```bash
 curl http://127.0.0.1:8110/healthz
@@ -130,9 +131,35 @@ paths. Provider calls still require the corresponding `AUDIOBOOKSHELF_*` and
 ### Discord bot
 
 Commands: `/library-search`, `/release-search` (with grab buttons),
-`/downloads`, `/job`, `/metadata-match`, `/scan`, `/organize-preview`. Each one
-is deferred before any network call and answered ephemerally, so the
-interaction token is never used as a long-running task channel.
+`/ebook-search` (with send-to-phone buttons), `/ebook-request` (with grab
+buttons), `/downloads`, `/job`, `/metadata-match`, `/scan`,
+`/organize-preview`. Each one is deferred before any network call and
+answered ephemerally, so the interaction token is never used as a
+long-running task channel.
+
+**Ebooks.** Audiobookshelf has no ebook library, and running a separate
+reader app just to browse files isn't wanted, so Shelfmark indexes
+`SHELFMARK_EBOOKS_ROOT` itself:
+
+- `/ebook-search <query>` walks the ebooks root, matching on author, title,
+  and filename, and shows up to 5 results with a **Send** button per result.
+  Pressing one fetches the file and attaches it to an ephemeral reply — open
+  it from Discord on a phone and it lands in whichever app is registered for
+  that format. When a book has more than one file (an epub next to a pdf,
+  say), the better format wins automatically, in `EBOOK_PREF` order.
+- `/ebook-request <query>` searches Prowlarr restricted to the configured
+  book categories (`PROWLARR_BOOK_CATEGORIES`, default `7000`) and offers the
+  same grab buttons as `/release-search`.
+- Discord refuses attachments over 10 MB on an unboosted server. The size is
+  checked and reported in plain language (naming the book and its size)
+  *before* any upload is attempted, rather than surfacing as a failed
+  Discord API call. Raise the ceiling with
+  `SHELFMARK_DISCORD_MAX_ATTACHMENT_MB` if the server is boosted.
+- A search result's id is an opaque token, never a filesystem path. The
+  download endpoint re-derives it from the files it finds under the ebooks
+  root and only serves a match that resolves back inside that root — a
+  request built from someone else's search result, or a raw path, matches
+  nothing.
 
 **Invite it with zero permissions.** Scopes `bot` and
 `applications.commands`, permission integer `0`. Every reply is an ephemeral
@@ -146,6 +173,8 @@ is nothing to justify in the developer portal and no verification gate later.
 | `SHELFMARK_API_TOKEN` | Required — the bot calls the API with it. |
 | `SHELFMARK_DISCORD_GUILD_ID` | Syncs commands to one guild, which is instant. Without it they sync globally and can take up to an hour to appear. |
 | `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` | Comma-separated role IDs permitted to use the bot. **Empty means nobody.** |
+| `SHELFMARK_DISCORD_MAX_ATTACHMENT_MB` | `/ebook-search`'s file-size ceiling before Discord would refuse the upload. Default `10`; raise it if the server is boosted. |
+| `PROWLARR_BOOK_CATEGORIES` | Categories `/ebook-request` restricts to. Default `7000`, since a typical indexer advertises the general Books bucket rather than 7020 (EBook) specifically. |
 
 To collect the IDs, turn on **User Settings → Advanced → Developer Mode**, then
 right-click the server for its ID and a role (in **Server Settings → Roles**)
