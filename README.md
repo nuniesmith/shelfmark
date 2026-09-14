@@ -257,9 +257,49 @@ both, with the broken one sorting first.
 Moves within a single filesystem use `rename` directly: atomic, and no data is
 copied at all. Only a move that crosses a filesystem boundary has to stage.
 
-An interrupted run can still leave a **partial book folder** — every file in it
-complete, but not all of the tracks present. Whole-directory staging is not
-implemented yet.
+A **new** book — one whose destination folder does not exist yet — is also
+staged whole before it appears. Every track and sidecar is assembled into a
+private directory beside the destination (`.shelfmark-work-books`, a separate
+marker from the one archive extraction uses, so the two never contend over the
+same working directory) and the finished folder is handed over with one
+`rename`. Either the whole book appears, or nothing does — there is no state
+where the library holds a folder missing most of its tracks.
+
+In move mode, a track on the same filesystem as the library is staged with a
+`rename` too, not a copy — this is why reorganising a library in place
+(`--dest` equal to the source) stays the metadata-only operation it always
+was, rather than turning into a full read-and-rewrite of every file. Only a
+source on a different filesystem is actually copied, the same case `move_file`
+already has to handle, and `--copy` always copies, because there the source
+must survive regardless.
+
+An import killed partway by anything **catchable** — out of disk, a bad
+track, an operator's Ctrl-C — loses nothing: every rename already made into
+staging is reversed (a rename back costs exactly what making it did) and the
+staging directory is removed. If reversing one of those renames also fails,
+deleting the directory would destroy the only remaining copy of that track,
+so it is left in place instead and its path is printed for manual recovery.
+
+A kill that cannot be caught — `SIGKILL`, an OOM kill, a power cut — is a
+different case, and worse: nothing runs afterward to reverse anything, so a
+move-mode import stopped that way leaves tracks renamed OUT of the source and
+sitting in `.shelfmark-work-books`, with no copy left in the source and none
+in the library either. Before whole-directory staging, that same kill left
+some tracks in the library and the rest in the source, and the next run's
+scan found and finished the book on its own. Staging trades that self-healing
+away, because a dotted directory is invisible to a scan by design — so every
+run checks the destination tree for one of these left over from an earlier
+kill and reports it loudly on stderr (count and path) before scanning
+anything. Nothing recovers it automatically — a staging directory can be
+partial, and completing a partial one is exactly the half-a-book this feature
+exists to prevent — so recovering the files back into the library or the
+source is a manual step for now.
+
+Filing more files into a book that is **already** on disk — a repeat run, or
+new tracks arriving for one already imported — still writes straight in, file
+by file, exactly as before: that folder is already visible to a scan either
+way, so staging buys nothing there, and `rename` cannot merge into a
+destination that already has files in it regardless.
 
 ### What happens when an archive is broken
 

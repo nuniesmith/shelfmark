@@ -11,6 +11,7 @@ from unittest import mock
 
 from src import main as main_module
 from src.main import (
+    BOOK_STAGING_DIR_NAME,
     STAGING_DIR_NAME,
     UnsafeArchive,
     apply_plan,
@@ -374,6 +375,267 @@ class AtomicWriteTests(unittest.TestCase):
         self.assertEqual(main_module.os.rename, real_rename)
         self.assertEqual(self.dest.read_bytes(), self.payload)
         self.assertFalse(self.src.exists(), "a completed move must remove the source")
+
+
+class WholeDirectoryStagingTests(unittest.TestCase):
+    """A book folder appears in the library whole, or not at all.
+
+    apply_plan used to move each track into dest_dir one at a time, so an
+    import killed partway — out of disk, a bad track, an operator's Ctrl-C —
+    left a book folder holding some tracks with the rest simply missing.
+    Nothing downstream can tell that from a short book; Audiobookshelf
+    imports it as a real one.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-stage-")
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "dump"
+        self.dest = self.root / "library"
+        self.trash = self.source / "trash"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def touch(self, path: Path, content: bytes = b"x") -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    def make_plan(self):
+        return build_plan(
+            source=self.source,
+            dest=self.dest,
+            trash=self.trash,
+            folder_format="year-title",
+            keep_names=False,
+            include_non_cover_images=False,
+            media_mode="audio",
+        )
+
+    def test_failure_partway_leaves_no_partial_book_folder(self) -> None:
+        """The property under test: a killed import leaves NOTHING under the
+        book's name, and the source tracks it had not yet consumed are still
+        there — a plain move would already have removed them.
+
+        Mocks os.rename, not shutil.copy2: a same-filesystem move mode import
+        stages with a rename now (see _stage_book), so that is where a real
+        failure — a disk actually going away mid-import — would surface.
+        """
+        book = self.source / "Some Author - The Book (2001)"
+        self.touch(book / "01.mp3", b"one")
+        self.touch(book / "02.mp3", b"two")
+        self.touch(book / "03.mp3", b"three")
+        plan = self.make_plan()
+        self.assertEqual(len(plan.books), 1)
+        dest_dir = plan.books[0].dest_dir
+
+        real_rename = main_module.os.rename
+        calls = {"n": 0}
+
+        def flaky_rename(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_rename(src, dst)
+
+        with mock.patch.object(main_module.os, "rename", flaky_rename):
+            with self.assertRaises(OSError):
+                apply_plan(plan, trash=self.trash, dry_run=False, copy=False)
+
+        self.assertFalse(dest_dir.exists(), "a partial book folder was left in the library")
+        self.assertFalse(list(self.dest.rglob("*.mp3")), "a stray track escaped into the library")
+        self.assertFalse(
+            list(self.dest.rglob(BOOK_STAGING_DIR_NAME)), "staging debris left behind"
+        )
+        # All three tracks are still at the source — the first track's
+        # rename into staging is rolled back (reversed), and the second and
+        # third were never touched at all.
+        self.assertEqual(
+            sorted(p.name for p in book.glob("*.mp3")), ["01.mp3", "02.mp3", "03.mp3"]
+        )
+
+    def test_staging_directory_is_beside_the_destination(self) -> None:
+        """`rename` is atomic only within one filesystem, so staging has to
+        be a sibling of dest_dir — not some other configured root."""
+        book = self.source / "Some Author - The Book (2001)"
+        self.touch(book / "01.mp3", b"one")
+        plan = self.make_plan()
+        dest_dir = plan.books[0].dest_dir
+        real_rename = main_module.os.rename
+        seen: dict[str, Path] = {}
+
+        def capturing_rename(src, dst):
+            # The FIRST rename is the per-track one, into staging; the
+            # second is the whole-directory swap at the very end, which
+            # lands at dest_dir itself and would otherwise overwrite this.
+            if "dst" not in seen:
+                seen["dst"] = Path(dst)
+            return real_rename(src, dst)
+
+        with mock.patch.object(main_module.os, "rename", capturing_rename):
+            apply_plan(plan, trash=self.trash, dry_run=False, copy=False)
+
+        self.assertIn("dst", seen)
+        self.assertEqual(seen["dst"].parent.parent, dest_dir.parent / BOOK_STAGING_DIR_NAME)
+        # And cleared away once the book has landed.
+        self.assertFalse((dest_dir.parent / BOOK_STAGING_DIR_NAME).exists())
+
+    def test_same_filesystem_move_renames_rather_than_copies(self) -> None:
+        """The property that actually distinguishes a rename from a copy: the
+        inode is preserved. A copy always allocates a new one, however
+        byte-for-byte identical the content looks afterward — and
+        reorganising an existing library in place (--dest equal to source)
+        is metadata-only work today that must not turn into a full
+        read-and-rewrite of it.
+        """
+        book = self.source / "Some Author - The Book (2001)"
+        self.touch(book / "01.mp3", b"one")
+        plan = self.make_plan()
+        dest_dir = plan.books[0].dest_dir
+        src_path = plan.books[0].tracks[0].src
+        inode_before = src_path.stat().st_ino
+
+        apply_plan(plan, trash=self.trash, dry_run=False, copy=False)
+
+        dest_path = dest_dir / "01.mp3"
+        self.assertTrue(dest_path.exists())
+        self.assertEqual(
+            dest_path.stat().st_ino,
+            inode_before,
+            "same-filesystem move copied the file's data instead of renaming it",
+        )
+
+    def test_failed_rollback_leaves_the_file_recoverable_not_deleted(self) -> None:
+        """If reversing a rename ALSO fails, the original location no longer
+        has that track — the forward rename already removed it — so deleting
+        the staged copy too would destroy the only one left. The staging
+        directory must survive instead, with the file still inside it.
+        """
+        book = self.source / "Some Author - The Book (2001)"
+        self.touch(book / "01.mp3", b"one")
+        self.touch(book / "02.mp3", b"two")
+        plan = self.make_plan()
+
+        real_rename = main_module.os.rename
+        calls = {"n": 0}
+
+        def flaky_rename(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_rename(src, dst)  # 01.mp3 stages fine
+            if calls["n"] == 2:
+                raise OSError(errno.ENOSPC, "No space left on device")  # 02.mp3 fails
+            raise OSError(errno.EACCES, "Permission denied")  # rolling 01.mp3 back ALSO fails
+
+        with mock.patch.object(main_module.os, "rename", flaky_rename):
+            with self.assertRaises(OSError):
+                apply_plan(plan, trash=self.trash, dry_run=False, copy=False)
+
+        staging_roots = list(self.dest.rglob(BOOK_STAGING_DIR_NAME))
+        self.assertEqual(
+            len(staging_roots), 1, "the staging directory was removed despite a failed rollback"
+        )
+        stranded = list(staging_roots[0].rglob("01.mp3"))
+        self.assertEqual(
+            len(stranded), 1, "the only remaining copy of the un-rolled-back track was deleted"
+        )
+        self.assertEqual(stranded[0].read_bytes(), b"one")
+
+    def test_move_retry_after_successful_import_does_not_duplicate(self) -> None:
+        """The idempotent-retry guarantee, exercised in --move mode (the
+        existing coverage for this is copy-only) across a multi-track book,
+        after the first run created dest_dir via staging."""
+        book = self.source / "Some Author - The Book (2001)"
+        self.touch(book / "01.mp3", b"one")
+        self.touch(book / "02.mp3", b"two")
+        first = self.make_plan()
+        apply_plan(first, trash=self.trash, dry_run=False, copy=False)
+
+        # As if the release arrived again — the operator re-downloaded it,
+        # or a sync re-delivered files already imported.
+        self.touch(book / "01.mp3", b"one")
+        self.touch(book / "02.mp3", b"two")
+        second = self.make_plan()
+        apply_plan(second, trash=self.trash, dry_run=False, copy=False)
+
+        files = sorted(p.name for p in self.dest.rglob("*.mp3"))
+        self.assertEqual(files, ["01.mp3", "02.mp3"])
+
+    def test_copy_mode_leaves_source_untouched_for_a_staged_book(self) -> None:
+        book = self.source / "Some Author - The Book (2001)"
+        self.touch(book / "01.mp3", b"one")
+        self.touch(book / "02.mp3", b"two")
+        plan = self.make_plan()
+        dest_dir = plan.books[0].dest_dir
+
+        apply_plan(plan, trash=self.trash, dry_run=False, copy=True)
+
+        self.assertEqual(
+            sorted(p.name for p in dest_dir.glob("*.mp3")), ["01.mp3", "02.mp3"]
+        )
+        self.assertEqual(
+            sorted(p.name for p in book.glob("*.mp3")), ["01.mp3", "02.mp3"]
+        )
+
+    def test_junk_sidecar_is_trashed_for_a_freshly_staged_book(self) -> None:
+        """Trash-kind extras (junk, duplicates) do not belong in the book
+        folder and must still be routed to trash for a book new enough to go
+        through staging, not just for one written the old file-by-file way."""
+        book = self.source / "Some Author - The Book (2001)"
+        self.touch(book / "01.mp3", b"one")
+        self.touch(book / "thumbs.db", b"junk")
+        plan = self.make_plan()
+        dest_dir = plan.books[0].dest_dir
+
+        apply_plan(plan, trash=self.trash, dry_run=False, copy=False)
+
+        self.assertTrue((self.trash / "thumbs.db").exists())
+        self.assertFalse((dest_dir / "thumbs.db").exists())
+
+    def test_stranded_staging_from_an_uncatchable_kill_is_reported_not_silent(self) -> None:
+        """SIGKILL, an OOM kill, and a power cut cannot be caught, so
+        _stage_book's own rollback (a `try`/`except`) never runs for them: a
+        move-mode import killed that way leaves tracks renamed OUT of the
+        source and stuck in .shelfmark-work-books, with nothing left to put
+        them back.
+
+        Before whole-directory staging, the same kill left some tracks in
+        the library and the rest still in the source, where the next run's
+        scan would find and finish the book — self-healing. Staging removes
+        that: the walker skips a dotted directory, so a scan does not find
+        these tracks in the source, the library never got a folder for them,
+        and nothing looks for them here either. This test is the substitute
+        for the self-healing this PR took away: the operator must at least
+        be told the files exist and where, rather than a book quietly
+        existing nowhere a human would look.
+        """
+        self.source.mkdir(parents=True, exist_ok=True)
+        dest_dir = self.dest / "Some Author" / "2001 - The Book"
+        staging_parent = dest_dir.parent / BOOK_STAGING_DIR_NAME
+        staging = staging_parent / "2001 - The Book.abcdef"
+        self.touch(staging / "01.mp3", b"one")
+        self.touch(staging / "02.mp3", b"two")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main([str(self.source), "--dest", str(self.dest), "--apply", "--yes"])
+
+        self.assertEqual(code, 0)
+        err = stderr.getvalue()
+        self.assertIn(
+            "1 book staging directory", err, "the operator was not told anything was stranded"
+        )
+        self.assertIn(staging.name, err, "the stranded directory's own path was not reported")
+
+        # Not deleted (the only copy of those tracks), and not silently
+        # completed into the library either — a staging directory can be
+        # partial, and finishing a partial one is exactly the half-a-book
+        # this PR exists to prevent.
+        self.assertTrue(staging.exists())
+        self.assertEqual(
+            sorted(p.name for p in staging.glob("*.mp3")), ["01.mp3", "02.mp3"]
+        )
+        self.assertFalse(dest_dir.exists())
 
 
 if __name__ == "__main__":
