@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
+from collections.abc import Collection, Iterable, Sequence
 from typing import Any
 
 import discord
@@ -29,6 +31,31 @@ def _int_set(value: str | None) -> set[int]:
         except ValueError as exc:
             raise ValueError("SHELFMARK_DISCORD_ALLOWED_ROLE_IDS must contain integer IDs") from exc
     return result
+
+
+def _idle(reasons: Sequence[str]) -> None:
+    """Stay up doing nothing, rather than exiting.
+
+    The bot runs under `restart: unless-stopped`, which restarts the container
+    on ANY exit — a clean one included. Raising on missing configuration
+    therefore produces a container that dies and respawns forever, scrolling
+    the one message the operator needed off the top of `docker logs`.
+
+    Idling keeps that message readable until the next deployment supplies the
+    value. It matches how the rest of this stack behaves: a service with a
+    missing credential should sit there waiting for one, not take the node's
+    log budget with it.
+    """
+    print("Shelfmark Discord bot is NOT running. Reason(s):", flush=True)
+    for reason in reasons:
+        print(f"  - {reason}", flush=True)
+    print(
+        "Set the missing value(s) as repository secrets on nuniesmith/freddy and "
+        "redeploy; the container is recreated with the new environment.",
+        flush=True,
+    )
+    while True:
+        time.sleep(3600)
 
 
 class ShelfmarkApi:
@@ -137,17 +164,47 @@ class ReleaseView(discord.ui.View):
         return callback
 
 
+def is_permitted(member_role_ids: Iterable[int], allowed_roles: Collection[int]) -> bool:
+    """Decide access from role IDs alone.
+
+    Fails CLOSED on an empty allow-list. It used to return True, so a bot
+    deployed before its role IDs were configured let every member of the server
+    run every command — including `/organize-preview`, which takes an arbitrary
+    absolute path and reports what is at it.
+
+    The dangerous part was that nothing looked wrong. The bot answered, the
+    commands worked, and the access control appeared to be in force precisely
+    because it was sitting there in the config waiting to be filled in.
+
+    Split out from the interaction handler so the decision can be tested
+    without standing up a Discord object graph — the reason the original was
+    never covered.
+    """
+    if not allowed_roles:
+        return False
+    return bool(set(member_role_ids) & set(allowed_roles))
+
+
 def install_commands(bot: commands.Bot, api: ShelfmarkApi, allowed_roles: set[int]) -> None:
     def permitted(interaction: discord.Interaction) -> bool:
-        if not allowed_roles:
-            return True
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        return bool(member and {role.id for role in member.roles} & allowed_roles)
+        if member is None:
+            return False  # a DM has no roles, so it can never be allowed
+        return is_permitted((role.id for role in member.roles), allowed_roles)
 
     async def guard(interaction: discord.Interaction) -> bool:
         if permitted(interaction):
             return True
-        await interaction.response.send_message("You are not allowed to use Shelfmark.", ephemeral=True)
+        # Say which of the two it is. "You are not allowed" sent to the server
+        # owner, on a bot with no roles configured, is a confusing half-truth.
+        if not allowed_roles:
+            message = (
+                "Shelfmark has no allowed roles configured, so every command is "
+                "refused. Set `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` and redeploy."
+            )
+        else:
+            message = "You are not allowed to use Shelfmark."
+        await interaction.response.send_message(message, ephemeral=True)
         return False
 
     @bot.tree.command(name="library-search", description="Search books already in Audiobookshelf")
@@ -297,6 +354,22 @@ def install_commands(bot: commands.Bot, api: ShelfmarkApi, allowed_roles: set[in
             await interaction.followup.send("The preview job could not be queued.", ephemeral=True)
 
 
+def blocking_problems() -> list[str]:
+    """Configuration without which the bot cannot connect at all.
+
+    Deliberately NOT including the allow-list: a bot with no roles configured
+    can still connect and answer, refusing each command with a message that
+    says why. That is far easier to diagnose from Discord than a container
+    that never appears.
+    """
+    problems: list[str] = []
+    if not (os.environ.get("DISCORD_BOT_TOKEN") or "").strip():
+        problems.append("DISCORD_BOT_TOKEN is not set")
+    if not (os.environ.get("SHELFMARK_API_TOKEN") or "").strip():
+        problems.append("SHELFMARK_API_TOKEN is not set (the bot calls the API with it)")
+    return problems
+
+
 def build_bot() -> commands.Bot:
     token = os.environ.get("DISCORD_BOT_TOKEN")
     if not token:
@@ -305,8 +378,19 @@ def build_bot() -> commands.Bot:
     api_token = os.environ.get("SHELFMARK_API_TOKEN")
     if not api_token:
         raise ValueError("SHELFMARK_API_TOKEN is required for the bot")
-    guild_id_text = os.environ.get("SHELFMARK_DISCORD_GUILD_ID")
-    guild_id = int(guild_id_text) if guild_id_text else None
+    guild_id_text = (os.environ.get("SHELFMARK_DISCORD_GUILD_ID") or "").strip()
+    try:
+        guild_id = int(guild_id_text) if guild_id_text else None
+    except ValueError:
+        # Not worth refusing to start over. Commands sync globally instead,
+        # which works — it is just slower to appear.
+        print(
+            f"SHELFMARK_DISCORD_GUILD_ID is not a number ({guild_id_text!r}); "
+            "syncing commands globally instead, which can take up to an hour "
+            "to appear.",
+            flush=True,
+        )
+        guild_id = None
     intents = discord.Intents.none()
     intents.guilds = True
 
@@ -323,16 +407,39 @@ def build_bot() -> commands.Bot:
             if self.user:
                 print(f"Shelfmark bot connected as {self.user} (guild={guild_id or 'global'})")
 
+    try:
+        allowed_roles = _int_set(os.environ.get("SHELFMARK_DISCORD_ALLOWED_ROLE_IDS"))
+    except ValueError as exc:
+        # An unparseable allow-list must not become an ABSENT allow-list, and
+        # must not crash-loop either. Empty is now fail-closed, so refusing
+        # everything is the safe reading of "I could not tell who is allowed".
+        print(f"{exc}. Refusing every command until it is corrected.", flush=True)
+        allowed_roles = set()
+    if not allowed_roles:
+        print(
+            "SHELFMARK_DISCORD_ALLOWED_ROLE_IDS is empty — every command will be "
+            "refused. Set it to the ID of the role permitted to use Shelfmark.",
+            flush=True,
+        )
     bot = ShelfmarkBot(command_prefix=commands.when_mentioned, intents=intents)
-    install_commands(bot, ShelfmarkApi(api_url, api_token), _int_set(os.environ.get("SHELFMARK_DISCORD_ALLOWED_ROLE_IDS")))
+    install_commands(bot, ShelfmarkApi(api_url, api_token), allowed_roles)
     return bot
 
 
 def main() -> None:
-    token = os.environ.get("DISCORD_BOT_TOKEN")
-    if not token:
-        raise SystemExit("DISCORD_BOT_TOKEN is required")
-    build_bot().run(token)
+    problems = blocking_problems()
+    if problems:
+        _idle(problems)
+        return
+    token = os.environ["DISCORD_BOT_TOKEN"]
+    try:
+        build_bot().run(token)
+    except discord.LoginFailure:
+        # A WRONG token, as distinct from a missing one. Retrying cannot fix
+        # it, and under `restart: unless-stopped` an exit here would retry it
+        # forever — against Discord's login endpoint, which is a good way to
+        # get the application rate-limited.
+        _idle(["DISCORD_BOT_TOKEN was rejected by Discord — the token is wrong or was reset"])
 
 
 if __name__ == "__main__":
