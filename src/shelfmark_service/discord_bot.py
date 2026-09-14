@@ -115,6 +115,35 @@ def _release_label(release: dict[str, Any]) -> str:
     return f"{title[:70]} · {indexer[:24]}{size_text}"
 
 
+def _job_status_message(payload: dict[str, Any], job_id: str) -> str:
+    """Render a `GET /api/v1/jobs/{id}` payload for `/job`.
+
+    Split out from the command handler for the same reason `is_permitted` is:
+    it can be checked directly, without a Discord interaction object graph, on
+    the exact question that motivated this module — that a failed job's code
+    (`extraction_failed`, `provider_not_configured`, ...) is now visible next
+    to its status, not just the free-text `error` sentence that used to be the
+    only signal and changed wording every time someone edited it.
+
+    The code line only appears for `failed`/`cancelled` jobs: a queued or
+    running job has none yet, and a succeeded one never will.
+    """
+    status = payload.get("status", "unknown")
+    lines = [
+        f"Job **{payload.get('id', job_id)}**: `{status}`",
+        f"Attempts: {payload.get('attempts', 0)}",
+    ]
+    if status in {"failed", "cancelled"}:
+        # `code` is None on a job that failed before this column existed
+        # (migration 2 backfills NULL, not a guess) — "unknown" says that
+        # plainly instead of the line silently vanishing.
+        lines.append(f"Code: `{payload.get('code') or 'unknown'}`")
+        error = payload.get("error")
+        if error:
+            lines.append(f"Error: {str(error)[:300]}")
+    return "\n".join(lines)
+
+
 def _library_label(item: dict[str, Any]) -> str:
     media = item.get("media") if isinstance(item.get("media"), dict) else item
     metadata = media.get("metadata") if isinstance(media, dict) and isinstance(media.get("metadata"), dict) else media
@@ -280,11 +309,7 @@ def install_commands(bot: commands.Bot, api: ShelfmarkApi, allowed_roles: set[in
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             payload = await api.get(f"/api/v1/jobs/{job_id}", actor=_actor(interaction))
-            await interaction.followup.send(
-                f"Job **{payload.get('id', job_id)}**: `{payload.get('status', 'unknown')}`\n"
-                f"Attempts: {payload.get('attempts', 0)}",
-                ephemeral=True,
-            )
+            await interaction.followup.send(_job_status_message(payload, job_id), ephemeral=True)
         except ServiceError:
             await interaction.followup.send("That job could not be loaded.", ephemeral=True)
 

@@ -360,7 +360,7 @@ Acceptance criteria:
 - [x] Add isolated extraction and archive safety checks.
 - [x] Add manifests and operation checksums. **Atomic file writes and extraction quarantine are done**; whole-directory staging and resume logic remain.
 - [x] Make repeated imports idempotent for identical move/copy retries.
-- [ ] Add structured JSON output and stable error codes.
+- [~] Add structured JSON output and stable error codes. **Stable error codes are done**: `shelfmark_service/errors.py` defines an append-only `ErrorCode` enum (`provider_not_configured`, `invalid_payload`, `source_missing`, `extraction_failed`, `verification_failed`, `upstream_unavailable`, `cancelled`, `internal`) and a `ShelfmarkError` exception; `worker.execute()` raises it from every real failure site (mapped from the actual `clients.py`/`transfer.py`/`main.py` failure modes, not invented), anything unmapped becomes `internal`, and the code is persisted alongside the free-text message (`jobs.error_code`, migration 2) and exposed as `code` on `GET /api/v1/jobs/{id}` and in the Discord `/job` reply. **Structured JSON output for the CLI is still open** — `main.py`'s `--dry-run`/`--apply` output is still plain text, untouched by this change.
 - [x] Add regression fixtures for mixed media, multipart isolation, broken archives, unknown files, and repeated copy runs.
 - [x] Keep CLI compatibility.
 
