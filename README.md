@@ -257,9 +257,23 @@ both, with the broken one sorting first.
 Moves within a single filesystem use `rename` directly: atomic, and no data is
 copied at all. Only a move that crosses a filesystem boundary has to stage.
 
-An interrupted run can still leave a **partial book folder** — every file in it
-complete, but not all of the tracks present. Whole-directory staging is not
-implemented yet.
+A **new** book — one whose destination folder does not exist yet — is also
+staged whole before it appears. Every track and sidecar is copied into a
+private directory beside the destination (`.shelfmark-work-books`, a separate
+marker from the one archive extraction uses, so the two never contend over the
+same working directory) and the finished folder is handed over with one
+`rename`. Either the whole book appears, or nothing does — there is no state
+where the library holds a folder missing most of its tracks. Population only
+ever reads the source, so an import killed partway (out of disk, a bad track,
+an operator's Ctrl-C) loses nothing: the half-built staging directory is
+simply deleted, and the source files it would have consumed are all still
+sitting where they started.
+
+Filing more files into a book that is **already** on disk — a repeat run, or
+new tracks arriving for one already imported — still writes straight in, file
+by file, exactly as before: that folder is already visible to a scan either
+way, so staging buys nothing there, and `rename` cannot merge into a
+destination that already has files in it regardless.
 
 ### What happens when an archive is broken
 

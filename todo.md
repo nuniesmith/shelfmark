@@ -78,7 +78,7 @@ These should be fixed before allowing an unattended service to move or delete fi
 - [x] Leave failed archives in place and mark the job failed; never move a failed archive to trash and return success. The archive is trashed only after a successful extract.
 - [x] Make move/copy operations resumable and idempotent. If the destination already contains the same file, compare size/checksum and skip it instead of creating `01 (2).mp3`. The remaining hole was an INTERRUPTED write: a truncated file under the real name is not identical to the source, so the retry wrote `01 (2).mp3` beside it. Writes now stage and rename, so the destination is complete or absent.
 - [x] Add an append-only transaction manifest for every worker import: source, destination, operation, checksum, timestamp, actor, and result.
-- [~] Write destination files atomically, then rename the completed destination directory into place. **Files are atomic** — staged in the destination directory, fsynced, renamed into place; `move` uses `os.rename` directly within a filesystem and stages only across the EXDEV boundary. **Whole-directory staging is still open**: a book is written track by track, so an interrupted import leaves a partial book folder even though every file in it is complete.
+- [x] Write destination files atomically, then rename the completed destination directory into place. **Files are atomic** — staged in the destination directory, fsynced, renamed into place; `move` uses `os.rename` directly within a filesystem and stages only across the EXDEV boundary. **Whole-directory staging is done for new books**: a book whose destination folder does not exist yet is assembled in `.shelfmark-work-books` beside it (a separate marker from archive extraction's `.shelfmark-work`, so the two can never contend over one working directory) and handed over with a single `rename`, so the library never shows one missing tracks. Filing into a book already on disk (a repeat run, or new files for one already imported) still writes file by file — that folder is already visible to a scan either way, and `rename` cannot merge into a non-empty destination regardless.
 - [ ] Use a quarantine directory for failed or ambiguous jobs instead of deleting source material. **Done for extraction failures** (`--quarantine`, default `<source>/.shelfmark-quarantine`); still open for the other job types.
 - [x] Review all archive extractors for path traversal and symlink behavior. External extractors should run in staging with post-extraction validation. `_safe_target` screens member names; `_reject_escaping_links` runs after extraction, which is the only point unrar/unar/7z can be held to the same rule.
 - [ ] Keep the CLI dry-run/apply behavior compatible with the existing README.
@@ -358,7 +358,7 @@ Acceptance criteria:
 - [ ] Add the expanded identity model.
 - [x] Preserve managed-library sidecars.
 - [x] Add isolated extraction and archive safety checks.
-- [x] Add manifests and operation checksums. **Atomic file writes and extraction quarantine are done**; whole-directory staging and resume logic remain.
+- [x] Add manifests and operation checksums. **Atomic file writes, extraction quarantine, and whole-directory staging for new books are done**; resume logic for a book already partly on disk remains file-by-file.
 - [x] Make repeated imports idempotent for identical move/copy retries.
 - [ ] Add structured JSON output and stable error codes.
 - [x] Add regression fixtures for mixed media, multipart isolation, broken archives, unknown files, and repeated copy runs.
