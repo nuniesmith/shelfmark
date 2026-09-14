@@ -99,6 +99,8 @@ class Worker:
                 self.settings.audiobookshelf_token,
                 timeout=self.settings.http_timeout,
                 retries=self.settings.http_retries,
+                breaker_failure_threshold=self.settings.circuit_breaker_failure_threshold,
+                breaker_cooldown_seconds=self.settings.circuit_breaker_cooldown_seconds,
             )
             if job.kind == "metadata_update":
                 item_id = str(job.payload.get("item_id", ""))
@@ -205,6 +207,8 @@ class Worker:
                 self.settings.prowlarr_api_key,
                 timeout=self.settings.http_timeout,
                 retries=self.settings.http_retries,
+                breaker_failure_threshold=self.settings.circuit_breaker_failure_threshold,
+                breaker_cooldown_seconds=self.settings.circuit_breaker_cooldown_seconds,
             )
             return {"release": release, "upstream": client.grab(release), "submitted": True}
         if job.kind not in {"organize_preview", "organize_apply"}:

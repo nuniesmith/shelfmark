@@ -51,6 +51,8 @@ class Settings:
     poll_interval: float = 2.0
     http_timeout: float = 15.0
     http_retries: int = 3
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_cooldown_seconds: float = 30.0
     audiobookshelf_url: str | None = None
     audiobookshelf_token: str | None = None
     audiobookshelf_library_id: str | None = None
@@ -87,6 +89,12 @@ class Settings:
             poll_interval=_float_from_env("SHELFMARK_WORKER_POLL_SECONDS", 2.0),
             http_timeout=_float_from_env("SHELFMARK_HTTP_TIMEOUT_SECONDS", 15.0),
             http_retries=max(0, int(os.environ.get("SHELFMARK_HTTP_RETRIES", "3"))),
+            circuit_breaker_failure_threshold=max(
+                1, int(os.environ.get("SHELFMARK_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
+            ),
+            circuit_breaker_cooldown_seconds=_float_from_env(
+                "SHELFMARK_CIRCUIT_BREAKER_COOLDOWN_SECONDS", 30.0
+            ),
             audiobookshelf_url=os.environ.get("AUDIOBOOKSHELF_URL") or None,
             audiobookshelf_token=os.environ.get("AUDIOBOOKSHELF_API_TOKEN") or None,
             audiobookshelf_library_id=os.environ.get("AUDIOBOOKSHELF_LIBRARY_ID") or None,

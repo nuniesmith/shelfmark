@@ -1,17 +1,108 @@
 from __future__ import annotations
 
+import email.message
+import io
 import json
 import threading
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from src.shelfmark_service.clients import (
     AudiobookshelfClient,
+    CircuitBreaker,
+    CircuitBreakerOpenError,
     HttpClient,
     ProwlarrClient,
     QBittorrentClient,
+    ServiceError,
 )
+
+
+class _FakeClock:
+    """A controllable stand-in for time.monotonic so breaker tests never sleep."""
+
+    def __init__(self, start: float = 0.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _http_error(code: int, body: bytes = b"boom", headers: email.message.Message | None = None) -> urllib.error.HTTPError:
+    """Build a real HTTPError without a socket, so the breaker's decode of the
+    exception (code, headers, read/close) exercises the same code paths a
+    live server response would."""
+    return urllib.error.HTTPError("http://svc/x", code, "err", headers or email.message.Message(), io.BytesIO(body))
+
+
+class _FakeHeaders:
+    def __init__(self, content_type: str = "application/json"):
+        self._content_type = content_type
+
+    def get_content_type(self) -> str:
+        return self._content_type
+
+
+class _FakeResponse:
+    """Minimal stand-in for the context-managed response HttpClient reads."""
+
+    def __init__(self, body: bytes = b'{"ok":true}'):
+        self._body = body
+        self.headers = _FakeHeaders()
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class _ExplodingResponse:
+    """A response that opens fine but blows up while being read/decoded with
+    something other than HTTPError/URLError/TimeoutError/OSError -- e.g. a
+    provider answering 200 with a body that can't be parsed the way the
+    caller expects. HttpClient.request() has no specific except clause for
+    this, so it is exactly the gap a half-open probe must still resolve."""
+
+    def __enter__(self) -> "_ExplodingResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        raise ValueError("response body could not be decoded")
+
+
+class _ScriptedOpener:
+    """A fake OpenerDirector: pops one scripted outcome per .open() call.
+
+    Each outcome is either an exception instance to raise (URLError/OSError
+    for a connection failure, HTTPError for a status response) or a
+    _FakeResponse to return. Used so breaker tests control exactly how many
+    real "network attempts" happen without any socket or server involved.
+    """
+
+    def __init__(self, script: list[object]):
+        self._script = list(script)
+        self.calls = 0
+
+    def open(self, req: object, timeout: float | None = None) -> _FakeResponse:
+        self.calls += 1
+        if not self._script:
+            raise AssertionError("opener.open called more times than scripted")
+        outcome = self._script.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -109,6 +200,254 @@ class ClientTests(unittest.TestCase):
         add = next(item for item in posts if "/torrents/add" in item[1])
         self.assertEqual(parse_qs(add[3].decode())["category"], ["shelfmark-books"])
         self.assertIn("SID=test", next(item for item in _Handler.calls if item[1].endswith("/api/v2/app/version"))[2].get("Cookie", ""))
+
+
+class CircuitBreakerUnitTests(unittest.TestCase):
+    """Exercises CircuitBreaker directly: no sockets, no HttpClient, a fake
+    clock instead of real sleeps -- these should run in well under a second."""
+
+    def test_circuit_breaker_open_error_is_a_service_error(self) -> None:
+        # Existing call sites (api.py, discord_bot.py) do `except ServiceError`;
+        # a breaker trip must still be caught there, not blow past them.
+        self.assertIsInstance(CircuitBreakerOpenError("svc", 1.0), ServiceError)
+
+    def test_closed_state_allows_calls(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=10, clock=clock)
+        breaker.before_call("svc")  # must not raise
+
+    def test_failures_below_threshold_do_not_open(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=10, clock=clock)
+        breaker.record_failure()
+        breaker.record_failure()
+        breaker.before_call("svc")  # 2 of 3: must still let calls through
+
+    def test_reaching_threshold_opens_and_fails_fast(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=10, clock=clock)
+        breaker.record_failure()
+        breaker.record_failure()
+        breaker.record_failure()
+        with self.assertRaises(CircuitBreakerOpenError):
+            breaker.before_call("svc")
+
+    def test_success_resets_the_consecutive_failure_count(self) -> None:
+        # A one-off failure followed by a success is not two-of-three
+        # consecutive failures; without the reset, unrelated occasional
+        # failures across many jobs would eventually add up and trip the
+        # breaker even though the provider is fine.
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=10, clock=clock)
+        breaker.record_failure()
+        breaker.record_failure()
+        breaker.record_success()
+        breaker.record_failure()
+        breaker.record_failure()
+        breaker.before_call("svc")  # still only 2 consecutive: must not raise
+
+    def test_stays_open_until_cooldown_elapses(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+        breaker.record_failure()
+        clock.advance(5)
+        with self.assertRaises(CircuitBreakerOpenError):
+            breaker.before_call("svc")
+        clock.advance(4.99)  # total 9.99s: still short of the 10s cooldown
+        with self.assertRaises(CircuitBreakerOpenError):
+            breaker.before_call("svc")
+        clock.advance(0.01)  # total 10s: cooldown has now fully elapsed
+        breaker.before_call("svc")  # the half-open trial: must not raise
+
+    def test_only_one_half_open_trial_is_permitted(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+        breaker.record_failure()
+        clock.advance(10)
+        breaker.before_call("svc")  # first caller: gets the trial
+        with self.assertRaises(CircuitBreakerOpenError):
+            # A second caller arriving while the trial is still unresolved
+            # must not also get a live request through -- that would pile a
+            # second attempt onto a provider we just decided was down.
+            breaker.before_call("svc")
+
+    def test_half_open_success_closes_the_circuit(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+        breaker.record_failure()
+        clock.advance(10)
+        breaker.before_call("svc")  # the trial
+        breaker.record_success()
+        breaker.before_call("svc")  # closed now: must not raise, no more cooldown
+
+    def test_half_open_failure_reopens_immediately(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=10, clock=clock)
+        for _ in range(5):
+            breaker.record_failure()  # reach the threshold once, the normal way
+        clock.advance(10)
+        breaker.before_call("svc")  # the trial
+        breaker.record_failure()  # only ONE new failure -- far below the threshold of 5
+        # A failed probe re-opens on its own; it must not take another 5
+        # failures to reach the configured threshold a second time.
+        with self.assertRaises(CircuitBreakerOpenError):
+            breaker.before_call("svc")
+
+
+class HttpClientBreakerTests(unittest.TestCase):
+    """Exercises the breaker through HttpClient.request via a scripted fake
+    opener, so no socket is ever opened and no test waits on a real cooldown."""
+
+    def test_connection_errors_trip_breaker_then_skip_the_network(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=2, cooldown_seconds=30, clock=clock)
+        opener = _ScriptedOpener([urllib.error.URLError("refused"), urllib.error.URLError("refused")])
+        client = HttpClient(
+            "http://example.invalid", service="conn-test", retries=0, backoff=0, opener=opener, breaker=breaker
+        )
+        with self.assertRaises(ServiceError) as ctx:
+            client.request("/x")
+        self.assertNotIsInstance(ctx.exception, CircuitBreakerOpenError)
+        with self.assertRaises(ServiceError) as ctx:
+            client.request("/x")
+        self.assertNotIsInstance(ctx.exception, CircuitBreakerOpenError)
+        # Breaker just tripped on the 2nd consecutive failure: the 3rd call
+        # must fail fast without a 3rd call into the opener.
+        with self.assertRaises(CircuitBreakerOpenError):
+            client.request("/x")
+        self.assertEqual(opener.calls, 2)
+
+    def test_5xx_failures_trip_the_breaker(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=2, cooldown_seconds=30, clock=clock)
+        opener = _ScriptedOpener([_http_error(500), _http_error(503)])
+        client = HttpClient(
+            "http://example.invalid", service="5xx-test", retries=0, backoff=0, opener=opener, breaker=breaker
+        )
+        with self.assertRaises(ServiceError):
+            client.request("/x")
+        with self.assertRaises(ServiceError):
+            client.request("/x")
+        with self.assertRaises(CircuitBreakerOpenError):
+            client.request("/x")
+        self.assertEqual(opener.calls, 2)
+
+    def test_404_does_not_trip_the_breaker(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=2, cooldown_seconds=30, clock=clock)
+        # More 404s than the failure_threshold: a bad item id must never
+        # disable the provider for every other job behind it in the queue.
+        opener = _ScriptedOpener([_http_error(404) for _ in range(5)])
+        client = HttpClient(
+            "http://example.invalid", service="404-test", retries=0, backoff=0, opener=opener, breaker=breaker
+        )
+        for _ in range(5):
+            with self.assertRaises(ServiceError) as ctx:
+                client.request("/x")
+            self.assertNotIsInstance(ctx.exception, CircuitBreakerOpenError)
+        self.assertEqual(opener.calls, 5)  # every call really reached "the network"
+
+    def test_401_does_not_trip_the_breaker(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=30, clock=clock)
+        opener = _ScriptedOpener([_http_error(401), _http_error(401)])
+        client = HttpClient(
+            "http://example.invalid", service="401-test", retries=0, backoff=0, opener=opener, breaker=breaker
+        )
+        for _ in range(2):
+            with self.assertRaises(ServiceError) as ctx:
+                client.request("/x")
+            self.assertNotIsInstance(ctx.exception, CircuitBreakerOpenError)
+        self.assertEqual(opener.calls, 2)
+
+    def test_429_does_not_trip_the_breaker(self) -> None:
+        # 429 is retryable (existing behaviour, unchanged) but is the
+        # provider rate-limiting, not the provider being down -- it must not
+        # count toward the breaker any more than a 404 would.
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=30, clock=clock)
+        opener = _ScriptedOpener([_http_error(429), _http_error(429)])
+        client = HttpClient(
+            "http://example.invalid", service="429-test", retries=0, backoff=0, opener=opener, breaker=breaker
+        )
+        for _ in range(2):
+            with self.assertRaises(ServiceError) as ctx:
+                client.request("/x")
+            self.assertNotIsInstance(ctx.exception, CircuitBreakerOpenError)
+        self.assertEqual(opener.calls, 2)
+
+    def test_half_open_probe_succeeds_and_closes_circuit(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+        opener = _ScriptedOpener(
+            [urllib.error.URLError("down"), _FakeResponse(b'{"ok":true}'), _FakeResponse(b'{"ok":true}')]
+        )
+        client = HttpClient(
+            "http://example.invalid", service="half-open-ok", retries=0, backoff=0, opener=opener, breaker=breaker
+        )
+        with self.assertRaises(ServiceError):
+            client.request("/x")  # trips the breaker
+        with self.assertRaises(CircuitBreakerOpenError):
+            client.request("/x")  # still within cooldown
+        self.assertEqual(opener.calls, 1)
+        clock.advance(10)
+        self.assertEqual(client.request("/x"), {"ok": True})  # the trial: succeeds
+        self.assertEqual(client.request("/x"), {"ok": True})  # closed: no cooldown needed now
+        self.assertEqual(opener.calls, 3)
+
+    def test_half_open_probe_failure_reopens_and_keeps_failing_fast(self) -> None:
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+        opener = _ScriptedOpener([urllib.error.URLError("down"), urllib.error.URLError("still down")])
+        client = HttpClient(
+            "http://example.invalid", service="half-open-fail", retries=0, backoff=0, opener=opener, breaker=breaker
+        )
+        with self.assertRaises(ServiceError):
+            client.request("/x")  # trips the breaker
+        clock.advance(10)
+        with self.assertRaises(ServiceError) as ctx:
+            client.request("/x")  # the trial: fails again
+        self.assertNotIsInstance(ctx.exception, CircuitBreakerOpenError)
+        # Re-opened immediately on the failed probe: no third network
+        # attempt until a fresh cooldown elapses.
+        with self.assertRaises(CircuitBreakerOpenError):
+            client.request("/x")
+        self.assertEqual(opener.calls, 2)
+
+    def test_half_open_probe_raising_an_unhandled_exception_still_recovers(self) -> None:
+        # Regression: before_call() marks a half-open trial in flight, and
+        # only record_success()/record_failure() ever clear that flag. Both
+        # were only called from the HTTPError and URLError/TimeoutError/
+        # OSError handlers, so an exception outside that set (a body that
+        # fails to decode, a truncated read, anything) used to leave the
+        # trial "in flight" forever: HALF_OPEN never re-checks the cooldown
+        # the way OPEN does, so every later call took the "another trial is
+        # already in flight" branch and failed fast permanently -- even
+        # 10,000 seconds later. This must instead be treated as a failure
+        # (no usable response came back), reopen the circuit, and recover
+        # normally after a further cooldown.
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+        opener = _ScriptedOpener(
+            [urllib.error.URLError("down"), _ExplodingResponse(), _FakeResponse(b'{"ok":true}')]
+        )
+        client = HttpClient(
+            "http://example.invalid", service="half-open-explode", retries=0, backoff=0, opener=opener, breaker=breaker
+        )
+        with self.assertRaises(ServiceError):
+            client.request("/x")  # trips the breaker
+        clock.advance(10)
+        with self.assertRaises(ValueError):
+            client.request("/x")  # the trial: raises something HttpClient has no handler for
+        self.assertEqual(opener.calls, 2)
+
+        # If the trial's outcome was never resolved, this would still be
+        # HALF_OPEN with trial_in_flight=True, and CircuitBreakerOpenError
+        # would come back no matter how long is waited -- prove that is not
+        # the case by waiting an amount of time that dwarfs the cooldown.
+        clock.advance(10_000)
+        self.assertEqual(client.request("/x"), {"ok": True})
+        self.assertEqual(opener.calls, 3)
 
 
 if __name__ == "__main__":
