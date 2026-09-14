@@ -264,14 +264,37 @@ every future pass from re-importing the same book, restarts included.
 
 **Three separate jobs, chained on success.** The reconciler enqueues
 `transfer_completed`; once it reports `verified: true`, its success enqueues
-`organize_apply`; that job's success enqueues `library_scan` (only if
-Audiobookshelf is configured — otherwise the book is already filed and picked
-up on the next scheduled scan). Each stage is an ordinary row in `jobs`,
-independently retryable and visible through `/job` with its structured error
-code — a failure at any stage stops the chain there rather than leaving a
-partially-organized book. An unverified transfer never reaches the
-organizer: it is destructive, and `transfer_completed` already fails the job
-outright on a checksum mismatch rather than returning normally.
+`organize_apply`; that job's success enqueues `library_scan` (only for the
+audio side, and only if Audiobookshelf is configured — see below). Each stage
+is an ordinary row in `jobs`, independently retryable and visible through
+`/job` with its structured error code — a failure at any stage stops the
+chain there rather than leaving a partially-organized book. An unverified
+transfer never reaches the organizer: it is destructive, and
+`transfer_completed` already fails the job outright on a checksum mismatch
+rather than returning normally.
+
+**`organize_apply` always gets an explicit `source` and `dest`; it never
+defaults either.** `source` is `SHELFMARK_INCOMING_ROOT` — the whole
+staging root, not the just-landed book's own subfolder — because `dest`
+falling back to `source` (its default when omitted) means "organize"
+silently does nothing but rename in place, and pointing `source` at the
+book folder itself removes the very folder name `build_plan` reads
+author/title/year from, scattering every track into its own book with no
+author. Scanning the whole root instead of just this torrent's folder is
+safe because the worker is single-process and runs one job at a time
+(`Worker.run_once`): nothing else can be mid-write into it while an organize
+job runs, and `transfer_completed` never lands a folder there until its own
+stability wait and checksum verify have both passed — so everything under
+it is always either a complete, verified book, or not there yet. `dest` is
+one of `SHELFMARK_AUDIOBOOKS_ROOT` / `SHELFMARK_EBOOKS_ROOT` — one
+`organize_apply` job per configured root, each scoped with `media: audio` or
+`media: ebook`, since a single download can hold both and `build_plan` takes
+only one `dest` per call. A pass whose media type is not present in that
+torrent simply plans zero books; only a pass that actually organizes
+something chains onward (into `library_scan` for audio, or straight to a
+completion notice for ebooks — Audiobookshelf has no ebook library, so
+there is nothing to scan on that side). If neither root is configured, the
+chain stops with a Discord warning rather than falling back to anything.
 
 **Notifications, without the worker depending on discord.py.** A Discord
 webhook (`SHELFMARK_DISCORD_WEBHOOK_URL`) is a plain HTTP POST, so the

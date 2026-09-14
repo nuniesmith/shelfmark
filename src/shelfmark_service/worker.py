@@ -496,44 +496,135 @@ class Worker:
             return
         name = job.payload.get("_reconcile_name") or torrent_hash
         if job.kind == "transfer_completed":
-            if not result.get("verified"):
-                # execute() already raises VERIFICATION_FAILED rather than
-                # returning normally when RsyncTransfer.verify() finds a
-                # mismatch (see the transfer_completed branch above), so this
-                # should be unreachable. It is checked again here anyway
-                # because organize_apply is destructive, and "never organize
-                # an unverified transfer" is a hard constraint worth enforcing
-                # at the one remaining place that could chain into it, not
-                # just trusted from upstream.
-                return
-            local_path = result.get("local_path")
-            if not local_path:
-                return
-            self.database.enqueue(
-                "organize_apply",
-                {"source": local_path, "_reconcile_hash": torrent_hash, "_reconcile_name": name},
-                actor="reconciler",
-            )
+            self._chain_transfer_completed(result, torrent_hash, name)
         elif job.kind == "organize_apply":
-            library_id = self.settings.audiobookshelf_library_id
-            if not (self.settings.audiobookshelf_url and self.settings.audiobookshelf_token and library_id):
-                # The book is already filed into the library at this point --
-                # Audiobookshelf's own periodic scan (or a manual `/scan`)
-                # will pick it up. Not configured is a stopping point, not a
-                # failure to page about.
-                self._notify(
-                    f":white_check_mark: **{name}** organized. Audiobookshelf is not "
-                    "configured for an automatic scan, so it will appear on the next "
-                    "scheduled or manual scan."
-                )
-                return
-            self.database.enqueue(
-                "library_scan",
-                {"library_id": library_id, "_reconcile_hash": torrent_hash, "_reconcile_name": name},
-                actor="reconciler",
-            )
+            self._chain_organize_apply(job, result, torrent_hash, name)
         elif job.kind == "library_scan":
             self._notify(f":white_check_mark: **{name}** is in the library.")
+
+    def _chain_transfer_completed(self, result: dict[str, Any], torrent_hash: str, name: str) -> None:
+        """Queue one `organize_apply` per configured media root.
+
+        `source` is the whole INCOMING ROOT, never the just-landed book path.
+        Two things break if it is the book path instead:
+
+          1. `dest` would default to `source` (see `execute()`'s
+             `dest = _path(payload, "dest", source)`), which means the book
+             gets "organized" in place -- i.e. not organized at all, silently.
+          2. Even with an explicit `dest`, `build_plan` reads author/title/
+             year off the name of the folder directly under `source`. Point
+             `source` AT that folder and there is no folder above it left to
+             read the name from -- every track becomes its own book with no
+             author, which is exactly the corruption a book showing up as
+             "in the library" in this feature's own Discord notification must
+             never paper over.
+
+        Scanning the whole root instead of just this torrent's folder is safe
+        specifically because the worker is single-process and runs one job at
+        a time (see `Worker.run_once`): nothing else can be mid-write into
+        `incoming_root` while this organize job runs, and `transfer_completed`
+        never lands a folder there until its own `wait_until_stable` +
+        `verify` have both passed. So everything under `incoming_root` at any
+        moment is either a fully verified, complete book, or not there yet --
+        never a partial tree an organize pass could catch mid-transfer.
+
+        `dest` is never left to default, and a download can hold both an
+        audiobook and an ebook -- `build_plan` takes exactly one `dest` per
+        call, and Audiobookshelf and Shelfmark's own ebook index are two
+        different roots. So this queues one pass per CONFIGURED root, each
+        scoped to its own `media` type; a pass whose type is not present in
+        this torrent's content plans zero books (see `build_plan`'s
+        `do_audio`/`do_ebook` gating) rather than erroring, and its sibling
+        pass still runs independently.
+        """
+        if not result.get("verified"):
+            # execute() already raises VERIFICATION_FAILED rather than
+            # returning normally when RsyncTransfer.verify() finds a mismatch
+            # (see the transfer_completed branch above), so this should be
+            # unreachable. It is checked again here anyway because
+            # organize_apply is destructive, and "never organize an
+            # unverified transfer" is a hard constraint worth enforcing at
+            # the one remaining place that could chain into it, not just
+            # trusted from upstream.
+            return
+        # Matches transfer_completed's OWN fallback (`local_root =
+        # self.settings.incoming_root or Path("/incoming")`) so this scans
+        # the exact directory the transfer actually wrote into, even when
+        # SHELFMARK_INCOMING_ROOT is unset.
+        incoming_root = self.settings.incoming_root or Path("/incoming")
+        audio_root = self.settings.audio_root
+        ebook_root = self.settings.ebook_root
+        if audio_root is None and ebook_root is None:
+            # Stop here, loudly -- rather than falling back to some default
+            # destination, which is the exact shape of bug this method
+            # exists to not repeat.
+            self._notify(
+                f":warning: Cannot organize **{name}**: neither SHELFMARK_AUDIOBOOKS_ROOT "
+                "nor SHELFMARK_EBOOKS_ROOT is configured."
+            )
+            return
+        if audio_root is not None:
+            self.database.enqueue(
+                "organize_apply",
+                {
+                    "source": str(incoming_root),
+                    "dest": str(audio_root),
+                    "media": "audio",
+                    "_reconcile_hash": torrent_hash,
+                    "_reconcile_name": name,
+                },
+                actor="reconciler",
+            )
+        if ebook_root is not None:
+            self.database.enqueue(
+                "organize_apply",
+                {
+                    "source": str(incoming_root),
+                    "dest": str(ebook_root),
+                    "media": "ebook",
+                    "_reconcile_hash": torrent_hash,
+                    "_reconcile_name": name,
+                },
+                actor="reconciler",
+            )
+
+    def _chain_organize_apply(self, job: Job, result: dict[str, Any], torrent_hash: str, name: str) -> None:
+        """Scan (audio) or just announce (ebook) once a pass actually organized something.
+
+        `result["books"]` is 0 when this pass's `media` type was not present
+        in the torrent (an ebook-only download under the audio pass, or vice
+        versa, since both passes always run when both roots are configured --
+        see `_chain_transfer_completed`). That is normal, not a failure, but
+        it must not chain into `library_scan` or announce "in the library":
+        that was exactly the bug report -- a scan/notification fired for a
+        book that never actually arrived at that pass's destination.
+        """
+        if not result.get("books"):
+            return
+        if job.payload.get("media") == "ebook":
+            # Audiobookshelf has no ebook library (see README's "Ebooks"
+            # section) -- Shelfmark serves ebooks by walking
+            # SHELFMARK_EBOOKS_ROOT directly on every request, so there is no
+            # scan step on this side of the chain; organized is the end of it.
+            self._notify(f":white_check_mark: **{name}** (ebook) organized.")
+            return
+        library_id = self.settings.audiobookshelf_library_id
+        if not (self.settings.audiobookshelf_url and self.settings.audiobookshelf_token and library_id):
+            # The book is already filed into the library at this point --
+            # Audiobookshelf's own periodic scan (or a manual `/scan`) will
+            # pick it up. Not configured is a stopping point, not a failure
+            # to page about.
+            self._notify(
+                f":white_check_mark: **{name}** organized. Audiobookshelf is not "
+                "configured for an automatic scan, so it will appear on the next "
+                "scheduled or manual scan."
+            )
+            return
+        self.database.enqueue(
+            "library_scan",
+            {"library_id": library_id, "_reconcile_hash": torrent_hash, "_reconcile_name": name},
+            actor="reconciler",
+        )
 
     def _notify_chain_failure(self, job: Job, message: str, code: str) -> None:
         """Page Discord when an automatic pipeline stage fails.

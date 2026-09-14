@@ -389,10 +389,17 @@ class ReconcileDownloadsJobTests(WorkerTestCase):
 
 class ChainAfterSuccessTests(WorkerTestCase):
     """`_chain_after_success` is the wiring between the three separate job
-    kinds -- see the module docstring on it in worker.py."""
+    kinds -- see the module docstring on it in worker.py.
 
-    def test_transfer_completed_chains_to_organize_apply(self) -> None:
-        worker = self.make_worker()
+    `source` must always be `incoming_root` (never the landed book path) and
+    `dest` must always be an explicit, configured media root -- see
+    `_chain_transfer_completed`'s docstring for exactly why: an omitted
+    `dest` defaults to `source` in `execute()`, which means "organize" does
+    nothing but rename in place.
+    """
+
+    def test_transfer_completed_with_only_audio_root_queues_one_audio_pass(self) -> None:
+        worker = self.make_worker(incoming_root=Path("/incoming"), audio_root=Path("/audiobooks"))
         job = self.make_job(
             "transfer_completed",
             {"remote_path": "Book One", "_reconcile_hash": "h1", "_reconcile_name": "Book One"},
@@ -401,15 +408,81 @@ class ChainAfterSuccessTests(WorkerTestCase):
         queued = self.database.list_jobs(status="queued", limit=50)
         self.assertEqual(len(queued), 1)
         self.assertEqual(queued[0].kind, "organize_apply")
-        self.assertEqual(queued[0].payload["source"], "/incoming/Book One")
+        # The incoming ROOT, not the book's own landed subfolder -- see the
+        # docstring on _chain_transfer_completed for why pointing source at
+        # the book folder itself strips the very name build_plan reads
+        # author/title/year from.
+        self.assertEqual(queued[0].payload["source"], "/incoming")
+        self.assertEqual(queued[0].payload["dest"], "/audiobooks")
+        self.assertEqual(queued[0].payload["media"], "audio")
         self.assertEqual(queued[0].payload["_reconcile_hash"], "h1")
+
+    def test_transfer_completed_with_only_ebook_root_queues_one_ebook_pass(self) -> None:
+        worker = self.make_worker(incoming_root=Path("/incoming"), ebook_root=Path("/ebooks"))
+        job = self.make_job(
+            "transfer_completed", {"remote_path": "Book One", "_reconcile_hash": "h1"}
+        )
+        worker._chain_after_success(job, {"verified": True, "local_path": "/incoming/Book One"})
+        queued = self.database.list_jobs(status="queued", limit=50)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].payload["source"], "/incoming")
+        self.assertEqual(queued[0].payload["dest"], "/ebooks")
+        self.assertEqual(queued[0].payload["media"], "ebook")
+
+    def test_transfer_completed_with_both_roots_queues_one_pass_per_root(self) -> None:
+        # A single download can hold both an audiobook and an ebook --
+        # build_plan takes exactly one dest per call, so this has to be two
+        # separate jobs, not one.
+        worker = self.make_worker(
+            incoming_root=Path("/incoming"), audio_root=Path("/audiobooks"), ebook_root=Path("/ebooks")
+        )
+        job = self.make_job(
+            "transfer_completed", {"remote_path": "Book One", "_reconcile_hash": "h1"}
+        )
+        worker._chain_after_success(job, {"verified": True, "local_path": "/incoming/Book One"})
+        queued = self.database.list_jobs(status="queued", limit=50)
+        self.assertEqual(len(queued), 2)
+        by_media = {j.payload["media"]: j for j in queued}
+        self.assertEqual(set(by_media), {"audio", "ebook"})
+        self.assertEqual(by_media["audio"].payload["dest"], "/audiobooks")
+        self.assertEqual(by_media["ebook"].payload["dest"], "/ebooks")
+        for j in queued:
+            self.assertEqual(j.payload["source"], "/incoming")
+
+    def test_transfer_completed_defaults_source_to_slash_incoming_when_unconfigured(self) -> None:
+        # Matches transfer_completed's OWN fallback (local_root =
+        # settings.incoming_root or Path("/incoming")) -- the organize pass
+        # has to scan the exact directory the transfer actually wrote into.
+        worker = self.make_worker(audio_root=Path("/audiobooks"))  # incoming_root unset
+        job = self.make_job(
+            "transfer_completed", {"remote_path": "Book One", "_reconcile_hash": "h1"}
+        )
+        worker._chain_after_success(job, {"verified": True, "local_path": "/incoming/Book One"})
+        queued = self.database.list_jobs(status="queued", limit=50)
+        self.assertEqual(queued[0].payload["source"], "/incoming")
+
+    def test_transfer_completed_with_neither_root_configured_notifies_and_does_not_chain(self) -> None:
+        # The exact bug being fixed: no configured destination must stop the
+        # chain with a clear message, not fall back to organizing in place.
+        worker = self.make_worker(incoming_root=Path("/incoming"))  # no audio_root/ebook_root
+        worker._notify = mock.Mock()  # type: ignore[method-assign]
+        job = self.make_job(
+            "transfer_completed", {"remote_path": "Book One", "_reconcile_hash": "h1", "_reconcile_name": "Book One"}
+        )
+        worker._chain_after_success(job, {"verified": True, "local_path": "/incoming/Book One"})
+        self.assertEqual(self.database.list_jobs(status="queued", limit=50), [])
+        worker._notify.assert_called_once()
+        message = worker._notify.call_args[0][0]
+        self.assertIn("Book One", message)
+        self.assertIn("AUDIOBOOKS_ROOT", message)
+        self.assertIn("EBOOKS_ROOT", message)
 
     def test_unverified_transfer_does_not_chain(self) -> None:
         # Defense in depth: execute() already raises VERIFICATION_FAILED
         # rather than returning a result when verify() finds a mismatch, so
         # this path should be unreachable in production -- but organize_apply
         # is destructive, so it is checked again here rather than trusted.
-        worker = self.make_worker()
+        worker = self.make_worker(incoming_root=Path("/incoming"), audio_root=Path("/audiobooks"))
         job = self.make_job(
             "transfer_completed", {"remote_path": "Book One", "_reconcile_hash": "h1"}
         )
@@ -420,12 +493,36 @@ class ChainAfterSuccessTests(WorkerTestCase):
         # A job submitted through POST /api/v1/transfers/pull has no
         # _reconcile_hash key -- this feature must not start auto-organizing
         # transfers nobody asked it to chain.
-        worker = self.make_worker()
+        worker = self.make_worker(incoming_root=Path("/incoming"), audio_root=Path("/audiobooks"))
         job = self.make_job("transfer_completed", {"remote_path": "Book One"})
         worker._chain_after_success(job, {"verified": True, "local_path": "/incoming/Book One"})
         self.assertEqual(self.database.list_jobs(status="queued", limit=50), [])
 
-    def test_organize_apply_chains_to_library_scan_when_abs_is_configured(self) -> None:
+    def test_organize_apply_with_zero_books_does_not_chain_or_notify(self) -> None:
+        # The other half of the bug report: a pass whose media type was not
+        # present in this torrent (books == 0) must not scan for, or
+        # announce, a book that never arrived at that pass's destination.
+        worker = self.make_worker(
+            audiobookshelf_url="http://abs.internal",
+            audiobookshelf_token="tok",
+            audiobookshelf_library_id="lib-1",
+        )
+        worker._notify = mock.Mock()  # type: ignore[method-assign]
+        job = self.make_job(
+            "organize_apply",
+            {
+                "source": "/incoming",
+                "dest": "/audiobooks",
+                "media": "audio",
+                "_reconcile_hash": "h1",
+                "_reconcile_name": "Book One",
+            },
+        )
+        worker._chain_after_success(job, {"applied": True, "books": 0})
+        self.assertEqual(self.database.list_jobs(status="queued", limit=50), [])
+        worker._notify.assert_not_called()
+
+    def test_organize_apply_audio_pass_chains_to_library_scan_when_abs_is_configured(self) -> None:
         worker = self.make_worker(
             audiobookshelf_url="http://abs.internal",
             audiobookshelf_token="tok",
@@ -433,25 +530,65 @@ class ChainAfterSuccessTests(WorkerTestCase):
         )
         job = self.make_job(
             "organize_apply",
-            {"source": "/incoming/Book One", "_reconcile_hash": "h1", "_reconcile_name": "Book One"},
+            {
+                "source": "/incoming",
+                "dest": "/audiobooks",
+                "media": "audio",
+                "_reconcile_hash": "h1",
+                "_reconcile_name": "Book One",
+            },
         )
-        worker._chain_after_success(job, {"applied": True})
+        worker._chain_after_success(job, {"applied": True, "books": 1})
         queued = self.database.list_jobs(status="queued", limit=50)
         self.assertEqual(len(queued), 1)
         self.assertEqual(queued[0].kind, "library_scan")
         self.assertEqual(queued[0].payload["library_id"], "lib-1")
         self.assertEqual(queued[0].payload["_reconcile_hash"], "h1")
 
-    def test_organize_apply_notifies_instead_of_scanning_when_abs_is_not_configured(self) -> None:
+    def test_organize_apply_audio_pass_notifies_instead_of_scanning_when_abs_is_not_configured(self) -> None:
         worker = self.make_worker()  # no audiobookshelf_* settings
         worker._notify = mock.Mock()  # type: ignore[method-assign]
         job = self.make_job(
-            "organize_apply", {"source": "/incoming/Book One", "_reconcile_hash": "h1", "_reconcile_name": "Book One"}
+            "organize_apply",
+            {
+                "source": "/incoming",
+                "dest": "/audiobooks",
+                "media": "audio",
+                "_reconcile_hash": "h1",
+                "_reconcile_name": "Book One",
+            },
         )
-        worker._chain_after_success(job, {"applied": True})
+        worker._chain_after_success(job, {"applied": True, "books": 1})
         self.assertEqual(self.database.list_jobs(status="queued", limit=50), [])
         worker._notify.assert_called_once()
         self.assertIn("Book One", worker._notify.call_args[0][0])
+
+    def test_organize_apply_ebook_pass_notifies_without_a_library_scan(self) -> None:
+        # Audiobookshelf has no ebook library -- Shelfmark serves ebooks by
+        # walking SHELFMARK_EBOOKS_ROOT directly, so an ebook pass must never
+        # enqueue library_scan even when Audiobookshelf IS configured.
+        worker = self.make_worker(
+            audiobookshelf_url="http://abs.internal",
+            audiobookshelf_token="tok",
+            audiobookshelf_library_id="lib-1",
+        )
+        worker._notify = mock.Mock()  # type: ignore[method-assign]
+        job = self.make_job(
+            "organize_apply",
+            {
+                "source": "/incoming",
+                "dest": "/ebooks",
+                "media": "ebook",
+                "_reconcile_hash": "h1",
+                "_reconcile_name": "Book One",
+            },
+        )
+        worker._chain_after_success(job, {"applied": True, "books": 1})
+        self.assertEqual(self.database.list_jobs(status="queued", limit=50), [])
+        worker._notify.assert_called_once()
+        message = worker._notify.call_args[0][0]
+        self.assertIn("Book One", message)
+        self.assertIn("ebook", message)
 
     def test_library_scan_success_sends_the_completion_notification(self) -> None:
         worker = self.make_worker()
@@ -464,6 +601,56 @@ class ChainAfterSuccessTests(WorkerTestCase):
         message = worker._notify.call_args[0][0]
         self.assertIn("Book One", message)
         self.assertIn("library", message)
+
+
+class LibraryPlacementEndToEndTests(WorkerTestCase):
+    """The regression class the bug report asked for: assert on the actual
+    destination TREE, not merely that the job reported success. Every prior
+    test in this file checked job outcome only, which is exactly how the
+    "organized in place, library left empty" bug passed 179 tests."""
+
+    def test_transfer_success_chain_lands_the_book_in_the_audio_library_root(self) -> None:
+        incoming = Path(self.tmp.name) / "incoming"
+        audio_root = Path(self.tmp.name) / "audiobooks"
+        book_dir = incoming / "Ursula K Le Guin - The Dispossessed (1974)"
+        book_dir.mkdir(parents=True)
+        (book_dir / "01.mp3").write_bytes(b"track one")
+        (book_dir / "02.mp3").write_bytes(b"track two")
+
+        worker = self.make_worker(
+            incoming_root=incoming,
+            audio_root=audio_root,
+            manifest_root=Path(self.tmp.name) / "manifests",
+        )
+        transfer_job = self.make_job(
+            "transfer_completed",
+            {"remote_path": book_dir.name, "_reconcile_hash": "h1", "_reconcile_name": book_dir.name},
+        )
+        # Chains the real organize_apply job -- this is the exact call
+        # run_once() makes after a real transfer_completed success.
+        worker._chain_after_success(
+            transfer_job, {"verified": True, "local_path": str(book_dir)}
+        )
+        organize_job = self.database.claim_next("test-worker")
+        assert organize_job is not None
+        self.assertEqual(organize_job.kind, "organize_apply")
+        result = worker.execute(organize_job)  # the REAL organizer, not mocked
+
+        self.assertEqual(result["books"], 1)
+        landed = list(audio_root.rglob("*.mp3"))
+        self.assertEqual(len(landed), 2, f"expected 2 tracks under {audio_root}, found {landed}")
+        # The folder name carries the metadata build_plan parsed out of the
+        # ORIGINAL "Ursula K Le Guin - The Dispossessed (1974)" folder name --
+        # the whole point of scanning incoming_root rather than the book path.
+        self.assertTrue(
+            any("Le Guin" in str(p) for p in landed), f"author missing from destination paths: {landed}"
+        )
+        self.assertTrue(
+            any("Dispossessed" in str(p) for p in landed), f"title missing from destination paths: {landed}"
+        )
+        # Moved, not copied or left in place: nothing playable remains under
+        # incoming once the organize pass has run.
+        self.assertEqual(list(incoming.rglob("*.mp3")), [])
 
 
 class ChainFailureNotificationTests(WorkerTestCase):
