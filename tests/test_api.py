@@ -43,5 +43,63 @@ class JobResponseTests(unittest.TestCase):
         self.assertIsNone(response["code"])
 
 
+from unittest import mock
+
+from src.shelfmark_service import api as api_module
+
+
+class FakeProwlarr:
+    """Stands in for ProwlarrClient so these tests never touch the network —
+    they exist to prove which categories reach the client, not to exercise
+    HTTP transport (that's clients.py's job, and clients.py is off limits
+    for this change)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def search(self, query, *, search_type=None, categories=None, limit=None, offset=None):
+        self.calls.append({"query": query, "categories": categories})
+        return []
+
+
+class BookOnlyCategoryTests(unittest.TestCase):
+    """The one configured indexer advertises 7000/7010/7030/7050, not 7020 —
+    `/ebook-request` asks for book_only=true rather than naming 7020 directly,
+    and the route is what is supposed to translate that into the configured
+    PROWLARR_BOOK_CATEGORIES default. This is the exact gap the task named:
+    ProwlarrClient.search() already accepted `categories`, but the route
+    never passed anything through.
+    """
+
+    def test_book_only_applies_the_configured_book_categories(self) -> None:
+        fake = FakeProwlarr()
+        with mock.patch.object(api_module, "_prowlarr_client", return_value=fake):
+            api_module.release_search(
+                q="dune", search_type=None, categories=None, book_only=True,
+                limit=50, offset=0, _actor="test",
+            )
+        self.assertEqual(fake.calls[0]["categories"], list(api_module.settings.prowlarr_book_categories))
+
+    def test_book_only_false_leaves_categories_unset(self) -> None:
+        """Must not change /release-search's existing (audiobook-inclusive)
+        behavior for the command that doesn't ask for books specifically."""
+        fake = FakeProwlarr()
+        with mock.patch.object(api_module, "_prowlarr_client", return_value=fake):
+            api_module.release_search(
+                q="dune", search_type=None, categories=None, book_only=False,
+                limit=50, offset=0, _actor="test",
+            )
+        self.assertIsNone(fake.calls[0]["categories"])
+
+    def test_explicit_categories_override_book_only(self) -> None:
+        fake = FakeProwlarr()
+        with mock.patch.object(api_module, "_prowlarr_client", return_value=fake):
+            api_module.release_search(
+                q="dune", search_type=None, categories=[7060], book_only=True,
+                limit=50, offset=0, _actor="test",
+            )
+        self.assertEqual(fake.calls[0]["categories"], [7060])
+
+
 if __name__ == "__main__":
     unittest.main()
