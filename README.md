@@ -149,6 +149,7 @@ application with both the `bot` and `applications.commands` scopes, then keep
 | `--keep-names` | Audio tracks as `01 - Chapter.mp3` instead of `01.mp3` |
 | `--keep-images` | Keep all images, not only cover |
 | `--yes` / `-y` | Skip confirmation. Required when there is no terminal (a pipe, cron, a script) — without it, `--apply` refuses rather than guessing |
+| `--quarantine DIR` | Where to hold the partial output of a failed extraction (default: `<source>/.shelfmark-quarantine`). The archive itself is never moved there |
 | `--trash-name NAME` | Junk folder name under source (default: `trash`) |
 | `--trash-unknown` | Move unrecognized non-media files to trash (default is to leave them for review) |
 | `--self-test` | Run built-in smoke tests |
@@ -179,6 +180,29 @@ application with both the `bot` and `applications.commands` scopes, then keep
 **Ebook:** epub, mobi, azw, azw3, pdf, cbz, cbr, fb2, djvu, lit  
 
 **Archives:** zip, rar, 7z, tar, tar.gz  
+
+### What happens when an archive is broken
+
+Archives are unpacked into a private staging directory and moved into place
+only once the whole tree has extracted and been checked. Either the finished
+folder appears, or nothing does — there is no state in which part of an archive
+is sitting in the dump looking like a book.
+
+That matters because the failure is otherwise silent in both directions.
+Python writes each member of a zip to disk and verifies its checksum
+afterwards, so a corrupt member fails with the files already written: real,
+plausible-looking media, one track quietly damaged. The run stops and reports
+the error, but the fragments used to stay behind, and nothing later knows where
+they came from — the next pass over that dump files them as an ordinary book.
+
+When an extraction fails:
+
+- the **archive is left exactly where it is**. It is the only remaining copy of
+  that content, and the run may simply need repeating with more disk free.
+- the partial output goes to `.shelfmark-quarantine/` (override with
+  `--quarantine`), timestamped, since it is sometimes the only evidence of what
+  was wrong with the archive.
+- the run exits non-zero and moves nothing into the library.
 
 ## Repairing a library Audiobookshelf has already scanned
 
@@ -246,8 +270,9 @@ Edit `src/main.py`:
   moves the files out of it.
 - `--copy` removes nothing — not the junk, not the archives, not empty folders.
   The one thing it adds is the extracted contents of any archive, unpacked
-  beside it, because the organiser has to be able to see inside. If even that is
-  too much, copy the dump somewhere else first and run against the copy.
+  beside it, because the organiser has to be able to see inside. A failed
+  extraction adds nothing at all. If even a successful one is too much, copy the
+  dump somewhere else first and run against the copy.
 - A dry run cannot see inside archives, so on a dump of zips it will report
   `Books 0`. With `--apply` the tool extracts, re-plans, and asks again before
   moving anything.

@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -1232,6 +1233,33 @@ def extract_dir_for(archive: Path) -> Path:
     return unique_dir(dest) if dest.exists() else dest
 
 
+STAGING_DIR_NAME = ".shelfmark-work"
+
+
+def staging_dir_for(archive: Path) -> Path:
+    """Reserve a private directory to extract into, beside the destination.
+
+    Beside, specifically — not in a configured work root somewhere else. The
+    staging directory only buys anything if the finished tree can be moved out
+    of it with `rename`, and `rename` is atomic only within one filesystem.
+    Staging on another mount turns that into a copy, which has an observable
+    half-done state and so gives back the one guarantee staging exists to make.
+
+    `.shelfmark-work` is already in SKIP_DIR_NAMES and the walker skips any
+    dotted directory besides, so a tree part-way through extraction is not
+    visible to a scan even while it is being written.
+    """
+    parent = archive.parent / STAGING_DIR_NAME
+    parent.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{archive.stem[:60]}.", dir=parent))
+
+
+def quarantine_dir_for(quarantine: Path, archive: Path) -> Path:
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    quarantine.mkdir(parents=True, exist_ok=True)
+    return unique_dir(quarantine / f"{stamp}-{sanitize_component(archive.stem)[:80]}")
+
+
 def extract_zip(path: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path) as zf:
@@ -1312,26 +1340,90 @@ def extract_7z(path: Path, dest: Path) -> None:
         raise RuntimeError(r.stderr or r.stdout or "7z failed")
 
 
-def extract_archive(path: Path) -> Path:
+def extract_archive(path: Path, *, quarantine: Path | None = None) -> Path:
+    """Extract into a private staging directory, then move the finished tree
+    into place in one step.
+
+    Extraction used to write straight into the dump, next to the archive, which
+    left two ways for a half-finished extraction to be mistaken for real
+    content. A run interrupted part-way — out of disk, killed, an archive that
+    turns out to be corrupt three files in — left those files sitting in the
+    source; and the organiser re-scans the source immediately after extracting,
+    so it would pick the fragments up and file them as books. The failure is
+    silent in both directions: nothing reports an error, and the library gains
+    a book that is missing most of itself.
+
+    Staging removes the possibility rather than narrowing the window. Either
+    the whole validated tree appears under its final name, or nothing does.
+
+    A failed extraction leaves the ARCHIVE untouched — it is the only remaining
+    copy of that content and the job may simply need running again with more
+    disk. The partial output goes to quarantine when one is configured, since
+    it is occasionally the evidence needed to work out what was wrong with the
+    archive, and is deleted otherwise.
+    """
     kind = archive_kind(path)
     # For multipart, kind is still rar/zip from the first volume
     if kind is None and PART_RE.match(path.name):
         kind = path.suffix.lower()[1:]
-    dest = extract_dir_for(path)
-    if kind == "zip":
-        extract_zip(path, dest)
-    elif kind == "tar":
-        extract_tar(path, dest)
-    elif kind == "rar":
-        extract_rar(path, dest)
-    elif kind == "7z":
-        extract_7z(path, dest)
-    else:
+    if kind not in {"zip", "tar", "rar", "7z"}:
         raise RuntimeError(f"Unsupported archive: {path.name}")
-    # Belt and braces for the external extractors, which validate by their own
-    # rules and cannot be made to use ours.
-    _reject_escaping_links(dest)
+
+    staging = staging_dir_for(path)
+    try:
+        if kind == "zip":
+            extract_zip(path, staging)
+        elif kind == "tar":
+            extract_tar(path, staging)
+        elif kind == "rar":
+            extract_rar(path, staging)
+        else:
+            extract_7z(path, staging)
+        # Belt and braces for the external extractors, which validate by their
+        # own rules and cannot be made to use ours.
+        _reject_escaping_links(staging)
+    except BaseException:
+        # BaseException, not Exception: a KeyboardInterrupt mid-extraction is
+        # exactly the case that used to strand fragments in the dump.
+        _dispose_staging(staging, path, quarantine)
+        raise
+
+    dest = extract_dir_for(path)
+    try:
+        ensure_parent(dest)
+        staging.rename(dest)
+    except OSError:
+        _dispose_staging(staging, path, quarantine)
+        raise
+    _prune_staging_parent(staging.parent)
     return dest
+
+
+def _dispose_staging(staging: Path, archive: Path, quarantine: Path | None) -> None:
+    """Clear a failed staging directory. Never raises — it runs on the failure
+    path, and a problem here must not replace the error being reported."""
+    try:
+        if not staging.exists():
+            return
+        if quarantine is not None and any(staging.iterdir()):
+            held = quarantine_dir_for(quarantine, archive)
+            shutil.move(str(staging), str(held))
+            eprint(f"  quarantined partial extraction -> {held}")
+        else:
+            shutil.rmtree(staging, ignore_errors=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        eprint(f"  could not clear staging directory {staging}: {exc}")
+    finally:
+        _prune_staging_parent(staging.parent)
+
+
+def _prune_staging_parent(parent: Path) -> None:
+    if parent.name != STAGING_DIR_NAME:
+        return
+    try:
+        parent.rmdir()
+    except OSError:
+        pass  # still holds another extraction, or is already gone
 
 
 def multipart_key(path: Path) -> tuple[str, int] | None:
@@ -1860,17 +1952,28 @@ def remove_empty_dirs(root: Path, keep: set[Path], emptied: set[Path]) -> None:
             pass
 
 
-def apply_extracts(plan: Plan, trash: Path, dry_run: bool, copy: bool = False) -> list[str]:
+def apply_extracts(
+    plan: Plan,
+    trash: Path,
+    dry_run: bool,
+    copy: bool = False,
+    quarantine: Path | None = None,
+) -> list[str]:
     errors: list[str] = []
     for op in plan.extracts:
         if dry_run:
             continue
         try:
-            extracted = extract_archive(op.src)
+            extracted = extract_archive(op.src, quarantine=quarantine)
             print(f"  extracted {op.src.name} -> {extracted.name}/")
-            # Under --copy the archive stays where it is. Extraction already
-            # writes a folder beside it, which is as far as a "read the dump"
-            # run should ever reach into the source.
+            # Trashing the archive is deliberately AFTER a successful extract,
+            # and only then. A failed extraction leaves it exactly where it is:
+            # it is the only remaining copy of that content, and the run may
+            # just need repeating with more disk free.
+            #
+            # Under --copy the archive stays put regardless. Extraction writes
+            # a folder beside it, which is as far as a "read the dump" run
+            # should ever reach into the source.
             if op.src.exists() and not copy:
                 move_file(op.src, unique_trash_path(trash, op.src.name))
         except Exception as exc:
@@ -1981,6 +2084,11 @@ def run(args: argparse.Namespace) -> int:
         if args.trash
         else source / args.trash_name
     )
+    quarantine = (
+        Path(args.quarantine).expanduser().resolve()
+        if getattr(args, "quarantine", None)
+        else source / ".shelfmark-quarantine"
+    )
 
     dry_run = not args.apply
     if args.dry_run:
@@ -2029,11 +2137,14 @@ def run(args: argparse.Namespace) -> int:
 
     if plan.extracts:
         print("Extracting archives…")
-        errors = apply_extracts(plan, trash=trash, dry_run=False, copy=args.copy)
+        errors = apply_extracts(
+            plan, trash=trash, dry_run=False, copy=args.copy, quarantine=quarantine
+        )
         for err in errors:
             eprint(f"  extract failed: {err}")
         if errors:
             eprint("Extraction failed; no files were moved into the library.")
+            eprint("The archives are untouched. Nothing partial was left in the source.")
             return 1
         print("Re-scanning after extract…")
         before = len(plan.books)
@@ -2126,6 +2237,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--trash-name", default="trash", help='Trash folder name (default: "trash").')
     p.add_argument("--trash", help="Full path for junk. Defaults to <source>/<trash-name>.")
+    p.add_argument(
+        "--quarantine",
+        help=(
+            "Where to hold the partial output of a failed extraction. "
+            "Defaults to <source>/.shelfmark-quarantine. The archive itself is "
+            "never moved there — a failed extract leaves it untouched."
+        ),
+    )
     p.add_argument(
         "--trash-unknown",
         action="store_true",
