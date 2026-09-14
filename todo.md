@@ -76,9 +76,9 @@ These should be fixed before allowing an unattended service to move or delete fi
 - [ ] Include parent-directory context in multipart archive identity so unrelated folders cannot be conflated.
 - [x] Extract archives into an isolated staging directory before importing their contents. Staged beside the destination so the finished tree moves into place with an atomic `rename` — a staging root on another filesystem would make that a copy, with an observable half-done state.
 - [x] Leave failed archives in place and mark the job failed; never move a failed archive to trash and return success. The archive is trashed only after a successful extract.
-- [ ] Make move/copy operations resumable and idempotent. If the destination already contains the same file, compare size/checksum and skip it instead of creating `01 (2).mp3`.
+- [x] Make move/copy operations resumable and idempotent. If the destination already contains the same file, compare size/checksum and skip it instead of creating `01 (2).mp3`. The remaining hole was an INTERRUPTED write: a truncated file under the real name is not identical to the source, so the retry wrote `01 (2).mp3` beside it. Writes now stage and rename, so the destination is complete or absent.
 - [x] Add an append-only transaction manifest for every worker import: source, destination, operation, checksum, timestamp, actor, and result.
-- [ ] Write destination files atomically, then rename the completed destination directory into place.
+- [~] Write destination files atomically, then rename the completed destination directory into place. **Files are atomic** — staged in the destination directory, fsynced, renamed into place; `move` uses `os.rename` directly within a filesystem and stages only across the EXDEV boundary. **Whole-directory staging is still open**: a book is written track by track, so an interrupted import leaves a partial book folder even though every file in it is complete.
 - [ ] Use a quarantine directory for failed or ambiguous jobs instead of deleting source material. **Done for extraction failures** (`--quarantine`, default `<source>/.shelfmark-quarantine`); still open for the other job types.
 - [x] Review all archive extractors for path traversal and symlink behavior. External extractors should run in staging with post-extraction validation. `_safe_target` screens member names; `_reject_escaping_links` runs after extraction, which is the only point unrar/unar/7z can be held to the same rule.
 - [ ] Keep the CLI dry-run/apply behavior compatible with the existing README.
@@ -358,7 +358,7 @@ Acceptance criteria:
 - [ ] Add the expanded identity model.
 - [x] Preserve managed-library sidecars.
 - [x] Add isolated extraction and archive safety checks.
-- [x] Add manifests and operation checksums; atomic writes, quarantine, and resume logic remain.
+- [x] Add manifests and operation checksums. **Atomic file writes and extraction quarantine are done**; whole-directory staging and resume logic remain.
 - [x] Make repeated imports idempotent for identical move/copy retries.
 - [ ] Add structured JSON output and stable error codes.
 - [x] Add regression fixtures for mixed media, multipart isolation, broken archives, unknown files, and repeated copy runs.

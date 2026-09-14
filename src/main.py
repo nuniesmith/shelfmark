@@ -30,6 +30,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import errno
 import filecmp
 import os
 import re
@@ -425,6 +426,10 @@ def is_cover(path: Path) -> bool:
 def is_junk_file(path: Path) -> bool:
     name = path.name.lower()
     if name in JUNK_NAMES or name.startswith("._"):
+        return True
+    # A temporary left by an interrupted write. Debris, not something to
+    # ask the operator about.
+    if name.endswith(PARTIAL_SUFFIX):
         return True
     if name in KEEP_TEXT:
         return False
@@ -1858,6 +1863,46 @@ def unique_file(path: Path) -> Path:
         n += 1
 
 
+PARTIAL_SUFFIX = ".shelfmark-partial"
+
+
+def _copy_into_place(src: Path, dest: Path) -> None:
+    """Copy to a temporary name in the destination directory, then rename.
+
+    `shutil.copy2` writes straight to the final path, so an interrupted copy —
+    a killed process, a full disk, a dropped network mount — leaves a truncated
+    file under the real name. Nothing downstream can tell that from a complete
+    one: it has the right name, in the right book folder, and Audiobookshelf
+    will happily import it.
+
+    The retry then makes it worse rather than better. `files_identical` sees
+    mismatched sizes, correctly declines to treat the destination as
+    already-done, and `unique_file` writes the good copy beside it as
+    `01 (2).mp3`. The library ends up holding both, and the broken one sorts
+    first.
+
+    Renaming into place removes the intermediate state: the final name either
+    does not exist or is complete. A crash leaves a dotted temporary behind,
+    which is recognised as junk rather than offered for review.
+    """
+    ensure_parent(dest)
+    handle, tmp_name = tempfile.mkstemp(
+        prefix=f".{dest.name}.", suffix=PARTIAL_SUFFIX, dir=dest.parent
+    )
+    os.close(handle)
+    tmp = Path(tmp_name)
+    try:
+        shutil.copy2(str(src), str(tmp))
+        # Flush before the rename, so the finished name can never point at data
+        # the filesystem has not committed yet.
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
+        os.replace(str(tmp), str(dest))
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def move_file(src: Path, dest: Path) -> None:
     if not src.exists():
         return
@@ -1872,7 +1917,17 @@ def move_file(src: Path, dest: Path) -> None:
         src.unlink()
         return
     dest = unique_file(dest)
-    shutil.move(str(src), str(dest))
+    try:
+        # Within one filesystem this is atomic and moves no data at all, which
+        # is both the fast path and the safe one.
+        os.rename(str(src), str(dest))
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        # Across filesystems there is no atomic move. `shutil.move` would fall
+        # back to copy2-then-unlink, straight to the final path; stage instead.
+        _copy_into_place(src, dest)
+        src.unlink()
 
 
 def copy_file(src: Path, dest: Path) -> None:
@@ -1882,7 +1937,7 @@ def copy_file(src: Path, dest: Path) -> None:
     if dest.exists() and files_identical(src, dest):
         return
     dest = unique_file(dest)
-    shutil.copy2(str(src), str(dest))
+    _copy_into_place(src, dest)
 
 
 def unique_trash_path(trash: Path, name: str) -> Path:

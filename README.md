@@ -181,6 +181,25 @@ application with both the `bot` and `applications.commands` scopes, then keep
 
 **Archives:** zip, rar, 7z, tar, tar.gz  
 
+### What happens when a write is interrupted
+
+Files are written to a temporary name inside the destination folder, flushed,
+and renamed into place. A track in the library is therefore complete or absent
+— never a truncated file wearing the right name, which nothing downstream can
+distinguish from a real one.
+
+This is also what stops the duplicate-track failure. A half-written `01.mp3` is
+not identical to its source, so a retry used to decline to overwrite it and
+write the good copy beside it as `01 (2).mp3` — leaving the library holding
+both, with the broken one sorting first.
+
+Moves within a single filesystem use `rename` directly: atomic, and no data is
+copied at all. Only a move that crosses a filesystem boundary has to stage.
+
+An interrupted run can still leave a **partial book folder** — every file in it
+complete, but not all of the tracks present. Whole-directory staging is not
+implemented yet.
+
 ### What happens when an archive is broken
 
 Archives are unpacked into a private staging directory and moved into place

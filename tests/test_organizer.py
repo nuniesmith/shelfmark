@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import tempfile
 import unittest
@@ -14,8 +15,11 @@ from src.main import (
     UnsafeArchive,
     apply_plan,
     build_plan,
+    copy_file,
     extract_archive,
+    is_junk_file,
     main,
+    move_file,
 )
 
 
@@ -290,6 +294,86 @@ class IsolatedExtractionTests(unittest.TestCase):
         self.assertEqual(self.visible_entries(), ["evil.zip"])
         self.assertFalse((self.source / STAGING_DIR_NAME).exists())
         self.assertTrue((outside / "secret.txt").exists())
+
+
+class AtomicWriteTests(unittest.TestCase):
+    """A file in the library is complete or absent, never half-written.
+
+    `shutil.copy2` writes straight to the final path. An interrupted copy left
+    a truncated file wearing the real name — indistinguishable downstream from
+    a good one — and the retry then wrote the good copy beside it as
+    `01 (2).mp3` rather than replacing it.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-atomic-")
+        self.root = Path(self.tmp.name)
+        self.src = self.root / "src" / "01.mp3"
+        self.src.parent.mkdir(parents=True)
+        self.payload = b"audio" * 5000
+        self.src.write_bytes(self.payload)
+        self.dest = self.root / "library" / "Author" / "2001 - Book" / "01.mp3"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    @staticmethod
+    def truncating_copy2(src: str, dst: str, **kwargs: object) -> None:
+        """Write half the bytes, then die — a full disk, or a killed process."""
+        data = Path(src).read_bytes()
+        Path(dst).write_bytes(data[: len(data) // 2])
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def test_interrupted_copy_leaves_no_file_under_the_real_name(self) -> None:
+        with mock.patch.object(main_module.shutil, "copy2", self.truncating_copy2):
+            with self.assertRaises(OSError):
+                copy_file(self.src, self.dest)
+
+        self.assertFalse(self.dest.exists(), "a truncated file was left under the final name")
+        # The staging temporary is cleaned up too, not merely renamed away.
+        leftovers = list(self.dest.parent.iterdir())
+        self.assertEqual(leftovers, [], f"staging debris left behind: {leftovers}")
+
+    def test_retry_after_an_interrupted_copy_yields_exactly_one_good_file(self) -> None:
+        with mock.patch.object(main_module.shutil, "copy2", self.truncating_copy2):
+            with contextlib.suppress(OSError):
+                copy_file(self.src, self.dest)
+
+        copy_file(self.src, self.dest)  # the retry, with a working copy2
+
+        written = sorted(p.name for p in self.dest.parent.iterdir())
+        self.assertEqual(written, ["01.mp3"], "the retry duplicated the track")
+        self.assertEqual(self.dest.read_bytes(), self.payload)
+
+    def test_partial_leftovers_are_treated_as_junk_not_offered_for_review(self) -> None:
+        """If a crash does strand a temporary, it must not look like content."""
+        self.dest.parent.mkdir(parents=True)
+        stranded = self.dest.parent / f".01.mp3.abc123{main_module.PARTIAL_SUFFIX}"
+        stranded.write_bytes(b"half")
+
+        self.assertTrue(is_junk_file(stranded))
+
+    def test_cross_filesystem_move_still_lands_atomically(self) -> None:
+        """The EXDEV path — `shutil.move` would copy straight to the final name."""
+        real_rename = main_module.os.rename
+
+        def rename_across_devices(src: str, dst: str) -> None:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        with mock.patch.object(main_module.os, "rename", rename_across_devices):
+            with mock.patch.object(main_module.shutil, "copy2", self.truncating_copy2):
+                with self.assertRaises(OSError):
+                    move_file(self.src, self.dest)
+            # Nothing under the real name, and the source is still there: a
+            # failed move must not consume the only copy.
+            self.assertFalse(self.dest.exists())
+            self.assertTrue(self.src.exists())
+
+            move_file(self.src, self.dest)  # retry with a working copy2
+
+        self.assertEqual(main_module.os.rename, real_rename)
+        self.assertEqual(self.dest.read_bytes(), self.payload)
+        self.assertFalse(self.src.exists(), "a completed move must remove the source")
 
 
 if __name__ == "__main__":
