@@ -240,7 +240,7 @@ Reference: <https://github.com/qbittorrent/qBittorrent/wiki/Web-API-Documentatio
 - [x] Create a restricted Sullivan account such as `shelfmark-sync`.
 - [x] Limit its SSH/rsync access to the Shelfmark qBittorrent category, via a forced `rrsync -ro` command in `authorized_keys`. Verify with `docker exec shelfmark-worker verify-sullivan-sync` — never by hand, since three of its four checks pass by failing.
 - [x] Use a dedicated SSH key stored as a Docker secret on Freddy.
-- [~] Pull completed files from Freddy after qBittorrent reports completion. **The pull works and is verified end to end; nothing watches qBittorrent for completion yet** — the job has to be started by hand. This is the orchestration gap, and it is what P3 still needs.
+- [x] Pull completed files from Freddy after qBittorrent reports completion. **Closed by the `reconcile_downloads` reconciler** (`Worker._reconcile_downloads` in `worker.py`): a periodic job — not a per-torrent watcher, so a worker restart mid-pipeline can't strand it — asks qBittorrent what's genuinely complete (a real seeding state, not just `progress == 1`, which a recheck or an in-progress move can also report) in the configured category and starts `transfer_completed` for anything new. The torrent hash is the idempotency key, recorded in the `reconciled_torrents` table (migration 3) in the same transaction as the job it enqueues, so a hash is never imported twice even across a crash between the two writes.
 - [x] Verify size and checksum before organization. A mismatch fails the job rather than handing a partial tree to the organiser, which is destructive.
 - [x] Leave the Sullivan source available for seeding and recovery until the Freddy import is verified. True by construction: the sync account is `rrsync -ro`, so Shelfmark cannot delete anything on sullivan even if asked to.
 - [ ] Only remove remote data through an explicit retention policy after successful import. Nothing removes remote data today, and the read-only account means nothing can.
@@ -251,16 +251,16 @@ Reference: <https://github.com/qbittorrent/qBittorrent/wiki/Web-API-Documentatio
 2. Shelfmark searches Prowlarr.
 3. The bot displays title, author, format, size, indexer, seeders, and quality.
 4. User selects a result and confirms.
-5. Shelfmark submits the selected release through Prowlarr.
-6. The worker records the Prowlarr release ID and qBittorrent hash.
-7. The worker polls qBittorrent until files are complete and stable.
-8. Freddy pulls only the Shelfmark category over restricted SSH/rsync.
-9. The worker verifies the transfer and extracts into isolated staging.
-10. The organizer generates a preview manifest.
-11. High-confidence plans can be automatically applied; ambiguous plans require approval.
-12. Files are atomically moved into the Freddy audiobook or ebook root.
-13. Shelfmark triggers an Audiobookshelf scan.
-14. The bot posts the final status and a stable link.
+5. Shelfmark submits the selected release through Prowlarr. **[x] implemented** — `grab_release` job via the `Grab` button on `/release-search` and `/ebook-request`.
+6. ~~The worker records the Prowlarr release ID and qBittorrent hash.~~ **Not needed as designed**: the `reconcile_downloads` reconciler (step 7) identifies completed torrents directly from qBittorrent's own listing by hash, rather than needing grab_release to hand one forward.
+7. The worker polls qBittorrent until files are complete and stable. **[x] implemented** — periodic `reconcile_downloads` job (not a per-torrent watcher; see the "Automatic download pipeline" section in README.md), checking qBittorrent's *state*, not just `progress == 1` (a recheck or an in-progress move both report 100% while unsafe to pull).
+8. Freddy pulls only the Shelfmark category over restricted SSH/rsync. **[x] implemented** — `transfer_completed`, now auto-enqueued by the reconciler for any newly-claimed torrent hash.
+9. The worker verifies the transfer and extracts into isolated staging. **[x] implemented** — `transfer_completed`'s checksum verify; the chain only proceeds to organizing when it reports `verified: true`.
+10. The organizer generates a preview manifest. **[x] implemented** — `organize_apply`'s plan/manifest, now auto-enqueued on a verified transfer with an explicit `source` (the incoming root, never the landed book's own subfolder — pointing at the book folder strips the name the parser reads author/title/year from) and an explicit `dest` (never left to default to `source`, which organizes nothing in place instead of moving it). One `organize_apply` job per configured root (`SHELFMARK_AUDIOBOOKS_ROOT` / `SHELFMARK_EBOOKS_ROOT`), each scoped to its own media type, since a single download can hold both and the organizer takes one `dest` per call.
+11. High-confidence plans can be automatically applied; ambiguous plans require approval. **[ ] not implemented** — every reconciler-driven `organize_apply` currently applies automatically; there is no separate ambiguous-plan approval gate yet.
+12. Files are atomically moved into the Freddy audiobook or ebook root. **[x] implemented** — `organize_apply`'s existing atomic move/trash behavior, unchanged by this feature. Verified with an end-to-end test asserting on the actual destination tree, not just the job's reported outcome.
+13. Shelfmark triggers an Audiobookshelf scan. **[x] implemented** — `library_scan`, auto-enqueued only after the AUDIO organize pass actually organizes something (`books > 0`) and only when Audiobookshelf is configured; otherwise the book waits for the next scheduled scan. The ebook pass never triggers a scan — Audiobookshelf has no ebook library, so there is nothing to scan on that side.
+14. The bot posts the final status and a stable link. **[~] partial** — a Discord *webhook* posts completion/failure text (`SHELFMARK_DISCORD_WEBHOOK_URL`; see README), decoupled from the bot process so the worker never imports `discord.py`. It does not yet post a stable Audiobookshelf link, and it is not the slash-command bot itself.
 
 ## Discord bot
 
@@ -487,7 +487,7 @@ Acceptance criteria:
 - [ ] Implement library search embeds.
 - [ ] Implement Prowlarr result pagination and selection.
 - [ ] Implement confirmation buttons.
-- [ ] Implement download progress notifications.
+- [~] Implement download progress notifications. A Discord *webhook* posts a completion message and a chain-failure message from the worker (`SHELFMARK_DISCORD_WEBHOOK_URL`; see README's "Automatic download pipeline"). No in-progress/percentage updates, and it is a webhook post, not a bot-side embed tied to the original interaction.
 - [ ] Implement cancellation.
 - [ ] Implement organization preview and approval.
 - [ ] Implement metadata candidate comparison and approval.
