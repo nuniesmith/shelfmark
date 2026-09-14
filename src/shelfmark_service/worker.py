@@ -153,8 +153,10 @@ class Worker:
                 user=self.settings.sullivan_user,
                 identity_file=self.settings.sullivan_identity_file,
                 port=self.settings.sullivan_ssh_port,
-                timeout_seconds=self.settings.http_timeout,
+                timeout_seconds=self.settings.transfer_timeout_seconds,
                 retries=self.settings.http_retries,
+                known_hosts=self.settings.sullivan_known_hosts,
+                strict_host_key=self.settings.sullivan_strict_host_key,
             )
             transfer.pull(remote, local)
             snapshot = wait_until_stable(
@@ -163,7 +165,29 @@ class Worker:
                 poll_seconds=self.settings.transfer_poll_seconds,
                 timeout_seconds=self.settings.transfer_timeout_seconds,
             )
-            return {"remote_path": remote, "local_path": str(local), "files": len(snapshot)}
+            # Verify AFTER the tree has settled, not straight after the pull:
+            # comparing a tree still being written reports differences that are
+            # simply the write in progress.
+            differences = transfer.verify(remote, local)
+            if differences:
+                raise RuntimeError(
+                    "transfer does not match Sullivan after copying "
+                    f"({len(differences)} file(s) differ): {', '.join(differences[:5])}"
+                )
+            JsonlManifest(
+                self.settings.manifest_root / f"{job.id}.jsonl", actor=self.worker_id
+            ).event(
+                "transfer_verified",
+                remote_path=remote,
+                local_path=str(local),
+                files=len(snapshot),
+            )
+            return {
+                "remote_path": remote,
+                "local_path": str(local),
+                "files": len(snapshot),
+                "verified": True,
+            }
         if job.kind == "grab_release":
             if not self.settings.prowlarr_url or not self.settings.prowlarr_api_key:
                 raise ValueError("Prowlarr integration is not configured")

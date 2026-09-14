@@ -173,6 +173,29 @@ is missing and idles until the next deployment supplies it. A token Discord
 *rejects* is treated the same way, rather than retried against the login
 endpoint until the application is rate-limited.
 
+## Transfers from Sullivan
+
+`POST /api/v1/transfers/pull` queues a `transfer_completed` job: rsync pulls
+the tree through the restricted `shelfmark-sync` account, waits for it to
+settle, and then verifies it.
+
+**Verification is a second, independent pass** — `rsync --checksum --dry-run`
+against the source. rsync already guards each transfer with its own rolling
+checksum, so this is not about a corrupted wire; it is about everything after,
+such as a truncated write or a file that changed on either side between the
+pull and the import. The organiser is destructive, so it must not be handed a
+tree that no longer matches. A mismatch fails the job.
+
+Note that `rsync --dry-run` **exits 0 whether or not anything differs** — the
+differences are in its output. Reading the exit status would report every
+transfer as verified, corrupt ones included.
+
+Host keys: the worker keeps a persistent `known_hosts` (default
+`/data/known_hosts`, override with `SULLIVAN_SSH_KNOWN_HOSTS`) and uses
+`StrictHostKeyChecking=accept-new`, so Sullivan's key is trusted on first
+contact and pinned thereafter. Set `SULLIVAN_SSH_STRICT_HOST_KEY=true` once
+that file holds a key you have checked and even first contact must match.
+
 ## CLI options
 
 | Flag | Description |
