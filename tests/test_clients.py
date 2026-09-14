@@ -65,6 +65,23 @@ class _FakeResponse:
         return self._body
 
 
+class _ExplodingResponse:
+    """A response that opens fine but blows up while being read/decoded with
+    something other than HTTPError/URLError/TimeoutError/OSError -- e.g. a
+    provider answering 200 with a body that can't be parsed the way the
+    caller expects. HttpClient.request() has no specific except clause for
+    this, so it is exactly the gap a half-open probe must still resolve."""
+
+    def __enter__(self) -> "_ExplodingResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        raise ValueError("response body could not be decoded")
+
+
 class _ScriptedOpener:
     """A fake OpenerDirector: pops one scripted outcome per .open() call.
 
@@ -396,6 +413,41 @@ class HttpClientBreakerTests(unittest.TestCase):
         with self.assertRaises(CircuitBreakerOpenError):
             client.request("/x")
         self.assertEqual(opener.calls, 2)
+
+    def test_half_open_probe_raising_an_unhandled_exception_still_recovers(self) -> None:
+        # Regression: before_call() marks a half-open trial in flight, and
+        # only record_success()/record_failure() ever clear that flag. Both
+        # were only called from the HTTPError and URLError/TimeoutError/
+        # OSError handlers, so an exception outside that set (a body that
+        # fails to decode, a truncated read, anything) used to leave the
+        # trial "in flight" forever: HALF_OPEN never re-checks the cooldown
+        # the way OPEN does, so every later call took the "another trial is
+        # already in flight" branch and failed fast permanently -- even
+        # 10,000 seconds later. This must instead be treated as a failure
+        # (no usable response came back), reopen the circuit, and recover
+        # normally after a further cooldown.
+        clock = _FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+        opener = _ScriptedOpener(
+            [urllib.error.URLError("down"), _ExplodingResponse(), _FakeResponse(b'{"ok":true}')]
+        )
+        client = HttpClient(
+            "http://example.invalid", service="half-open-explode", retries=0, backoff=0, opener=opener, breaker=breaker
+        )
+        with self.assertRaises(ServiceError):
+            client.request("/x")  # trips the breaker
+        clock.advance(10)
+        with self.assertRaises(ValueError):
+            client.request("/x")  # the trial: raises something HttpClient has no handler for
+        self.assertEqual(opener.calls, 2)
+
+        # If the trial's outcome was never resolved, this would still be
+        # HALF_OPEN with trial_in_flight=True, and CircuitBreakerOpenError
+        # would come back no matter how long is waited -- prove that is not
+        # the case by waiting an amount of time that dwarfs the cooldown.
+        clock.advance(10_000)
+        self.assertEqual(client.request("/x"), {"ok": True})
+        self.assertEqual(opener.calls, 3)
 
 
 if __name__ == "__main__":

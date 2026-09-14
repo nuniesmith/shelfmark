@@ -232,44 +232,65 @@ class HttpClient:
         self.breaker.before_call(self.service)
 
         last_error: ServiceError | None = None
-        for attempt in range(self.retries + 1):
-            try:
-                with self.opener.open(req, timeout=self.timeout) as response:
-                    raw = response.read()
-                    result = self._decode(raw, response.headers.get_content_type())
-                self.breaker.record_success()
-                return result
-            except urllib.error.HTTPError as exc:
-                raw = exc.read()
-                exc.close()
-                detail = raw.decode("utf-8", errors="replace").strip()
-                last_error = ServiceError(
-                    self.service,
-                    detail or exc.reason or f"HTTP {exc.code}",
-                    status=exc.code,
-                )
-                retryable = exc.code == 429 or exc.code >= 500
-                if not retryable or attempt >= self.retries:
-                    # A response at all -- even 4xx/429 -- means the provider
-                    # is reachable; only 5xx says the PROVIDER is unwell.
-                    # Tripping the breaker on a 401/404 would let one job with
-                    # a bad key or a stale item id disable the provider for
-                    # every other job behind it in the queue.
-                    if exc.code >= 500:
+        # `resolved` tracks whether one of the branches below already told the
+        # breaker how this call turned out. It's checked in `finally` because
+        # a half-open call that raises something other than HTTPError /
+        # URLError / TimeoutError / OSError (a malformed body that fails to
+        # decode, a truncated read, anything) would otherwise skip both
+        # record_success() and record_failure(). before_call() already
+        # flipped that trial's _trial_in_flight to True, and only OPEN's
+        # branch re-checks the cooldown -- HALF_OPEN just sees the flag stuck
+        # on and fails fast forever. That is a permanently wedged breaker,
+        # which is worse than having no breaker at all, so any escape route
+        # out of this call must resolve it: an exception we have no specific
+        # handling for still means no usable response came back.
+        resolved = False
+        try:
+            for attempt in range(self.retries + 1):
+                try:
+                    with self.opener.open(req, timeout=self.timeout) as response:
+                        raw = response.read()
+                        result = self._decode(raw, response.headers.get_content_type())
+                    self.breaker.record_success()
+                    resolved = True
+                    return result
+                except urllib.error.HTTPError as exc:
+                    raw = exc.read()
+                    exc.close()
+                    detail = raw.decode("utf-8", errors="replace").strip()
+                    last_error = ServiceError(
+                        self.service,
+                        detail or exc.reason or f"HTTP {exc.code}",
+                        status=exc.code,
+                    )
+                    retryable = exc.code == 429 or exc.code >= 500
+                    if not retryable or attempt >= self.retries:
+                        # A response at all -- even 4xx/429 -- means the
+                        # provider is reachable; only 5xx says the PROVIDER is
+                        # unwell. Tripping the breaker on a 401/404 would let
+                        # one job with a bad key or a stale item id disable
+                        # the provider for every other job behind it in the
+                        # queue.
+                        if exc.code >= 500:
+                            self.breaker.record_failure()
+                        else:
+                            self.breaker.record_success()
+                        resolved = True
+                        raise last_error from exc
+                    retry_after = exc.headers.get("Retry-After")
+                    self._sleep(attempt, retry_after)
+                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    last_error = ServiceError(self.service, str(exc))
+                    if attempt >= self.retries:
                         self.breaker.record_failure()
-                    else:
-                        self.breaker.record_success()
-                    raise last_error from exc
-                retry_after = exc.headers.get("Retry-After")
-                self._sleep(attempt, retry_after)
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                last_error = ServiceError(self.service, str(exc))
-                if attempt >= self.retries:
-                    self.breaker.record_failure()
-                    raise last_error from exc
-                self._sleep(attempt, None)
-        self.breaker.record_failure()
-        raise last_error or ServiceError(self.service, "request failed")
+                        resolved = True
+                        raise last_error from exc
+                    self._sleep(attempt, None)
+            resolved = True
+            raise last_error or ServiceError(self.service, "request failed")
+        finally:
+            if not resolved:
+                self.breaker.record_failure()
 
     def _sleep(self, attempt: int, retry_after: str | None) -> None:
         try:
