@@ -286,7 +286,7 @@ Implement:
 - [ ] Discord application and bot registration.
 - [ ] Guild-scoped slash commands during development.
 - [ ] Buttons, select menus, and modals for release and metadata selection.
-- [ ] Role/user allowlists for download, organize, metadata, and scan actions.
+- [x] Role/user allowlists for download, organize, metadata, and scan actions. **Fails closed** — an unset `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` refuses everyone rather than permitting everyone, which is what it did before.
 - [ ] Per-user and per-guild rate limits.
 - [ ] Audit records containing Discord user, guild, channel, and message IDs.
 - [ ] Immediate interaction deferral, followed by persistent job notifications.

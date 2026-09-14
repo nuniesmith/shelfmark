@@ -127,13 +127,51 @@ The API and worker share only the SQLite database and mounted staging/library
 paths. Provider calls still require the corresponding `AUDIOBOOKSHELF_*` and
 `PROWLARR_*` settings in `.env`.
 
-The initial Discord adapter registers guild-scoped commands when
-`SHELFMARK_DISCORD_GUILD_ID` is set, which makes development changes appear
-quickly. It currently provides `/library-search`, `/release-search` with grab
-buttons, `/downloads`, `/job`, `/metadata-match`, `/scan`, and `/organize-preview`. The bot defers each command before
-calling the API and sends the resulting job ID as a follow-up. Invite the
-application with both the `bot` and `applications.commands` scopes, then keep
-`DISCORD_BOT_TOKEN` only in the staging `.env`.
+### Discord bot
+
+Commands: `/library-search`, `/release-search` (with grab buttons),
+`/downloads`, `/job`, `/metadata-match`, `/scan`, `/organize-preview`. Each one
+is deferred before any network call and answered ephemerally, so the
+interaction token is never used as a long-running task channel.
+
+**Invite it with zero permissions.** Scopes `bot` and
+`applications.commands`, permission integer `0`. Every reply is an ephemeral
+interaction response, which needs no channel permission at all. It also
+requests **no privileged intents** — `Intents.none()` plus `guilds` — so there
+is nothing to justify in the developer portal and no verification gate later.
+
+| Variable | What it does |
+|---|---|
+| `DISCORD_BOT_TOKEN` | Required. Without it the bot logs why and idles. |
+| `SHELFMARK_API_TOKEN` | Required — the bot calls the API with it. |
+| `SHELFMARK_DISCORD_GUILD_ID` | Syncs commands to one guild, which is instant. Without it they sync globally and can take up to an hour to appear. |
+| `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` | Comma-separated role IDs permitted to use the bot. **Empty means nobody.** |
+
+To collect the IDs, turn on **User Settings → Advanced → Developer Mode**, then
+right-click the server for its ID and a role (in **Server Settings → Roles**)
+for its ID.
+
+The role itself needs **no Discord permissions**. It is used only as a
+membership tag — the check is a set intersection on role IDs and never reads a
+permission bit. Granting it anything real would hand those people server powers
+the bot will never consult.
+
+Restrict the bot to one channel through **Server Settings → Integrations →
+Shelfmark → Manage** rather than in code. Discord enforces that before the
+interaction is ever sent.
+
+**The allow-list fails closed.** With `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS`
+unset, every command is refused with a message saying so. It used to permit
+everyone, which meant a bot deployed before its roles were configured let any
+member of the server run any command — `/organize-preview` included, which
+takes an arbitrary absolute path and reports what is at it.
+
+**Missing configuration does not crash-loop.** The container runs under
+`restart: unless-stopped`, so exiting on a missing token would respawn forever
+and scroll the one useful message out of the log. Instead the bot prints what
+is missing and idles until the next deployment supplies it. A token Discord
+*rejects* is treated the same way, rather than retried against the login
+endpoint until the application is rate-limited.
 
 ## CLI options
 
