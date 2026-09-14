@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.shelfmark_service.ebooks import EbookNotFound, list_ebooks, resolve_ebook
+from src.shelfmark_service.ebooks import (
+    EbookNotFound,
+    _ebook_id,
+    list_ebooks,
+    resolve_ebook,
+)
 
 
 def _touch(path: Path, content: bytes = b"x") -> None:
@@ -118,10 +123,67 @@ class ResolveEbookSecurityTests(unittest.TestCase):
         """
         link = self.root / "Author One" / "2020 - Book Alpha" / "escape.epub"
         os.symlink(self.secret, link)
-        escaping_id = [e for e in list_ebooks(self.root, "escape")][0].id
+        # Derive the id directly rather than from list_ebooks. The listing now
+        # filters escaping symlinks out, so taking the id from there would
+        # make this test silently stop exercising the resolver at all — it
+        # would pass because there was nothing to resolve, not because the
+        # resolver refused. This guard has to hold on its own.
+        escaping_id = _ebook_id(self.root, link)
         with self.assertRaises(EbookNotFound):
             resolve_ebook(self.root, escaping_id)
 
+
+
+class ListingAndResolverAgreeTests(unittest.TestCase):
+    """What is offered and what can be fetched must be the same set.
+
+    They were not. A symlink inside the library pointing outside it was
+    INCLUDED in search results and then REFUSED at download — the reader was
+    shown a book, tapped Send, and got a failure for something the bot had
+    just told her it had. Nothing unsafe ever left the box; the resolver held.
+    But a dead result nobody can explain is its own kind of broken, and the
+    fix is that the two can no longer disagree.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-agree-")
+        self.root = Path(self.tmp.name) / "ebooks"
+        (self.root / "Real Author").mkdir(parents=True)
+        (self.root / "Real Author" / "A Real Book.epub").write_bytes(b"EPUB")
+
+        outside = Path(self.tmp.name) / "elsewhere"
+        outside.mkdir()
+        self.secret = outside / "secret.epub"
+        self.secret.write_bytes(b"TOP SECRET")
+        (self.root / "Real Author" / "sneaky.epub").symlink_to(self.secret)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_an_escaping_symlink_is_not_offered_at_all(self) -> None:
+        titles = [book.title for book in list_ebooks(self.root, "")]
+        self.assertEqual(titles, ["A Real Book"])
+        self.assertNotIn("sneaky", " ".join(titles).casefold())
+
+    def test_everything_offered_can_actually_be_fetched(self) -> None:
+        """The property that was violated, stated directly."""
+        for book in list_ebooks(self.root, ""):
+            with self.subTest(book=book.title):
+                self.assertEqual(resolve_ebook(self.root, book.id).read_bytes(), b"EPUB")
+
+    def test_a_non_id_is_refused_however_it_is_shaped(self) -> None:
+        """Note what this does NOT prove.
+
+        It exercises the opaque-id layer — none of these strings hash to a
+        real file, so none match. It does not reach resolve_ebook's own
+        containment check, which _iter_ebook_files now filters ahead of, and
+        which consequently no test can discriminate. That branch is a
+        deliberate backstop, not covered code; see the comment on it.
+        """
+        for candidate in ("sneaky.epub", str(self.secret), "../elsewhere/secret.epub"):
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(EbookNotFound):
+                    resolve_ebook(self.root, candidate)
 
 if __name__ == "__main__":
     unittest.main()

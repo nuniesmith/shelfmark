@@ -56,12 +56,35 @@ def _ebook_id(root: Path, path: Path) -> str:
     return hashlib.sha256(rel.encode("utf-8")).hexdigest()[:24]
 
 
+def _within_root(root_resolved: Path, path: Path) -> bool:
+    """Whether a file really lives inside the library.
+
+    A symlink inside the root can point anywhere. `path` looks honest; only
+    `path.resolve()` tells the truth.
+    """
+    resolved = path.resolve()
+    return resolved == root_resolved or root_resolved in resolved.parents
+
+
 def _iter_ebook_files(root: Path) -> Iterator[Path]:
+    """Every real ebook under the root — the ONE definition of what exists.
+
+    The containment check lives here, not only in resolve_ebook, because the
+    listing and the resolver have to agree. They did not: an escaping symlink
+    was offered as a search result and then refused at download, so the reader
+    was shown a book, tapped Send, and got a failure for something the bot had
+    just said it had. Nothing unsafe left the box — the resolver held — but a
+    dead result you cannot explain is its own kind of broken.
+
+    Filtering at the source means anything the resolver would refuse is never
+    offered in the first place, and the two cannot drift apart again.
+    """
     is_ebook = _main_module().is_ebook
     if not root.is_dir():
         return
+    root_resolved = root.resolve()
     for path in sorted(root.rglob("*")):
-        if is_ebook(path):
+        if is_ebook(path) and _within_root(root_resolved, path):
             yield path
 
 
@@ -133,6 +156,13 @@ def resolve_ebook(root: Path, ebook_id: str) -> Path:
     EbookNotFound. The containment check below is defense in depth for the
     one case hashing alone doesn't cover: a symlink INSIDE the root pointing
     outside it, whose `path` is honest but whose `path.resolve()` is not.
+
+    _iter_ebook_files now filters those out before they ever reach here, so
+    this branch is unreachable through any public call path — and therefore
+    NO TEST DISCRIMINATES IT. Deleting it would go unnoticed. It stays anyway:
+    it is the check that actually protects the bytes, and making it depend on
+    the walk above continuing to be careful is exactly the coupling that let
+    the listing and the resolver disagree in the first place.
     """
     root_resolved = root.resolve()
     for path in _iter_ebook_files(root):
