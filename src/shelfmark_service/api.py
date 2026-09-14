@@ -106,6 +106,8 @@ def _abs_client() -> AudiobookshelfClient:
         settings.audiobookshelf_token or "",
         timeout=settings.http_timeout,
         retries=settings.http_retries,
+        breaker_failure_threshold=settings.circuit_breaker_failure_threshold,
+        breaker_cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
     )
 
 
@@ -117,6 +119,8 @@ def _prowlarr_client() -> ProwlarrClient:
         settings.prowlarr_api_key,
         timeout=settings.http_timeout,
         retries=settings.http_retries,
+        breaker_failure_threshold=settings.circuit_breaker_failure_threshold,
+        breaker_cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
     )
 
 
@@ -134,6 +138,8 @@ def _qbittorrent_client() -> QBittorrentClient:
         api_key=settings.qbittorrent_api_key,
         timeout=settings.http_timeout,
         retries=settings.http_retries,
+        breaker_failure_threshold=settings.circuit_breaker_failure_threshold,
+        breaker_cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
     )
 
 

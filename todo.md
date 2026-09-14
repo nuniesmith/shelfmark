@@ -419,7 +419,7 @@ GET  /readyz
 - [x] Implement checksum verification. A second `rsync --checksum --dry-run` pass after the tree settles. **The differences are in the OUTPUT, not the exit status** — rsync exits 0 either way, so reading the status would report every transfer as verified, corrupt ones included.
 - [x] Implement organizer preview/apply jobs. `organize_preview` and `organize_apply` in `worker.execute`.
 - [x] Implement ABS scan and metadata jobs. `library_scan`, `metadata_match`, `metadata_update`.
-- [~] Add client timeouts, retries, backoff, and circuit breaking. Timeouts, bounded retries and backoff are in `HttpClient`; **circuit breaking is not implemented** — a provider that is down is retried on every job.
+- [x] Add client timeouts, retries, backoff, and circuit breaking. Timeouts, bounded retries and backoff are in `HttpClient`. Circuit breaking is a three-state breaker (`CircuitBreaker` in `clients.py`) keyed by service name in a process-wide registry — HttpClient instances are built fresh per job, so a breaker living on the instance would reset every job and never trip; the registry is what lets job N+1's brand-new client see job N's failures. Only connection errors, timeouts, and 5xx count against it — a 401/404 is a bad request or credential, not the provider being down, so it does not trip the breaker for every other job behind it in the queue. Configurable via `SHELFMARK_CIRCUIT_BREAKER_FAILURE_THRESHOLD` / `SHELFMARK_CIRCUIT_BREAKER_COOLDOWN_SECONDS`.
 
 Acceptance criteria:
 
