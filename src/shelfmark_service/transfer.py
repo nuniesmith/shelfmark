@@ -122,12 +122,37 @@ class RsyncTransfer:
             args.extend(["-i", str(Path(self.identity_file).expanduser())])
         return " ".join(shlex.quote(arg) for arg in args)
 
+    def _remote_spec(self, remote_path: str) -> str:
+        """Address the remote directory ITSELF, with no trailing slash.
+
+        A trailing slash means "the contents of" in rsync, and that lost the
+        one thing the organiser depends on: the folder NAME. A pull of
+        "Ursula K Le Guin - The Dispossessed (1974)" deposited 01.mp3 and
+        02.mp3 loose in /incoming, stripping the author, title and year that
+        the parser reads out of the directory name — and dropping a second
+        book's tracks into the same flat directory, where they merge.
+
+        It also broke the transfer outright. With a trailing slash rsync sets
+        times on the destination root, and /incoming is a bind mount owned by a
+        different uid than the container runs as, so --archive failed with
+        "failed to set times on /incoming/.: Operation not permitted" and exit
+        23 AFTER copying the files. Naming the directory means rsync creates
+        and owns the subdirectory it writes into, and never touches the mount
+        point's own attributes.
+        """
+        path = remote_path.rstrip("/")
+        if not path:
+            # The category root itself has no directory name to preserve, so
+            # "contents of" is the only meaning available.
+            return f"{self.user}@{self.host}:/"
+        return f"{self.user}@{self.host}:{path}"
+
     def pull(self, remote_path: str, local_path: Path) -> None:
         if not remote_path or remote_path.startswith("-"):
             raise TransferError("remote_path must be a non-empty path")
         local_path = Path(local_path).expanduser().resolve()
         local_path.mkdir(parents=True, exist_ok=True)
-        remote = f"{self.user}@{self.host}:{remote_path.rstrip('/')}/"
+        remote = self._remote_spec(remote_path)
         # NOT --protect-args. rrsync refuses it outright:
         #
         #     rrsync error: option -s has been disabled on this server
@@ -190,7 +215,7 @@ class RsyncTransfer:
         if not remote_path or remote_path.startswith("-"):
             raise TransferError("remote_path must be a non-empty path")
         local_path = Path(local_path).expanduser().resolve()
-        remote = f"{self.user}@{self.host}:{remote_path.rstrip('/')}/"
+        remote = self._remote_spec(remote_path)
         command: Sequence[str] = (
             "rsync",
             "--archive",
