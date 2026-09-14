@@ -16,3 +16,6 @@ build/
 .env.*
 !.env.example
 *.db
+
+# Agent worktrees are checkouts of this same repo; never commit them.
+.claude/

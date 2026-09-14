@@ -159,8 +159,14 @@ class Worker:
                 strict_host_key=self.settings.sullivan_strict_host_key,
             )
             transfer.pull(remote, local)
+            # Where the book actually landed. rsync now preserves the remote
+            # directory name, so the tree is under local/<name> rather than
+            # loose in the incoming root — and it is that path an organize job
+            # has to be pointed at, not the shared root holding every download.
+            name = posixpath.basename(remote.rstrip("/"))
+            landed = local / name if name else local
             snapshot = wait_until_stable(
-                local,
+                landed,
                 settle_seconds=self.settings.transfer_settle_seconds,
                 poll_seconds=self.settings.transfer_poll_seconds,
                 timeout_seconds=self.settings.transfer_timeout_seconds,
@@ -179,12 +185,12 @@ class Worker:
             ).event(
                 "transfer_verified",
                 remote_path=remote,
-                local_path=str(local),
+                local_path=str(landed),
                 files=len(snapshot),
             )
             return {
                 "remote_path": remote,
-                "local_path": str(local),
+                "local_path": str(landed),
                 "files": len(snapshot),
                 "verified": True,
             }

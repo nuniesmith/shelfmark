@@ -55,7 +55,9 @@ class TransferTests(unittest.TestCase):
         # The path keeps its spaces, raw and unescaped. A forced command has no
         # shell to word-split them, and escaping them makes rrsync look for a
         # filename containing literal backslashes.
-        self.assertIn("shelfmark-sync@sullivan.internal:/complete/shelfmark-books/Book Name/", command)
+        # No trailing slash: the remote DIRECTORY, not its contents. See
+        # RemotePathTests for why that distinction is load-bearing.
+        self.assertIn("shelfmark-sync@sullivan.internal:/complete/shelfmark-books/Book Name", command)
         ssh = command[command.index("-e") + 1]
         self.assertIn("BatchMode=yes", ssh)
         self.assertIn("ConnectTimeout=30", ssh)
@@ -195,5 +197,51 @@ class RrsyncCompatibilityTests(unittest.TestCase):
         for method in ("pull", "verify"):
             with self.subTest(method=method):
                 spec = [a for a in self._command_for(method) if a.startswith("shelfmark-sync@")]
-                self.assertEqual(spec, ["shelfmark-sync@sullivan:/Book Name/"])
+                self.assertEqual(spec, ["shelfmark-sync@sullivan:/Book Name"])
                 self.assertNotIn("\\", spec[0])
+
+
+class RemotePathTests(unittest.TestCase):
+    """The remote must name the DIRECTORY, never "its contents".
+
+    A trailing slash means "contents of" in rsync, and it cost two things at
+    once. It discarded the folder NAME — the only place the organiser reads
+    author, title and year from — so a pulled book arrived as loose tracks in
+    the incoming root, where a second book's tracks would merge with it. And
+    it made rsync set times on the destination root, which is a bind mount
+    owned by a different uid than the container runs as, so --archive failed
+    with "failed to set times on /incoming/.: Operation not permitted" AFTER
+    copying the files.
+    """
+
+    def _spec_for(self, method: str, remote: str) -> str:
+        captured: list[list[str]] = []
+
+        def runner(command: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+            captured.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory(prefix="shelfmark-remote-") as tmp:
+            transfer = RsyncTransfer("sullivan", "shelfmark-sync", retries=0, runner=runner)
+            getattr(transfer, method)(remote, Path(tmp))
+        return next(a for a in captured[0] if a.startswith("shelfmark-sync@"))
+
+    def test_directory_name_is_preserved(self) -> None:
+        for method in ("pull", "verify"):
+            with self.subTest(method=method):
+                spec = self._spec_for(method, "/Ursula K Le Guin - The Dispossessed (1974)")
+                self.assertFalse(
+                    spec.endswith("/"),
+                    f"trailing slash discards the folder name: {spec}",
+                )
+                self.assertTrue(spec.endswith("The Dispossessed (1974)"))
+
+    def test_a_supplied_trailing_slash_is_still_stripped(self) -> None:
+        """The caller should not be able to reintroduce the bug by accident."""
+        self.assertEqual(self._spec_for("pull", "/Book/"), "shelfmark-sync@sullivan:/Book")
+
+    def test_the_category_root_still_means_contents_of(self) -> None:
+        """The root has no directory name to preserve, so "contents of" is the
+        only available meaning — and it must not collapse to a bare host spec,
+        which rsync reads as the remote default directory."""
+        self.assertEqual(self._spec_for("pull", "/"), "shelfmark-sync@sullivan:/")
