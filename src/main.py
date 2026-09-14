@@ -2061,14 +2061,42 @@ def staging_dir_for_book(dest_dir: Path) -> Path:
     return Path(tempfile.mkdtemp(prefix=f"{dest_dir.name[:60]}.", dir=parent))
 
 
-def _dispose_book_staging(staging: Path) -> None:
-    """Clear a book staging directory that never made it into the library.
+def _rollback_and_dispose_book_staging(
+    staging: Path, moved: list[tuple[Path, Path]]
+) -> None:
+    """Undo a book staged with renames, then clear the staging directory.
 
-    No quarantine option here, unlike _dispose_staging for archives, and none
-    is needed: _stage_book only ever READS op.src (see there), so whatever a
-    failed attempt left in staging is still sitting untouched at the source
-    too. Deleting it loses nothing.
+    `moved` is every (original source, staged path) pair _stage_book actually
+    renamed rather than copied — the same-filesystem fast path, which moves
+    no data at all. Reversing a rename is exactly as cheap as making it, so
+    that is the normal way to undo one here, not a fallback of last resort:
+    nothing in this function duplicates a byte to stay safe.
+
+    Anything else still in staging (a cross-filesystem source, or any file
+    from a --copy run) was only ever copied in the first place, so its
+    source is untouched and it is simply disposable.
+
+    A rename-back that itself fails is the one remaining way this could lose
+    data: the original location no longer has that file — the forward rename
+    is what removed it — so deleting the staged copy would leave nothing at
+    all. That file is left exactly where it is, staging is kept rather than
+    removed, and its path is printed so the failure is recoverable rather
+    than silent.
     """
+    stranded = False
+    for src, target in moved:
+        try:
+            if target.exists():
+                ensure_parent(src)
+                os.rename(str(target), str(src))
+        except OSError as exc:
+            stranded = True
+            eprint(f"  could not restore {target} -> {src}: {exc}")
+
+    if stranded:
+        eprint(f"  left partial staging directory for recovery: {staging}")
+        return
+
     try:
         shutil.rmtree(staging, ignore_errors=True)
     except Exception as exc:  # pragma: no cover - defensive
@@ -2077,36 +2105,64 @@ def _dispose_book_staging(staging: Path) -> None:
         _prune_staging_parent(staging.parent)
 
 
-def _stage_book(book: BookPlan) -> Path:
-    """Copy every track and extra a NEW book needs into a private directory.
+def _stage_book(book: BookPlan, copy: bool) -> tuple[Path, list[tuple[Path, Path]]]:
+    """Assemble every track and extra a NEW book needs into a private
+    directory, returning it alongside every (source, staged path) pair that
+    was RENAMED rather than copied.
 
     A book used to be written straight into dest_dir file by file, so an
     import killed partway — out of disk, a bad track three files in, an
     operator's Ctrl-C — left a book folder in the library with some tracks
     present and the rest simply missing. Nothing downstream can tell that
-    from a short book: Audiobookshelf imports it as a real one.
+    from a short book: Audiobookshelf imports it as a real one. Assembling it
+    here first and handing the whole directory over with one `rename` (in
+    apply_plan) removes that state rather than narrowing the window for it.
 
-    Assembling it here first and handing the whole directory over with one
-    `rename` (in apply_plan) removes that state rather than narrowing the
-    window for it. Copying instead of moving is what makes an abort here
-    free: op.src is only ever read, so nothing has left the source, and a
-    half-built staging directory can simply be deleted without losing a
-    track that a plain move would already have consumed.
+    In move mode, staging a source that lives on the SAME filesystem as the
+    destination is a plain `os.rename` — atomic, instant, and no data is
+    copied — exactly like move_file's fast path. That matters concretely:
+    reorganising an existing library in place (`--dest` equal to the source)
+    is metadata-only work today, and copying here instead would turn every
+    such run into a full read-and-rewrite of the library, needing twice the
+    disk transiently on a server that has already run out once. Only a
+    source on a different filesystem is actually copied (the EXDEV case
+    move_file already handles the same way), and copy mode always copies,
+    because there the source must survive regardless of filesystem.
+
+    The returned pairs are what makes an abort here affordable without
+    falling back to a real copy: reversing a rename costs exactly what
+    making it did, so undoing a partially-renamed book is just as cheap as
+    building it was, and nothing needs to be duplicated up front "to be
+    safe".
     """
     staging = staging_dir_for_book(book.dest_dir)
+    moved: list[tuple[Path, Path]] = []
     try:
         for op in book.tracks + book.extras:
             if op.kind == "trash":
                 continue
             target = staging / op.dest.relative_to(book.dest_dir)
             ensure_parent(target)
-            shutil.copy2(str(op.src), str(target))
+            if copy:
+                shutil.copy2(str(op.src), str(target))
+                continue
+            try:
+                os.rename(str(op.src), str(target))
+                moved.append((op.src, target))
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # Across filesystems there is no atomic move, same as
+                # move_file's own EXDEV fallback. The source is left alone
+                # here too — it is only removed once the whole book has
+                # safely landed (see apply_plan's post-rename cleanup).
+                shutil.copy2(str(op.src), str(target))
     except BaseException:
         # BaseException, not Exception: a KeyboardInterrupt mid-import is
         # exactly the case that used to strand a partial book folder.
-        _dispose_book_staging(staging)
+        _rollback_and_dispose_book_staging(staging, moved)
         raise
-    return staging
+    return staging, moved
 
 
 def apply_plan(plan: Plan, trash: Path, dry_run: bool, copy: bool) -> None:
@@ -2120,8 +2176,11 @@ def apply_plan(plan: Plan, trash: Path, dry_run: bool, copy: bool) -> None:
 
     A book whose dest_dir does not exist yet is assembled whole in staging and
     handed over with one `rename` (see _stage_book), so the library never
-    shows one that is missing tracks. A book already on disk — a repeat run,
-    or new files arriving for one already imported — is written straight in,
+    shows one that is missing tracks. In move mode a same-filesystem source
+    is staged with a rename too, not a copy, so this costs no more than the
+    old file-by-file move did — only a cross-filesystem source, or --copy
+    mode, actually duplicates data. A book already on disk — a repeat run, or
+    new files arriving for one already imported — is written straight in,
     file by file, exactly as before: it is already visible to a scan either
     way, so staging buys nothing, and `rename` cannot merge into a
     destination that already has files in it regardless.
@@ -2136,18 +2195,21 @@ def apply_plan(plan: Plan, trash: Path, dry_run: bool, copy: bool) -> None:
         keep_ops = [op for op in ops if op.kind != "trash"]
         trash_ops = [op for op in ops if op.kind == "trash"]
         if keep_ops and not book.dest_dir.exists():
-            staging = _stage_book(book)
+            staging, moved = _stage_book(book, copy)
             try:
                 staging.rename(book.dest_dir)
             except OSError:
-                _dispose_book_staging(staging)
+                _rollback_and_dispose_book_staging(staging, moved)
                 raise
             _prune_staging_parent(staging.parent)
             if not copy:
-                # The library now holds every file under its final name, so
-                # the source copy is redundant. Removed only now: if this
-                # never runs (a crash right here, or --copy), the source is
-                # untouched and the next run just repeats the same copy.
+                # A same-filesystem source is already gone — _stage_book
+                # renamed it — so this is a no-op for most tracks. It only
+                # does real work for a cross-filesystem source, which was
+                # copied rather than moved and is now redundant. Either way
+                # it runs only after the rename above has already landed: if
+                # it never runs (a crash right here, or --copy), the source
+                # is untouched and the next run just repeats the same work.
                 for op in keep_ops:
                     op.src.unlink(missing_ok=True)
         else:
