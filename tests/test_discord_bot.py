@@ -5,6 +5,7 @@ from unittest import mock
 
 from src.shelfmark_service.discord_bot import (
     _int_set,
+    _job_status_message,
     blocking_problems,
     is_permitted,
 )
@@ -99,6 +100,53 @@ class StartupTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(blocking_problems(), [])
+
+
+class JobStatusMessageTests(unittest.TestCase):
+    """`/job` used to show only status and attempts — never the failure code
+    or even the free-text reason. Split into a plain function for the same
+    reason `is_permitted` is: it is checkable without a Discord interaction
+    object graph, on the exact thing this module exists to fix."""
+
+    def test_succeeded_job_has_no_code_line(self) -> None:
+        message = _job_status_message({"id": "abc", "status": "succeeded", "attempts": 1}, "abc")
+        self.assertNotIn("Code:", message)
+
+    def test_queued_job_has_no_code_line(self) -> None:
+        message = _job_status_message({"id": "abc", "status": "queued", "attempts": 0}, "abc")
+        self.assertNotIn("Code:", message)
+
+    def test_failed_job_shows_code_and_error(self) -> None:
+        message = _job_status_message(
+            {
+                "id": "abc",
+                "status": "failed",
+                "attempts": 2,
+                "code": "source_missing",
+                "error": "source is not a directory: /incoming/x",
+            },
+            "abc",
+        )
+        self.assertIn("Code: `source_missing`", message)
+        self.assertIn("Error: source is not a directory: /incoming/x", message)
+
+    def test_legacy_failed_job_without_a_code_shows_unknown_not_a_blank(self) -> None:
+        """A job that failed before migration 2 added the column has
+        `code: None` from the API. The line has to say so plainly rather than
+        silently disappearing, which would look identical to "this job never
+        failed"."""
+        message = _job_status_message(
+            {"id": "abc", "status": "failed", "attempts": 1, "code": None, "error": "boom"}, "abc"
+        )
+        self.assertIn("Code: `unknown`", message)
+
+    def test_cancelled_job_shows_its_code_without_an_error_line(self) -> None:
+        message = _job_status_message(
+            {"id": "abc", "status": "cancelled", "attempts": 1, "code": "cancelled", "error": None},
+            "abc",
+        )
+        self.assertIn("Code: `cancelled`", message)
+        self.assertNotIn("Error:", message)
 
 
 if __name__ == "__main__":

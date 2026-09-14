@@ -32,6 +32,7 @@ class Job:
     heartbeat_at: str | None
     worker_id: str | None
     error: str | None
+    error_code: str | None
     result: dict[str, Any] | None
     cancel_requested: bool
 
@@ -49,6 +50,13 @@ class Job:
             heartbeat_at=row["heartbeat_at"],
             worker_id=row["worker_id"],
             error=row["error"],
+            # NULL for any row written before migration 2 added this column,
+            # and reading it back does not crash: sqlite backfills existing
+            # rows with NULL on `ALTER TABLE ... ADD COLUMN`, so this is the
+            # honest value for "no code was ever recorded" rather than a
+            # fabricated "internal", which would claim to know the failure was
+            # unmapped when it might just predate the column entirely.
+            error_code=row["error_code"],
             result=json.loads(row["result_json"]) if row["result_json"] else None,
             cancel_requested=bool(row["cancel_requested"]),
         )
@@ -116,6 +124,19 @@ class Database:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                 (1, utc_now()),
             )
+            # Migration 2: a stable error_code alongside the existing free-text
+            # `error` column, so a job's failure reason can be branched on
+            # without parsing a sentence that changes whenever someone rewords
+            # it. Unlike the CREATE TABLE/INDEX statements above, `ALTER TABLE
+            # ADD COLUMN` is NOT idempotent in SQLite — a second run raises
+            # "duplicate column name" — so this has to be gated on the
+            # migrations table instead of re-run unconditionally every start.
+            if conn.execute("SELECT 1 FROM schema_migrations WHERE version = 2").fetchone() is None:
+                conn.execute("ALTER TABLE jobs ADD COLUMN error_code TEXT")
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (2, utc_now()),
+                )
 
     @staticmethod
     def _audit(
@@ -247,16 +268,16 @@ class Database:
                 )
             return updated == 1
 
-    def fail(self, job_id: str, worker_id: str, error: str) -> bool:
+    def fail(self, job_id: str, worker_id: str, error: str, code: str | None = None) -> bool:
         now = utc_now()
         with closing(self.connect()) as conn:
             updated = conn.execute(
                 """
                 UPDATE jobs
-                   SET status = 'failed', finished_at = ?, heartbeat_at = ?, error = ?
+                   SET status = 'failed', finished_at = ?, heartbeat_at = ?, error = ?, error_code = ?
                  WHERE id = ? AND status = 'running' AND worker_id = ?
                 """,
-                (now, now, error[:4000], job_id, worker_id),
+                (now, now, error[:4000], code, job_id, worker_id),
             ).rowcount
             if updated:
                 self._audit(
@@ -265,7 +286,7 @@ class Database:
                     action="job.failed",
                     target_type="job",
                     target_id=job_id,
-                    details={"error": error[:4000]},
+                    details={"error": error[:4000], "code": code},
                 )
             return updated == 1
 
@@ -293,12 +314,18 @@ class Database:
         return self.get_job(job_id)
 
     def cancel_running(self, job_id: str, worker_id: str) -> bool:
-        """Finalize a running job after its worker observed cancellation."""
+        """Finalize a running job after its worker observed cancellation.
+
+        Sets `error_code = 'cancelled'` even though `status` already says
+        'cancelled': a caller reading only the code column (the same field a
+        failed job's reason lives in) should still be able to tell "the user
+        stopped this" apart from "this broke" without also inspecting status.
+        """
         with closing(self.connect()) as conn:
             updated = conn.execute(
                 """
                 UPDATE jobs
-                   SET status = 'cancelled', finished_at = ?, heartbeat_at = ?
+                   SET status = 'cancelled', finished_at = ?, heartbeat_at = ?, error_code = 'cancelled'
                  WHERE id = ? AND status = 'running' AND worker_id = ?
                 """,
                 (utc_now(), utc_now(), job_id, worker_id),

@@ -73,6 +73,7 @@ def _job_response(job: Job) -> dict[str, Any]:
         "heartbeat_at": job.heartbeat_at,
         "worker_id": job.worker_id,
         "error": job.error,
+        "code": job.error_code,
         "result": job.result,
         "cancel_requested": job.cancel_requested,
     }

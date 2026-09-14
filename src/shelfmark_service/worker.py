@@ -10,11 +10,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .clients import AudiobookshelfClient, ProwlarrClient
+from .clients import AudiobookshelfClient, ProwlarrClient, ServiceError
 from .config import Settings
 from .db import Database, Job
+from .errors import ErrorCode, ShelfmarkError
 from .manifest import JsonlManifest, sha256_file
-from .transfer import RsyncTransfer, wait_until_stable
+from .transfer import RsyncTransfer, TransferError, wait_until_stable
 
 logger = logging.getLogger("shelfmark.worker")
 
@@ -27,9 +28,23 @@ def _path(payload: dict[str, Any], name: str, default: Path | None = None) -> Pa
     value = payload.get(name)
     if value is None:
         if default is None:
-            raise ValueError(f"job payload requires {name}")
+            raise ShelfmarkError(ErrorCode.INVALID_PAYLOAD, f"job payload requires {name}")
         return default
     return Path(str(value)).expanduser().resolve()
+
+
+def _upstream_failure(exc: ServiceError) -> ShelfmarkError:
+    # Mirrors api.py's `_upstream_error`: never surface `exc.message` here.
+    # It is the upstream response BODY, which api.py's own comment on
+    # `_upstream_error` already documents as unsafe ("can contain release
+    # URLs, credentials, or other data that should stay in service logs") —
+    # that rule applies just as much to a job's stored error as to an HTTP
+    # response, so only the service name and status code travel further.
+    return ShelfmarkError(
+        ErrorCode.UPSTREAM_UNAVAILABLE,
+        f"{exc.service} request failed",
+        details={"service": exc.service, "status": exc.status},
+    )
 
 
 def _plan_summary(plan: Any) -> dict[str, Any]:
@@ -84,16 +99,30 @@ class Worker:
             self.database.cancel_running(job.id, worker_id=self.worker_id)
             manifest.event("job_cancelled", job_id=job.id, reason=str(exc))
             logger.info("job cancelled id=%s reason=%s", job.id, exc)
+        except ShelfmarkError as exc:
+            self.database.fail(job.id, self.worker_id, exc.message, code=exc.code.value)
+            manifest.event(
+                "job_failed", job_id=job.id, error=exc.message, code=exc.code.value, details=exc.details
+            )
+            logger.exception("job failed id=%s code=%s", job.id, exc.code.value)
         except Exception as exc:  # noqa: BLE001 - failure belongs in the job record
-            self.database.fail(job.id, self.worker_id, str(exc))
-            manifest.event("job_failed", job_id=job.id, error=str(exc))
+            # Anything landing here escaped every explicit ShelfmarkError raise
+            # in execute() — an OSError from a disk write, an ImportError, a
+            # bug. It still needs a code, because a job record with a message
+            # but no code is exactly the "nothing downstream can branch on
+            # this" problem this module exists to fix. INTERNAL is that
+            # deliberately generic bucket, never a guess at a more specific one.
+            self.database.fail(job.id, self.worker_id, str(exc), code=ErrorCode.INTERNAL.value)
+            manifest.event("job_failed", job_id=job.id, error=str(exc), code=ErrorCode.INTERNAL.value)
             logger.exception("job failed id=%s", job.id)
         return True
 
     def execute(self, job: Job) -> dict[str, Any]:
         if job.kind in {"metadata_update", "metadata_match", "library_scan"}:
             if not self.settings.audiobookshelf_url or not self.settings.audiobookshelf_token:
-                raise ValueError("Audiobookshelf integration is not configured")
+                raise ShelfmarkError(
+                    ErrorCode.PROVIDER_NOT_CONFIGURED, "Audiobookshelf integration is not configured"
+                )
             client = AudiobookshelfClient(
                 self.settings.audiobookshelf_url,
                 self.settings.audiobookshelf_token,
@@ -102,54 +131,69 @@ class Worker:
                 breaker_failure_threshold=self.settings.circuit_breaker_failure_threshold,
                 breaker_cooldown_seconds=self.settings.circuit_breaker_cooldown_seconds,
             )
-            if job.kind == "metadata_update":
-                item_id = str(job.payload.get("item_id", ""))
-                media = job.payload.get("media")
-                if not item_id or not isinstance(media, dict):
-                    raise ValueError("metadata_update requires item_id and media")
-                return {"item_id": item_id, "upstream": client.update_media(item_id, media), "updated": True}
-            if job.kind == "metadata_match":
-                item_id = str(job.payload.get("item_id", ""))
-                if not item_id:
-                    raise ValueError("metadata_match requires item_id")
-                fields = {
-                    key: job.payload.get(key)
-                    for key in ("title", "author", "provider", "isbn", "asin")
-                    if job.payload.get(key)
-                }
+            # Everything below talks to Audiobookshelf, so one handler covers
+            # all three sub-kinds: a ServiceError here means the integration is
+            # configured but the request itself failed (bad ID, ABS down,
+            # timeout) — a different situation from the payload/config checks
+            # above, which is why it gets UPSTREAM_UNAVAILABLE instead of
+            # INVALID_PAYLOAD or PROVIDER_NOT_CONFIGURED.
+            try:
+                if job.kind == "metadata_update":
+                    item_id = str(job.payload.get("item_id", ""))
+                    media = job.payload.get("media")
+                    if not item_id or not isinstance(media, dict):
+                        raise ShelfmarkError(
+                            ErrorCode.INVALID_PAYLOAD, "metadata_update requires item_id and media"
+                        )
+                    return {"item_id": item_id, "upstream": client.update_media(item_id, media), "updated": True}
+                if job.kind == "metadata_match":
+                    item_id = str(job.payload.get("item_id", ""))
+                    if not item_id:
+                        raise ShelfmarkError(ErrorCode.INVALID_PAYLOAD, "metadata_match requires item_id")
+                    fields = {
+                        key: job.payload.get(key)
+                        for key in ("title", "author", "provider", "isbn", "asin")
+                        if job.payload.get(key)
+                    }
+                    return {
+                        "item_id": item_id,
+                        "upstream": client.match(
+                            item_id,
+                            **fields,
+                            override_defaults=bool(job.payload.get("override_defaults", False)),
+                        ),
+                        "matched": True,
+                    }
+                library_id = str(job.payload.get("library_id", ""))
+                if not library_id:
+                    raise ShelfmarkError(ErrorCode.INVALID_PAYLOAD, "library_scan requires library_id")
                 return {
-                    "item_id": item_id,
-                    "upstream": client.match(
-                        item_id,
-                        **fields,
-                        override_defaults=bool(job.payload.get("override_defaults", False)),
-                    ),
-                    "matched": True,
+                    "library_id": library_id,
+                    "upstream": client.scan(library_id, force=bool(job.payload.get("force", False))),
+                    "scan_started": True,
                 }
-            library_id = str(job.payload.get("library_id", ""))
-            if not library_id:
-                raise ValueError("library_scan requires library_id")
-            return {
-                "library_id": library_id,
-                "upstream": client.scan(library_id, force=bool(job.payload.get("force", False))),
-                "scan_started": True,
-            }
+            except ServiceError as exc:
+                raise _upstream_failure(exc) from exc
         if job.kind == "transfer_completed":
             if not self.settings.sullivan_host or not self.settings.sullivan_user:
-                raise ValueError("Sullivan transfer is not configured")
+                raise ShelfmarkError(ErrorCode.PROVIDER_NOT_CONFIGURED, "Sullivan transfer is not configured")
             raw_remote = str(job.payload.get("remote_path", "")).strip()
             if not raw_remote:
-                raise ValueError("job payload requires remote_path")
+                raise ShelfmarkError(ErrorCode.INVALID_PAYLOAD, "job payload requires remote_path")
             base_remote = posixpath.normpath(self.settings.sullivan_completed_root)
             remote = posixpath.normpath(
                 raw_remote if raw_remote.startswith("/") else posixpath.join(base_remote, raw_remote)
             )
             if remote != base_remote and not remote.startswith(base_remote.rstrip("/") + "/"):
-                raise ValueError("remote_path must stay within Sullivan's Shelfmark category")
+                raise ShelfmarkError(
+                    ErrorCode.INVALID_PAYLOAD, "remote_path must stay within Sullivan's Shelfmark category"
+                )
             local_root = self.settings.incoming_root or Path("/incoming")
             local = _path(job.payload, "local_path", local_root)
             if local != local_root and local_root not in local.parents:
-                raise ValueError("local_path must stay within the configured incoming root")
+                raise ShelfmarkError(
+                    ErrorCode.INVALID_PAYLOAD, "local_path must stay within the configured incoming root"
+                )
             transfer = RsyncTransfer(
                 host=self.settings.sullivan_host,
                 user=self.settings.sullivan_user,
@@ -160,27 +204,48 @@ class Worker:
                 known_hosts=self.settings.sullivan_known_hosts,
                 strict_host_key=self.settings.sullivan_strict_host_key,
             )
-            transfer.pull(remote, local)
+            # Each call below fails for a different reason, so each gets its
+            # own translation rather than one try/except around the whole
+            # transfer: a pull failure is the SSH/rsync path being unreachable
+            # (UPSTREAM_UNAVAILABLE); wait_until_stable failing means nothing
+            # usable ever showed up locally (SOURCE_MISSING); a failed verify
+            # RUN is the checksum command itself breaking (UPSTREAM_UNAVAILABLE
+            # again), which is distinct from the command succeeding and
+            # reporting that the content differs (VERIFICATION_FAILED, below).
+            try:
+                transfer.pull(remote, local)
+            except TransferError as exc:
+                raise ShelfmarkError(ErrorCode.UPSTREAM_UNAVAILABLE, f"transfer from Sullivan failed: {exc}") from exc
             # Where the book actually landed. rsync now preserves the remote
             # directory name, so the tree is under local/<name> rather than
             # loose in the incoming root — and it is that path an organize job
             # has to be pointed at, not the shared root holding every download.
             name = posixpath.basename(remote.rstrip("/"))
             landed = local / name if name else local
-            snapshot = wait_until_stable(
-                landed,
-                settle_seconds=self.settings.transfer_settle_seconds,
-                poll_seconds=self.settings.transfer_poll_seconds,
-                timeout_seconds=self.settings.transfer_timeout_seconds,
-            )
+            try:
+                snapshot = wait_until_stable(
+                    landed,
+                    settle_seconds=self.settings.transfer_settle_seconds,
+                    poll_seconds=self.settings.transfer_poll_seconds,
+                    timeout_seconds=self.settings.transfer_timeout_seconds,
+                )
+            except TransferError as exc:
+                raise ShelfmarkError(ErrorCode.SOURCE_MISSING, str(exc)) from exc
             # Verify AFTER the tree has settled, not straight after the pull:
             # comparing a tree still being written reports differences that are
             # simply the write in progress.
-            differences = transfer.verify(remote, local)
+            try:
+                differences = transfer.verify(remote, local)
+            except TransferError as exc:
+                raise ShelfmarkError(
+                    ErrorCode.UPSTREAM_UNAVAILABLE, f"verification against Sullivan failed: {exc}"
+                ) from exc
             if differences:
-                raise RuntimeError(
+                raise ShelfmarkError(
+                    ErrorCode.VERIFICATION_FAILED,
                     "transfer does not match Sullivan after copying "
-                    f"({len(differences)} file(s) differ): {', '.join(differences[:5])}"
+                    f"({len(differences)} file(s) differ): {', '.join(differences[:5])}",
+                    details={"differing_files": differences[:5], "differing_count": len(differences)},
                 )
             JsonlManifest(
                 self.settings.manifest_root / f"{job.id}.jsonl", actor=self.worker_id
@@ -198,10 +263,10 @@ class Worker:
             }
         if job.kind == "grab_release":
             if not self.settings.prowlarr_url or not self.settings.prowlarr_api_key:
-                raise ValueError("Prowlarr integration is not configured")
+                raise ShelfmarkError(ErrorCode.PROVIDER_NOT_CONFIGURED, "Prowlarr integration is not configured")
             release = job.payload.get("release")
             if not isinstance(release, dict) or not release:
-                raise ValueError("job payload requires a release object")
+                raise ShelfmarkError(ErrorCode.INVALID_PAYLOAD, "job payload requires a release object")
             client = ProwlarrClient(
                 self.settings.prowlarr_url,
                 self.settings.prowlarr_api_key,
@@ -210,13 +275,20 @@ class Worker:
                 breaker_failure_threshold=self.settings.circuit_breaker_failure_threshold,
                 breaker_cooldown_seconds=self.settings.circuit_breaker_cooldown_seconds,
             )
-            return {"release": release, "upstream": client.grab(release), "submitted": True}
+            try:
+                return {"release": release, "upstream": client.grab(release), "submitted": True}
+            except ServiceError as exc:
+                raise _upstream_failure(exc) from exc
         if job.kind not in {"organize_preview", "organize_apply"}:
-            raise ValueError(f"unsupported job kind: {job.kind}")
+            # Reachable only if a job was enqueued with a kind the API's
+            # `JobRequest` schema never allows (e.g. inserted directly through
+            # `Database.enqueue`, which does not validate `kind`) — a bad
+            # request, not a broken worker.
+            raise ShelfmarkError(ErrorCode.INVALID_PAYLOAD, f"unsupported job kind: {job.kind}")
         payload = job.payload
         source = _path(payload, "source")
         if not source.is_dir():
-            raise ValueError(f"source is not a directory: {source}")
+            raise ShelfmarkError(ErrorCode.SOURCE_MISSING, f"source is not a directory: {source}")
         dest = _path(payload, "dest", source)
         trash = _path(payload, "trash", source / "trash")
         from main import apply_extracts, apply_plan, build_plan
@@ -245,7 +317,9 @@ class Worker:
             self._record_plan(manifest, plan)
             errors = apply_extracts(plan, trash=trash, dry_run=False, copy=bool(payload.get("copy", False)))
             if errors:
-                raise RuntimeError("; ".join(errors))
+                raise ShelfmarkError(
+                    ErrorCode.EXTRACTION_FAILED, "; ".join(errors), details={"errors": errors}
+                )
             plan = build_plan(**options)
             manifest.event("plan_recreated", summary=_plan_summary(plan))
         self._record_plan(manifest, plan)
