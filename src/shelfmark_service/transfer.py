@@ -128,11 +128,24 @@ class RsyncTransfer:
         local_path = Path(local_path).expanduser().resolve()
         local_path.mkdir(parents=True, exist_ok=True)
         remote = f"{self.user}@{self.host}:{remote_path.rstrip('/')}/"
+        # NOT --protect-args. rrsync refuses it outright:
+        #
+        #     rrsync error: option -s has been disabled on this server
+        #
+        # and it is not needed here. --protect-args exists because a normal
+        # remote SHELL word-splits the path; a forced command has no shell —
+        # rrsync parses the request itself and keeps the path intact. Verified
+        # against the live account with a directory full of spaces: raw spaces
+        # transfer correctly, and backslash-escaping them FAILS, because the
+        # escapes arrive as literal characters in the filename.
+        #
+        # Nothing is given up. A path cannot inject options (remote_path
+        # starting with "-" is rejected above) and cannot escape the category
+        # (rrsync enforces its own root, which the restriction checks cover).
         command: Sequence[str] = (
             "rsync",
             "--archive",
             "--partial",
-            "--protect-args",
             "--human-readable",
             "--itemize-changes",
             "-e",
@@ -184,7 +197,6 @@ class RsyncTransfer:
             "--checksum",
             "--dry-run",
             "--itemize-changes",
-            "--protect-args",
             "-e",
             self._ssh_command(),
             remote,
