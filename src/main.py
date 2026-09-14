@@ -2277,6 +2277,51 @@ def print_plan(plan: Plan, source: Path, dest: Path) -> None:
         print()
 
 
+def find_stranded_book_staging(dest: Path) -> list[Path]:
+    """Every book staging directory left behind under dest, if any.
+
+    One of these should never survive a run. _stage_book cleans up after
+    itself on success (the rename into place) and on any CATCHABLE failure
+    (see _rollback_and_dispose_book_staging, which reverses same-filesystem
+    renames before removing the directory). But SIGKILL, an OOM kill, and a
+    power cut cannot be caught — nothing runs to reverse anything — and a
+    move-mode import has already renamed those tracks OUT of the source by
+    the time one of those lands. Left unreported, the files are then
+    invisible everywhere at once: gone from the source, never in the
+    library, and skipped by every future scan because the walker treats a
+    dotted directory as this tool's own working state, not content. Before
+    this PR the same kill left some tracks in the library and the rest still
+    in the source, where the next run's scan would find and finish them —
+    reporting this loudly is what keeps that self-healing property from
+    quietly becoming "the tracks do not exist anywhere a human would look".
+    """
+    if not dest.is_dir():
+        return []
+    return [
+        child
+        for marker in dest.rglob(BOOK_STAGING_DIR_NAME)
+        if marker.is_dir()
+        for child in marker.iterdir()
+        if child.is_dir()
+    ]
+
+
+def report_stranded_book_staging(dest: Path) -> None:
+    stranded = find_stranded_book_staging(dest)
+    if not stranded:
+        return
+    eprint(
+        f"WARNING: {len(stranded)} book staging "
+        f"director{'y' if len(stranded) == 1 else 'ies'} left behind by an "
+        "earlier run that was killed rather than interrupted (SIGKILL, an "
+        "OOM kill, a power cut). These files are not visible to a scan and "
+        "will NOT be recovered automatically — that would risk completing a "
+        "partial book into the library. Recover them by hand:"
+    )
+    for path in stranded:
+        eprint(f"  {path}")
+
+
 def confirm(prompt: str) -> bool:
     if not sys.stdin.isatty():
         return False
@@ -2308,6 +2353,11 @@ def run(args: argparse.Namespace) -> int:
     dry_run = not args.apply
     if args.dry_run:
         dry_run = True
+
+    # Before the scan, not after: these files are invisible to it (see
+    # find_stranded_book_staging), so nothing later in this run would ever
+    # mention them otherwise.
+    report_stranded_book_staging(dest)
 
     print("Scanning…")
     plan = build_plan(

@@ -592,6 +592,51 @@ class WholeDirectoryStagingTests(unittest.TestCase):
         self.assertTrue((self.trash / "thumbs.db").exists())
         self.assertFalse((dest_dir / "thumbs.db").exists())
 
+    def test_stranded_staging_from_an_uncatchable_kill_is_reported_not_silent(self) -> None:
+        """SIGKILL, an OOM kill, and a power cut cannot be caught, so
+        _stage_book's own rollback (a `try`/`except`) never runs for them: a
+        move-mode import killed that way leaves tracks renamed OUT of the
+        source and stuck in .shelfmark-work-books, with nothing left to put
+        them back.
+
+        Before whole-directory staging, the same kill left some tracks in
+        the library and the rest still in the source, where the next run's
+        scan would find and finish the book — self-healing. Staging removes
+        that: the walker skips a dotted directory, so a scan does not find
+        these tracks in the source, the library never got a folder for them,
+        and nothing looks for them here either. This test is the substitute
+        for the self-healing this PR took away: the operator must at least
+        be told the files exist and where, rather than a book quietly
+        existing nowhere a human would look.
+        """
+        self.source.mkdir(parents=True, exist_ok=True)
+        dest_dir = self.dest / "Some Author" / "2001 - The Book"
+        staging_parent = dest_dir.parent / BOOK_STAGING_DIR_NAME
+        staging = staging_parent / "2001 - The Book.abcdef"
+        self.touch(staging / "01.mp3", b"one")
+        self.touch(staging / "02.mp3", b"two")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main([str(self.source), "--dest", str(self.dest), "--apply", "--yes"])
+
+        self.assertEqual(code, 0)
+        err = stderr.getvalue()
+        self.assertIn(
+            "1 book staging directory", err, "the operator was not told anything was stranded"
+        )
+        self.assertIn(staging.name, err, "the stranded directory's own path was not reported")
+
+        # Not deleted (the only copy of those tracks), and not silently
+        # completed into the library either — a staging directory can be
+        # partial, and finishing a partial one is exactly the half-a-book
+        # this PR exists to prevent.
+        self.assertTrue(staging.exists())
+        self.assertEqual(
+            sorted(p.name for p in staging.glob("*.mp3")), ["01.mp3", "02.mp3"]
+        )
+        self.assertFalse(dest_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
