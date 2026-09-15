@@ -56,6 +56,35 @@ services:
       - /mnt/1tb/shelfmark/quarantine:/quarantine
     user: "${PUID:-1001}:${PGID:-1001}"
     restart: unless-stopped
+    # The worker serves no HTTP of its own, and the image is python-slim --
+    # no curl (verified: only openssh-client/rsync/7zip/unrar-free are
+    # installed, for the Sullivan transfer, not for this). So this checks
+    # the one thing the worker can see locally: its own row in
+    # `worker_liveness` (see db.py migration 4 and worker.py's
+    # `_maybe_record_liveness`), refreshed every main-loop iteration
+    # including when idle. `Database.latest_worker_liveness()` is the same
+    # method /readyz calls, so the two can never disagree about what counts
+    # as stale. No row yet (a fresh volume, or a database from before this
+    # feature) exits 0 -- "never ticked" must never be reported the same as
+    # "stopped ticking", the same rule /readyz follows.
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - >-
+          import sys;
+          from datetime import datetime, timezone;
+          from shelfmark_service.config import Settings;
+          from shelfmark_service.db import Database;
+          s = Settings.from_env();
+          row = Database(s.database_path).latest_worker_liveness();
+          age = None if row is None else (datetime.now(timezone.utc) - datetime.fromisoformat(row["last_seen_at"])).total_seconds();
+          sys.exit(1 if (age is not None and age > s.worker_liveness_stale_seconds) else 0)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   shelfmark-bot:
     build: .

@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
+
+from fastapi import HTTPException
 
 from src.shelfmark_service.api import _job_response
-from src.shelfmark_service.db import Job
+from src.shelfmark_service.config import Settings
+from src.shelfmark_service.db import Database, Job
 
 
 def _job(**overrides: object) -> Job:
@@ -42,8 +48,6 @@ class JobResponseTests(unittest.TestCase):
         response = _job_response(_job(error_code=None))
         self.assertIsNone(response["code"])
 
-
-from unittest import mock
 
 from src.shelfmark_service import api as api_module
 
@@ -99,6 +103,68 @@ class BookOnlyCategoryTests(unittest.TestCase):
                 limit=50, offset=0, _actor="test",
             )
         self.assertEqual(fake.calls[0]["categories"], [7060])
+
+
+class ReadyzWorkerLivenessTests(unittest.TestCase):
+    """`/readyz` is the endpoint a monitoring probe (Uptime Kuma) actually
+    watches for a dead or wedged worker -- see api._worker_liveness's
+    docstring for why "no row yet" (unknown) and "old row" (stale) must
+    produce different outcomes, not collapse into one."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-readyz-test-")
+        self.database = Database(Path(self.tmp.name) / "shelfmark.db")
+        self.database.initialize()
+        self.settings = Settings(
+            database_path=self.database.path,
+            worker_liveness_stale_seconds=60.0,
+        )
+        db_patch = mock.patch.object(api_module, "database", self.database)
+        settings_patch = mock.patch.object(api_module, "settings", self.settings)
+        db_patch.start()
+        settings_patch.start()
+        self.addCleanup(db_patch.stop)
+        self.addCleanup(settings_patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_no_liveness_row_reports_unknown_and_stays_ready(self) -> None:
+        """A fresh deploy (or a database older than migration 4) must not be
+        reported as a stale worker -- see the brief's explicit constraint."""
+        response = api_module.readyz()
+        self.assertEqual(response["worker"]["status"], "unknown")
+        self.assertEqual(response["status"], "ready")
+
+    def test_fresh_liveness_row_reports_ok_and_names_the_worker(self) -> None:
+        self.database.record_liveness("worker-a")
+        response = api_module.readyz()
+        self.assertEqual(response["worker"]["status"], "ok")
+        self.assertEqual(response["worker"]["worker_id"], "worker-a")
+
+    def test_stale_liveness_row_fails_readyz_with_503(self) -> None:
+        """A 200 saying "stale" in the body is invisible to an uptime monitor
+        that only reads the status code -- this must be a non-2xx."""
+        self.database.record_liveness("worker-a")
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE worker_liveness SET last_seen_at = '2000-01-01T00:00:00+00:00' "
+                "WHERE worker_id = 'worker-a'"
+            )
+        with self.assertRaises(HTTPException) as ctx:
+            api_module.readyz()
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail["worker"]["status"], "stale")
+
+    def test_the_freshest_of_two_workers_is_reported(self) -> None:
+        self.database.record_liveness("worker-old")
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE worker_liveness SET last_seen_at = '2000-01-01T00:00:00+00:00' "
+                "WHERE worker_id = 'worker-old'"
+            )
+        self.database.record_liveness("worker-new")
+        response = api_module.readyz()
+        self.assertEqual(response["worker"]["worker_id"], "worker-new")
+        self.assertEqual(response["worker"]["status"], "ok")
 
 
 if __name__ == "__main__":

@@ -438,9 +438,9 @@ Acceptance criteria:
 - [x] Mount only required audiobook, ebook, staging, quarantine, and data paths. The SSH secret is mounted read-only.
 - [x] Run containers with the matching non-root UID/GID (1001:1001, matching the `actions` owner of the bind mounts).
 - [x] Use a private host port such as `8110`.
-- [~] Add health checks, restart policies, resource limits, and log rotation. Verified live: `restart=unless-stopped`, memory limits 512m/512m/256m, logs capped 10m x 3. **Only `shelfmark-api` has a health check** — the worker and bot have none, so a wedged worker looks healthy to Docker.
+- [~] Add health checks, restart policies, resource limits, and log rotation. Verified live: `restart=unless-stopped`, memory limits 512m/512m/256m, logs capped 10m x 3. **`shelfmark-worker` now has a Docker health check** (reads its own `worker_liveness` row locally — no curl in the python-slim image, and the worker serves no HTTP of its own). **The bot still has none.**
 - [x] Store secrets through Docker secrets or an external environment file. The Sullivan key is a Docker secret; the rest come from `.env`, written by the deploy from repository secrets.
-- [ ] Add Uptime Kuma checks for API, worker heartbeat, ABS, Prowlarr, and qBittorrent reachability. **Not done** — Kuma is running on Freddy but has no Shelfmark monitor. Now that the pipeline runs unattended this is the main blind spot.
+- [~] Add Uptime Kuma checks for API, worker heartbeat, ABS, Prowlarr, and qBittorrent reachability. **Worker heartbeat is now visible**: `/readyz` fails with 503 once the worker's `worker_liveness` row goes stale (`SHELFMARK_WORKER_LIVENESS_STALE_SECONDS`, default 180s) — see "Worker liveness monitoring" below. **Kuma itself still has no Shelfmark monitor configured** — someone needs to point an HTTP(s) check at `/readyz` and an ABS/Prowlarr/qBittorrent reachability check at Freddy; that configuration step is outside this repo.
 
 Acceptance criteria:
 

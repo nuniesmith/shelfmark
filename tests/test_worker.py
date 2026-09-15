@@ -28,6 +28,7 @@ from src.shelfmark_service.worker import (
     Worker,
     _is_torrent_complete,
     _maybe_enqueue_reconcile,
+    _maybe_record_liveness,
     _release_download_source,
     _split_webhook_url,
 )
@@ -912,6 +913,43 @@ class MaybeEnqueueReconcileTests(WorkerTestCase):
         result = _maybe_enqueue_reconcile(self.database, settings, now=1000.0, last_reconcile=0.0)
         self.assertEqual(result, 0.0)
         self.assertFalse(self.database.has_active_job("reconcile_downloads"))
+
+
+class MaybeRecordLivenessTests(WorkerTestCase):
+    """The idle-worker case per-job heartbeats miss: see worker.py's
+    `_maybe_record_liveness` docstring for the throttling rationale."""
+
+    def test_first_call_writes_regardless_of_the_zero_sentinel(self) -> None:
+        """`main()` seeds `last_liveness = 0.0` so the very first loop
+        iteration always writes -- a fresh deploy's worker must not wait a
+        full poll interval before it becomes visible to /readyz."""
+        settings = Settings(poll_interval=2.0, worker_id="worker-a")
+        result = _maybe_record_liveness(self.database, settings, now=100.0, last_liveness=0.0)
+        self.assertEqual(result, 100.0)
+        row = self.database.latest_worker_liveness()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["worker_id"], "worker-a")
+
+    def test_does_not_write_again_inside_the_poll_interval(self) -> None:
+        settings = Settings(poll_interval=2.0, worker_id="worker-a")
+        first = _maybe_record_liveness(self.database, settings, now=100.0, last_liveness=0.0)
+        # 1 second later is inside the 2-second poll interval.
+        second = _maybe_record_liveness(self.database, settings, now=101.0, last_liveness=first)
+        self.assertEqual(second, first)  # timer unchanged: the throttle held
+
+    def test_writes_again_once_the_poll_interval_elapses(self) -> None:
+        settings = Settings(poll_interval=2.0, worker_id="worker-a")
+        first = _maybe_record_liveness(self.database, settings, now=100.0, last_liveness=0.0)
+        second = _maybe_record_liveness(self.database, settings, now=103.0, last_liveness=first)
+        self.assertEqual(second, 103.0)
+
+    def test_two_different_worker_ids_each_get_their_own_row(self) -> None:
+        _maybe_record_liveness(self.database, Settings(worker_id="worker-a"), now=100.0, last_liveness=0.0)
+        _maybe_record_liveness(self.database, Settings(worker_id="worker-b"), now=100.0, last_liveness=0.0)
+        with self.database.connect() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM worker_liveness").fetchone()[0]
+        self.assertEqual(count, 2)
 
 
 if __name__ == "__main__":

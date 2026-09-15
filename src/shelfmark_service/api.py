@@ -10,6 +10,7 @@ from __future__ import annotations
 import secrets
 import urllib.parse
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -181,6 +182,37 @@ def healthz() -> dict[str, str]:
     return {"status": "ok", "service": "shelfmark"}
 
 
+def _worker_liveness() -> dict[str, Any]:
+    """Classify the freshest `worker_liveness` row against the staleness threshold.
+
+    Three outcomes, not two -- see `Database.latest_worker_liveness`'s
+    docstring for why "no row" must never be reported the same as "stale":
+
+    - `unknown`: no worker has ever ticked (a database from before migration
+      4, or a worker container that has not completed a loop iteration yet
+      -- at most a fraction of a second into a fresh deploy, since
+      worker.py's `main()` writes its first liveness row before claiming any
+      job). Reporting this as failure would fail /readyz on every upgrade
+      and the first moment of every deploy -- worse than no check at all,
+      since it trains whoever gets paged to ignore it.
+    - `ok`: the freshest row is newer than `worker_liveness_stale_seconds`.
+    - `stale`: it is older -- something that WAS alive has gone quiet longer
+      than a normal idle tick or an ordinary job takes. This is the actual
+      "dead or wedged worker" this feature exists to surface.
+    """
+    row = database.latest_worker_liveness()
+    if row is None:
+        return {"status": "unknown", "worker_id": None, "last_seen_at": None}
+    last_seen = datetime.fromisoformat(row["last_seen_at"])
+    age_seconds = (datetime.now(timezone.utc) - last_seen).total_seconds()
+    return {
+        "status": "ok" if age_seconds <= settings.worker_liveness_stale_seconds else "stale",
+        "worker_id": row["worker_id"],
+        "last_seen_at": row["last_seen_at"],
+        "age_seconds": round(age_seconds, 1),
+    }
+
+
 @app.get("/readyz")
 def readyz() -> dict[str, Any]:
     try:
@@ -190,7 +222,20 @@ def readyz() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail={"status": "not_ready", "error": str(exc)}) from exc
     if missing:
         raise HTTPException(status_code=503, detail={"status": "not_ready", "missing": missing})
-    return {"status": "ready", "database": str(settings.database_path)}
+    worker = _worker_liveness()
+    if worker["status"] == "stale":
+        # A 200 saying "worker stale" in the body is invisible to a plain
+        # HTTP-up monitor (Uptime Kuma included) -- it only reads the status
+        # code. /readyz, not /healthz, is where this belongs: the API
+        # process itself is fine (that's what /healthz asserts, and it must
+        # keep asserting only that -- Compose's own healthcheck for
+        # shelfmark-api targets /healthz, and restarting the API container
+        # would do nothing to revive a dead worker in a different
+        # container). A stale worker is exactly the kind of "a dependency
+        # this service relies on is unavailable" fact /readyz already
+        # reports for missing media roots, so it fails the same way: 503.
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "worker": worker})
+    return {"status": "ready", "database": str(settings.database_path), "worker": worker}
 
 
 @app.get("/api/v1/library/search")

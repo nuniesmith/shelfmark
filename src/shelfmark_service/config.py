@@ -113,6 +113,20 @@ class Settings:
     transfer_poll_seconds: float = 5.0
     transfer_timeout_seconds: float = 3600.0
     worker_stale_seconds: float = 900.0
+    # How long a worker's `worker_liveness` row (see db.py migration 4) may go
+    # unrefreshed before /readyz and the worker's own Docker healthcheck call
+    # it stale. This is deliberately a SEPARATE knob from `worker_stale_seconds`
+    # above: that one gates reaping an abandoned RUNNING JOB back onto the
+    # queue (a 900s default chosen to tolerate a slow-but-alive job), while
+    # this one gates a liveness signal ticked once per poll loop -- most of
+    # which are idle. Defaulted to 3x the reconcile interval (60s default) so
+    # normal idle ticking (every `SHELFMARK_WORKER_POLL_SECONDS`, default 2s)
+    # or an ordinary quick job never trips it, while a genuinely wedged
+    # worker is still caught within a few minutes rather than waiting for the
+    # much more conservative 900s job reaper. A threshold at or below the
+    # poll/tick rate would flap on every idle cycle, reporting "stale"
+    # between two perfectly normal writes.
+    worker_liveness_stale_seconds: float = 180.0
     # Off switch for the whole grab->transfer->organize->scan chain: an
     # operator who needs to stop automatic imports (a bad release flooding
     # retries, a library reorganization in progress) flips one env var and
@@ -173,6 +187,9 @@ class Settings:
             transfer_poll_seconds=_float_from_env("SHELFMARK_TRANSFER_POLL_SECONDS", 5.0),
             transfer_timeout_seconds=_float_from_env("SHELFMARK_TRANSFER_TIMEOUT_SECONDS", 3600.0),
             worker_stale_seconds=_float_from_env("SHELFMARK_WORKER_STALE_SECONDS", 900.0),
+            worker_liveness_stale_seconds=_float_from_env(
+                "SHELFMARK_WORKER_LIVENESS_STALE_SECONDS", 180.0
+            ),
             download_automation_enabled=_bool_from_env("SHELFMARK_DOWNLOAD_AUTOMATION_ENABLED", True),
             reconcile_interval_seconds=_float_from_env("SHELFMARK_RECONCILE_INTERVAL_SECONDS", 60.0),
             discord_webhook_url=os.environ.get("SHELFMARK_DISCORD_WEBHOOK_URL") or None,

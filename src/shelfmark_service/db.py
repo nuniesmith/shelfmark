@@ -157,6 +157,31 @@ class Database:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (3, utc_now()),
                 )
+            # Migration 4: one row per worker recording "I am alive", refreshed
+            # every main-loop iteration (see worker.py's `_maybe_record_liveness`)
+            # -- including when the queue is empty, which `jobs.heartbeat_at`
+            # never covers because that column only exists on a RUNNING job
+            # row. Without this, an idle worker and a dead one write exactly
+            # nothing, either way, so a monitoring probe cannot tell "nothing
+            # to do" from "nobody is home". `worker_id` is the primary key
+            # rather than a single fixed row so a second worker -- a manual
+            # scale-out, or two containers briefly overlapping during a
+            # deploy -- gets its own row instead of the two clobbering each
+            # other's timestamp.
+            if conn.execute("SELECT 1 FROM schema_migrations WHERE version = 4").fetchone() is None:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS worker_liveness (
+                        worker_id TEXT PRIMARY KEY,
+                        pid INTEGER,
+                        last_seen_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (4, utc_now()),
+                )
 
     @staticmethod
     def _audit(
@@ -477,3 +502,51 @@ class Database:
                     details={"requeued_at": now},
                 )
             return len(rows)
+
+    def record_liveness(self, worker_id: str, pid: int | None = None) -> None:
+        """Upsert this worker's row in `worker_liveness`.
+
+        Called once per main-loop iteration (see worker.py's
+        `_maybe_record_liveness`), not once per job. That distinction is the
+        entire point of this table: `heartbeat()` above only ever touches a
+        RUNNING job row, so a worker sitting idle with an empty queue writes
+        nothing there -- indistinguishable, to any caller, from a worker that
+        crashed. This is deliberately a small, separate write rather than
+        piggybacking on the jobs table, so it means the same thing whether or
+        not a job happens to be in flight.
+        """
+        now = utc_now()
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_liveness(worker_id, pid, last_seen_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(worker_id) DO UPDATE SET
+                    pid = excluded.pid,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (worker_id, pid, now),
+            )
+
+    def latest_worker_liveness(self) -> dict[str, Any] | None:
+        """The most recently updated `worker_liveness` row, across every worker_id.
+
+        Returns None both when no worker has ever ticked AND when the table
+        itself does not exist yet -- an older database from before migration 4,
+        or a brand-new one whose worker container has not reached
+        `initialize()` for the first time yet. Both situations mean exactly
+        the same thing to a caller ("no liveness data exists") and must read
+        as unknown rather than stale: `/readyz` and the worker's own Docker
+        healthcheck command (see the Dockerfile-adjacent compose healthcheck)
+        both call this single method instead of each re-implementing that
+        distinction and risking the two disagreeing.
+        """
+        with closing(self.connect()) as conn:
+            try:
+                row = conn.execute(
+                    "SELECT worker_id, pid, last_seen_at FROM worker_liveness "
+                    "ORDER BY last_seen_at DESC LIMIT 1"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+        return dict(row) if row else None
