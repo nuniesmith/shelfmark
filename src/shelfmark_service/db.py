@@ -157,6 +157,31 @@ class Database:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (3, utc_now()),
                 )
+            # Migration 4: one row per worker recording "I am alive", refreshed
+            # every main-loop iteration (see worker.py's `_maybe_record_liveness`)
+            # -- including when the queue is empty, which `jobs.heartbeat_at`
+            # never covers because that column only exists on a RUNNING job
+            # row. Without this, an idle worker and a dead one write exactly
+            # nothing, either way, so a monitoring probe cannot tell "nothing
+            # to do" from "nobody is home". `worker_id` is the primary key
+            # rather than a single fixed row so a second worker -- a manual
+            # scale-out, or two containers briefly overlapping during a
+            # deploy -- gets its own row instead of the two clobbering each
+            # other's timestamp.
+            if conn.execute("SELECT 1 FROM schema_migrations WHERE version = 4").fetchone() is None:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS worker_liveness (
+                        worker_id TEXT PRIMARY KEY,
+                        pid INTEGER,
+                        last_seen_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (4, utc_now()),
+                )
 
     @staticmethod
     def _audit(
@@ -477,3 +502,151 @@ class Database:
                     details={"requeued_at": now},
                 )
             return len(rows)
+
+    def record_liveness(self, worker_id: str, pid: int | None = None) -> None:
+        """Upsert this worker's row in `worker_liveness`.
+
+        Called once per main-loop iteration (see worker.py's
+        `_maybe_record_liveness`), not once per job. That distinction is the
+        entire point of this table: `heartbeat()` above only ever touches a
+        RUNNING job row, so a worker sitting idle with an empty queue writes
+        nothing there -- indistinguishable, to any caller, from a worker that
+        crashed. This is deliberately a small, separate write rather than
+        piggybacking on the jobs table, so it means the same thing whether or
+        not a job happens to be in flight.
+        """
+        now = utc_now()
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_liveness(worker_id, pid, last_seen_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(worker_id) DO UPDATE SET
+                    pid = excluded.pid,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (worker_id, pid, now),
+            )
+
+    def latest_worker_liveness(self) -> dict[str, Any] | None:
+        """The most recently updated `worker_liveness` row, across every worker_id.
+
+        Returns None both when no worker has ever ticked AND when the table
+        itself does not exist yet -- an older database from before migration 4,
+        or a brand-new one whose worker container has not reached
+        `initialize()` for the first time yet. Both situations mean exactly
+        the same thing to a caller ("no liveness data exists") and must read
+        as unknown rather than stale: `/readyz` and the worker's own Docker
+        healthcheck command (see the Dockerfile-adjacent compose healthcheck)
+        both call this single method instead of each re-implementing that
+        distinction and risking the two disagreeing.
+        """
+        with closing(self.connect()) as conn:
+            try:
+                row = conn.execute(
+                    "SELECT worker_id, pid, last_seen_at FROM worker_liveness "
+                    "ORDER BY last_seen_at DESC LIMIT 1"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+        return dict(row) if row else None
+
+    def youngest_running_job_started_at(self) -> str | None:
+        """The most recent `started_at` among currently RUNNING jobs, or None.
+
+        `Worker.run_once` executes exactly one job to completion, synchronously,
+        before the main loop returns to write another `worker_liveness` row
+        (see `_maybe_record_liveness`) -- so a single long job (a big
+        `transfer_completed` pull, its settle wait, then its checksum verify)
+        can legitimately leave that row unrefreshed for the job's entire
+        duration with nothing wrong. `/readyz` uses this to tell that case
+        apart from an actually dead or wedged worker: a RUNNING job that
+        started recently is itself evidence someone is home, even though the
+        liveness row alone looks stale. `MAX(started_at)` picks the most
+        favorable evidence available -- the freshest running job, in the rare
+        case more than one exists (e.g. two worker containers briefly
+        overlapping) -- since any one sufficiently recent running job is
+        enough to explain the silence.
+        """
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(started_at) AS started_at FROM jobs WHERE status = 'running'"
+            ).fetchone()
+        return row["started_at"] if row and row["started_at"] else None
+
+    def worker_liveness_status(
+        self, stale_after_seconds: float, running_job_bound_seconds: float
+    ) -> dict[str, Any]:
+        """Classify this worker fleet's liveness: `unknown` / `ok` / `busy` / `stale`.
+
+        This is the ONE implementation of the rule, called by both
+        api.py's `/readyz` and worker.py's `check_liveness_cli` (the
+        `shelfmark-worker` Docker healthcheck). It used to be two: `/readyz`
+        had this exact logic, and the Docker healthcheck was a separate
+        inline `python -c` one-liner that only checked liveness age with no
+        busy-job exception -- which meant `docker ps` reported
+        `shelfmark-worker` as unhealthy during any legitimately long
+        transfer, even after `/readyz` was fixed to say `busy` for the same
+        situation. Two health signals disagreeing is worse than either
+        alone, since now the operator has to know which one lies -- and
+        `docker ps` is the one people check first. Sharing this method is
+        what makes that impossible to reintroduce: there is nowhere left
+        for the two to drift apart.
+
+        Four outcomes:
+
+        - `unknown`: no worker has EVER ticked -- a database from before
+          migration 4, or a worker container a fraction of a second into
+          startup, before its first loop iteration. Must never read as
+          `stale`: that would fail every upgrade and the first moment of
+          every deploy.
+        - `ok`: the freshest `worker_liveness` row is within
+          `stale_after_seconds`.
+        - `busy`: that row is older, but a job is `running` that started
+          within `running_job_bound_seconds`. `Worker.run_once` executes
+          one job to completion synchronously -- no threads -- so a big
+          transfer's pull, settle-wait, and checksum verify can together
+          outlast `stale_after_seconds` with the worker perfectly healthy
+          the whole time; nothing refreshes `worker_liveness` until that
+          job returns. Reporting this as `stale` pages for a routine
+          import, and an alert that fires when nothing is wrong trains
+          whoever gets paged to ignore it.
+        - `stale`: the row is older AND either no job is running or the
+          running job itself started longer ago than
+          `running_job_bound_seconds`. That second half is deliberate, not
+          a loophole: a job stuck in `running` past its own ceiling is no
+          longer credible evidence of anything -- it either genuinely
+          overran, or the worker died mid-job and left the row stuck in
+          `running` forever, which is exactly the "wedged worker hides
+          behind a permanently running job" failure this bound exists to
+          still catch.
+        """
+        row = self.latest_worker_liveness()
+        if row is None:
+            return {"status": "unknown", "worker_id": None, "last_seen_at": None}
+        last_seen = datetime.fromisoformat(row["last_seen_at"])
+        age_seconds = (datetime.now(timezone.utc) - last_seen).total_seconds()
+        if age_seconds <= stale_after_seconds:
+            return {
+                "status": "ok",
+                "worker_id": row["worker_id"],
+                "last_seen_at": row["last_seen_at"],
+                "age_seconds": round(age_seconds, 1),
+            }
+        started_at = self.youngest_running_job_started_at()
+        if started_at is not None:
+            job_age_seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
+            if job_age_seconds <= running_job_bound_seconds:
+                return {
+                    "status": "busy",
+                    "worker_id": row["worker_id"],
+                    "last_seen_at": row["last_seen_at"],
+                    "age_seconds": round(age_seconds, 1),
+                    "running_job_age_seconds": round(job_age_seconds, 1),
+                }
+        return {
+            "status": "stale",
+            "worker_id": row["worker_id"],
+            "last_seen_at": row["last_seen_at"],
+            "age_seconds": round(age_seconds, 1),
+        }

@@ -6,6 +6,7 @@ import logging
 import os
 import posixpath
 import signal
+import sys
 import time
 import urllib.parse
 from pathlib import Path
@@ -767,6 +768,44 @@ class Worker:
             logger.warning("Discord webhook notification failed", exc_info=True)
 
 
+def _maybe_record_liveness(database: Database, settings: Settings, now: float, last_liveness: float) -> float:
+    """Write this worker's `worker_liveness` row if the throttle window has elapsed.
+
+    Returns the new timer value, mirroring `_maybe_enqueue_reconcile` below
+    in every respect: `now`/`last_liveness` are both `time.monotonic()`
+    values, not wall clock, for the same reason -- a system clock step must
+    never cause a burst of skipped or duplicated writes -- and it is split
+    out from `main()` so a test can exercise "is a write due" without an
+    actual infinite loop running.
+
+    Throttled to once per `poll_interval` rather than on every single call:
+    when the queue is empty, `run_once()` returns False and the loop already
+    sleeps `poll_interval` before calling this again, so the throttle changes
+    nothing in that steady state -- it still writes every idle iteration,
+    which is the case per-job heartbeats miss. It only matters when jobs are
+    queued back to back with no sleep between them: without it, a backlog of
+    many quick jobs (metadata_*, grab_release, reconcile_downloads) would
+    write this row once per job for no benefit, since /readyz only needs to
+    know the worker ticked SOME time inside `worker_liveness_stale_seconds`,
+    not the exact millisecond of its most recent job. A single-row upsert is
+    cheap on its own (SQLite WAL, no fsync under synchronous=NORMAL), but a
+    deep backlog of sub-second jobs could otherwise turn this into thousands
+    of extra writes with zero effect on what any monitor would observe.
+
+    Note this does NOT tick while a single job is actually executing --
+    `run_once()` runs one job to completion synchronously (see the module
+    docstring for why: single process, no threads), so a long transfer job
+    blocks the loop, and with it this write, for its whole duration. That
+    job's own `heartbeat_at` (set at claim and at completion) is the signal
+    for that case; this table exists specifically for the gap heartbeats
+    leave, an EMPTY queue, not to add a second clock ticking mid-job.
+    """
+    if now - last_liveness < settings.poll_interval:
+        return last_liveness
+    database.record_liveness(settings.worker_id, pid=os.getpid())
+    return now
+
+
 def _maybe_enqueue_reconcile(database: Database, settings: Settings, now: float, last_reconcile: float) -> float:
     """Enqueue a `reconcile_downloads` job if one is due, returning the new timer value.
 
@@ -818,14 +857,49 @@ def main() -> None:
     signal.signal(signal.SIGINT, stop)
     # 0.0 is always "due": `time.monotonic()` starts counting from an
     # arbitrary epoch that is never negative, and this guarantees the first
-    # loop iteration considers a reconcile rather than waiting a full
-    # SHELFMARK_RECONCILE_INTERVAL_SECONDS after every restart.
+    # loop iteration considers a reconcile -- and records this worker's first
+    # liveness row -- rather than waiting a full interval after every
+    # restart. A fresh deploy's very first liveness write happens here,
+    # before the loop has claimed a single job, which is what keeps the
+    # "never seen" window (see db.py's `latest_worker_liveness`) to well
+    # under a second rather than a full `worker_liveness_stale_seconds`.
     last_reconcile = 0.0
+    last_liveness = 0.0
     while not stopping:
         database.requeue_stale(settings.worker_stale_seconds, actor=settings.worker_id)
-        last_reconcile = _maybe_enqueue_reconcile(database, settings, time.monotonic(), last_reconcile)
+        now = time.monotonic()
+        last_liveness = _maybe_record_liveness(database, settings, now, last_liveness)
+        last_reconcile = _maybe_enqueue_reconcile(database, settings, now, last_reconcile)
         if not worker.run_once():
             time.sleep(settings.poll_interval)
+
+
+def check_liveness_cli() -> None:
+    """Console entry point for the `shelfmark-worker` Docker healthcheck.
+
+    Exits 0 for `unknown`/`ok`/`busy` (nothing wrong, or too soon to judge),
+    1 for `stale`. This calls `Database.worker_liveness_status` -- the exact
+    same classifier `/readyz` uses in api.py -- rather than re-implementing
+    any part of the rule here.
+
+    This used to be an inline `python -c` one-liner directly in
+    docker-compose.yml, checking only `worker_liveness` age with no
+    exception for a job that is legitimately still running. That meant
+    `docker ps` reported `shelfmark-worker` as unhealthy during any long
+    transfer even after `/readyz` was fixed to say `busy` for the very same
+    situation -- two health signals disagreeing, which is worse than either
+    alone, since it teaches an operator not to trust the one they check
+    first. A one-liner also could not grow the busy-job exception without
+    becoming unreadable and untestable. A named entry point fixes both: the
+    compose healthcheck becomes one word, and this function is unit-testable
+    like everything else in this module.
+    """
+    settings = Settings.from_env()
+    database = Database(settings.database_path)
+    status = database.worker_liveness_status(
+        settings.worker_liveness_stale_seconds, settings.transfer_timeout_seconds
+    )["status"]
+    sys.exit(1 if status == "stale" else 0)
 
 
 if __name__ == "__main__":

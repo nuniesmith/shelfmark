@@ -181,6 +181,20 @@ def healthz() -> dict[str, str]:
     return {"status": "ok", "service": "shelfmark"}
 
 
+def _worker_liveness() -> dict[str, Any]:
+    """The `worker` object /readyz reports: unknown / ok / busy / stale.
+
+    A thin wrapper around `Database.worker_liveness_status` -- the ONE
+    implementation of this rule, shared with worker.py's
+    `check_liveness_cli` (the `shelfmark-worker` Docker healthcheck). See
+    that method's docstring for the full rule and for why it used to be
+    two separate implementations that could (and did) disagree.
+    """
+    return database.worker_liveness_status(
+        settings.worker_liveness_stale_seconds, settings.transfer_timeout_seconds
+    )
+
+
 @app.get("/readyz")
 def readyz() -> dict[str, Any]:
     try:
@@ -190,7 +204,20 @@ def readyz() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail={"status": "not_ready", "error": str(exc)}) from exc
     if missing:
         raise HTTPException(status_code=503, detail={"status": "not_ready", "missing": missing})
-    return {"status": "ready", "database": str(settings.database_path)}
+    worker = _worker_liveness()
+    if worker["status"] == "stale":
+        # A 200 saying "worker stale" in the body is invisible to a plain
+        # HTTP-up monitor (Uptime Kuma included) -- it only reads the status
+        # code. /readyz, not /healthz, is where this belongs: the API
+        # process itself is fine (that's what /healthz asserts, and it must
+        # keep asserting only that -- Compose's own healthcheck for
+        # shelfmark-api targets /healthz, and restarting the API container
+        # would do nothing to revive a dead worker in a different
+        # container). A stale worker is exactly the kind of "a dependency
+        # this service relies on is unavailable" fact /readyz already
+        # reports for missing media roots, so it fails the same way: 503.
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "worker": worker})
+    return {"status": "ready", "database": str(settings.database_path), "worker": worker}
 
 
 @app.get("/api/v1/library/search")

@@ -338,6 +338,89 @@ the source of truth.
 manual paths — `/transfers/pull`, `/organize-preview`, `/scan` — are
 unaffected either way.
 
+**Worker liveness monitoring.** Running unattended only helps if a dead or
+wedged worker is actually visible somewhere. `jobs.heartbeat_at` only exists
+on a RUNNING job row, so a worker sitting idle with an empty queue (the
+normal state, most of the time) writes nothing there — indistinguishable
+from a crashed one. The worker now records its own liveness in a small
+`worker_liveness` table (schema migration 4) once per main-loop iteration —
+including when idle — keyed by `worker_id`, so a second worker never
+clobbers the first's row. Two ways this surfaces:
+
+- `GET /readyz` includes a `worker` object (`status`: `unknown` / `ok` /
+  `busy` / `stale`, plus `worker_id`, `last_seen_at`, `age_seconds`) and
+  returns **503** only for `stale`. A 200 with "stale" in the body would be
+  invisible to an uptime monitor that only reads the status code, so a
+  stale worker fails the same way `/readyz` already fails for a missing
+  media root — and it stays on `/readyz`, not `/healthz`: the API process
+  itself is fine even when the worker is dead, and `shelfmark-api`'s own
+  Docker healthcheck targets `/healthz` specifically, so a stale worker
+  never makes Docker think the *API* container needs restarting.
+  **`unknown`** (no row at all) is reported whenever no worker has ever
+  ticked yet — a database from before migration 4, or a fresh deploy in the
+  first fraction of a second before the worker container completes its
+  first loop — and never fails `/readyz`.
+- The `shelfmark-worker` container has its own Docker `healthcheck` now
+  too: `shelfmark-worker-healthcheck`, a console entry point (alongside
+  `shelfmark-api`/`shelfmark-worker`/`shelfmark-bot`) installed by
+  `pyproject.toml` and wired into `docker-compose.yml`'s `test:` as one
+  word. The image is python-slim with no `curl` (only `openssh-client`,
+  `rsync`, `7zip`, and `unrar-free` are installed, for the Sullivan
+  transfer), and the worker serves no HTTP of its own, so it reads
+  `worker_liveness` straight out of SQLite instead.
+
+**One classifier, not two.** Both surfaces above call the exact same
+`Database.worker_liveness_status(stale_after_seconds, running_job_bound_seconds)`
+— `/readyz` from `api.py`, `shelfmark-worker-healthcheck` from
+`worker.py`'s `check_liveness_cli`. Early on the healthcheck was a separate
+inline `python -c` one-liner that only checked liveness age, and that
+mismatch actually shipped for a moment: `docker ps` reported
+`shelfmark-worker` as `unhealthy` during a legitimate long transfer even
+after `/readyz` had already been fixed to report `busy` for the exact same
+situation. Two health signals disagreeing is worse than either alone —
+`docker ps` is the reflex check when something seems wrong, and a
+container that routinely shows unhealthy while working normally teaches
+the operator the column means nothing. There is now exactly one
+implementation of the rule, so the two cannot drift apart again.
+
+**The busy-worker case, and the bound that still catches it.**
+`Worker.run_once` runs one job to completion synchronously — no threads —
+so a big `transfer_completed` pull, its 30s settle-wait, and its
+`--checksum` verify pass can together outlast `worker_liveness_stale_seconds`
+(default `180`, three times the reconcile interval) with the worker
+perfectly healthy the whole time; nothing refreshes `worker_liveness` until
+that job returns. Reporting that as `stale` would page for a routine
+import, and an alert that fires when nothing is wrong trains whoever gets
+paged to ignore it — worse than no check at all. So a stale
+`worker_liveness` row is not immediately `stale`: the classifier also
+checks the `jobs` table for a `running` job. One that started within
+`SHELFMARK_TRANSFER_TIMEOUT_SECONDS` (the longest any single job is meant
+to take, already configured) reports `busy` and stays healthy — that job's
+own `started_at` is itself evidence someone is home. A `running` job
+older than that bound is no longer credible evidence of anything: either
+it genuinely overran its own ceiling, or the worker died mid-job and left
+the row stuck in `running` forever — exactly the "wedged worker hides
+behind a permanently running job" failure this bound exists to still
+catch, so that case reports `stale` regardless.
+
+Writing the liveness row on every loop iteration is throttled to at most
+once per `SHELFMARK_WORKER_POLL_SECONDS` (default 2s): when idle, the loop
+already sleeps that long between iterations so nothing changes; the
+throttle only matters when many quick jobs run back to back with no sleep
+in between, where it caps this at one small SQLite upsert per poll interval
+instead of one per job.
+
+**Known gaps, left out of scope for this feature:**
+
+- No retention policy on `jobs` or `audit_events`. The live database
+  reached roughly 801 job rows after about one day, almost entirely
+  `reconcile_downloads` ticking every `SHELFMARK_RECONCILE_INTERVAL_SECONDS`
+  (default 60s). Nothing here causes that growth, but this feature is what
+  makes anyone actually look at that table, so it is worth flagging: there
+  is currently nothing that prunes old, finished job or audit rows.
+- `shelfmark-bot` still has no Docker `healthcheck` at all — only
+  `shelfmark-api` and now `shelfmark-worker` do.
+
 ## CLI options
 
 | Flag | Description |

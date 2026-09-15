@@ -28,8 +28,10 @@ from src.shelfmark_service.worker import (
     Worker,
     _is_torrent_complete,
     _maybe_enqueue_reconcile,
+    _maybe_record_liveness,
     _release_download_source,
     _split_webhook_url,
+    check_liveness_cli,
 )
 
 
@@ -912,6 +914,127 @@ class MaybeEnqueueReconcileTests(WorkerTestCase):
         result = _maybe_enqueue_reconcile(self.database, settings, now=1000.0, last_reconcile=0.0)
         self.assertEqual(result, 0.0)
         self.assertFalse(self.database.has_active_job("reconcile_downloads"))
+
+
+class MaybeRecordLivenessTests(WorkerTestCase):
+    """The idle-worker case per-job heartbeats miss: see worker.py's
+    `_maybe_record_liveness` docstring for the throttling rationale."""
+
+    def test_first_call_writes_regardless_of_the_zero_sentinel(self) -> None:
+        """`main()` seeds `last_liveness = 0.0` so the very first loop
+        iteration always writes -- a fresh deploy's worker must not wait a
+        full poll interval before it becomes visible to /readyz."""
+        settings = Settings(poll_interval=2.0, worker_id="worker-a")
+        result = _maybe_record_liveness(self.database, settings, now=100.0, last_liveness=0.0)
+        self.assertEqual(result, 100.0)
+        row = self.database.latest_worker_liveness()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["worker_id"], "worker-a")
+
+    def test_does_not_write_again_inside_the_poll_interval(self) -> None:
+        settings = Settings(poll_interval=2.0, worker_id="worker-a")
+        first = _maybe_record_liveness(self.database, settings, now=100.0, last_liveness=0.0)
+        # 1 second later is inside the 2-second poll interval.
+        second = _maybe_record_liveness(self.database, settings, now=101.0, last_liveness=first)
+        self.assertEqual(second, first)  # timer unchanged: the throttle held
+
+    def test_writes_again_once_the_poll_interval_elapses(self) -> None:
+        settings = Settings(poll_interval=2.0, worker_id="worker-a")
+        first = _maybe_record_liveness(self.database, settings, now=100.0, last_liveness=0.0)
+        second = _maybe_record_liveness(self.database, settings, now=103.0, last_liveness=first)
+        self.assertEqual(second, 103.0)
+
+    def test_two_different_worker_ids_each_get_their_own_row(self) -> None:
+        _maybe_record_liveness(self.database, Settings(worker_id="worker-a"), now=100.0, last_liveness=0.0)
+        _maybe_record_liveness(self.database, Settings(worker_id="worker-b"), now=100.0, last_liveness=0.0)
+        with self.database.connect() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM worker_liveness").fetchone()[0]
+        self.assertEqual(count, 2)
+
+
+class CheckLivenessCliTests(unittest.TestCase):
+    """`shelfmark-worker-healthcheck` (the Docker healthcheck command,
+    wired in pyproject.toml) -- must classify through the exact same
+    `Database.worker_liveness_status` /readyz uses. This replaced an inline
+    `python -c` one-liner in docker-compose.yml that checked liveness age
+    only, with no exception for a job legitimately still running: that
+    meant `docker ps` reported `shelfmark-worker` unhealthy during any long
+    transfer even after `/readyz` was fixed to say `busy` for the same
+    situation. These tests exist specifically to keep that from coming
+    back for THIS entry point too."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-healthcheck-cli-test-")
+        self.db_path = Path(self.tmp.name) / "shelfmark.db"
+        self.database = Database(self.db_path)
+        self.database.initialize()
+        env_patch = mock.patch.dict(
+            "os.environ",
+            {
+                "SHELFMARK_DB_PATH": str(self.db_path),
+                "SHELFMARK_WORKER_LIVENESS_STALE_SECONDS": "60",
+                "SHELFMARK_TRANSFER_TIMEOUT_SECONDS": "500",
+            },
+        )
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _age_liveness(self, worker_id: str) -> None:
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE worker_liveness SET last_seen_at = '2000-01-01T00:00:00+00:00' "
+                "WHERE worker_id = ?",
+                (worker_id,),
+            )
+
+    def test_exits_zero_when_no_worker_has_ever_ticked(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_exits_zero_for_a_fresh_liveness_row(self) -> None:
+        self.database.record_liveness("worker-a")
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_exits_one_for_a_stale_row_with_no_running_job(self) -> None:
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_exits_zero_for_a_stale_row_with_a_recently_started_running_job(self) -> None:
+        """The exact case that must not regress: a legitimate long transfer
+        must not flip `docker ps` to unhealthy."""
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        self.database.enqueue("transfer_completed", {"remote_path": "Some Book"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_exits_one_for_a_stale_row_with_an_old_running_job(self) -> None:
+        """A job stuck in `running` past its own timeout ceiling must not
+        hide a dead worker from `docker ps` forever."""
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        self.database.enqueue("transfer_completed", {"remote_path": "Some Book"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET started_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                (claimed.id,),
+            )
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 1)
 
 
 if __name__ == "__main__":

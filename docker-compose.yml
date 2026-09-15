@@ -56,6 +56,24 @@ services:
       - /mnt/1tb/shelfmark/quarantine:/quarantine
     user: "${PUID:-1001}:${PGID:-1001}"
     restart: unless-stopped
+    # The worker serves no HTTP of its own, and the image is python-slim --
+    # no curl (verified: only openssh-client/rsync/7zip/unrar-free are
+    # installed, for the Sullivan transfer, not for this). `shelfmark-worker-
+    # healthcheck` (installed by pyproject.toml, see worker.py's
+    # `check_liveness_cli`) reads the worker's own `worker_liveness` row
+    # locally through the exact same `Database.worker_liveness_status`
+    # classifier `/readyz` uses -- previously this was an inline `python -c`
+    # one-liner that checked liveness age only, with no exception for a job
+    # still legitimately running, so `docker ps` showed `unhealthy` during
+    # any long transfer even after `/readyz` was fixed to say `busy` for the
+    # same situation. One shared classifier is what keeps that from
+    # happening again.
+    healthcheck:
+      test: ["CMD", "shelfmark-worker-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   shelfmark-bot:
     build: .

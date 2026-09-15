@@ -22,6 +22,7 @@ shelfmark = "main:main"
 shelfmark-fix-metadata = "fix_metadata:main"
 shelfmark-api = "shelfmark_service.api:main"
 shelfmark-worker = "shelfmark_service.worker:main"
+shelfmark-worker-healthcheck = "shelfmark_service.worker:check_liveness_cli"
 shelfmark-bot = "shelfmark_service.discord_bot:main"
 
 [tool.setuptools]
