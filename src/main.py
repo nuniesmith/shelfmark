@@ -132,7 +132,7 @@ QUALITY_RE = re.compile(
         |
         \b(?:64|96|128|192|224|256|320)k\b
         |
-        \b(?:mp3|m4b|m4a|flac|opus)\b
+        \b(?:mp3|m4b|m4a|flac|opus|epub|mobi|azw3|pdf)\b
         |
         \[\s*(?:unabridged|abridged|audiobook|retail|explicit)\s*\]
     )""",
@@ -888,7 +888,9 @@ def apply_known_titles(meta: Meta) -> Meta:
 
 
 def normalize_meta(meta: Meta, book_dir: Path, source: Path) -> Meta:
-    """Fix common mis-parses: Disc N titles, section folders, Title/Author swaps, bios."""
+    """Fix common mis-parses: Disc N titles, section folders, Title/Author
+    swaps, bios, and a book folder that is really an archive's extraction
+    directory (see the climb below)."""
     author, title, year, narrator = meta.author, meta.title, meta.year, meta.narrator
     parent = book_dir.parent if book_dir != source else source
 
@@ -919,6 +921,52 @@ def normalize_meta(meta: Meta, book_dir: Path, source: Path) -> Meta:
                     author = humanize(climb.name)
                 if is_disc_folder(title) or is_section_folder(title) or title == "Unknown Title":
                     title = year or "Unknown Title"
+
+    # ── the book folder's own name IS the extraction, not the book ─────────
+    # extract_dir_for names a directory after the ARCHIVE it was unpacked
+    # from (extract_archive), and a scene release deliberately obfuscates
+    # that archive name — the release folder
+    #   Brenda.Peynado.-.The.Rock.Eaters.2021.RETAIL.EPUB.eBook-CTO/
+    # holds an archive like "tr8e3el.rar", which extracts to "tr8e3el/": no
+    # author, no title, no year, nothing parse_name can read out of it. Every
+    # scrap of real metadata is one or more directories up, in the folder
+    # that actually names the release. Climb past any number of such empty
+    # wrappers, stopping at the first ancestor parse_name finds an author OR
+    # a year in — same idea as the disc/section climb above, but keyed on
+    # "this name told us nothing" instead of a fixed vocabulary, since an
+    # obfuscated archive name has no fixed shape to match on.
+    #
+    # This can never fire on a legitimately-named book folder: parse_name
+    # always finds an author or a year in "Author - Title (2001)" (that is
+    # what the whole parser exists to do), so book_dir keeps its own name
+    # exactly as before whenever it carries any signal at all.
+    if (
+        book_dir != source
+        and not is_disc_folder(book_dir.name)
+        and not is_section_folder(book_dir.name)
+    ):
+        own_meta = parse_name(book_dir.name)
+        if own_meta.author == "Unknown Author" and not own_meta.year:
+            ancestor = book_dir.parent
+            while ancestor != source:
+                candidate = parse_name(ancestor.name)
+                informative = candidate.author != "Unknown Author" or bool(candidate.year)
+                if (
+                    informative
+                    and not is_non_author_folder(ancestor.name)
+                    and ancestor.name.casefold() not in STOP_AUTHOR
+                ):
+                    if candidate.title and candidate.title != "Unknown Title":
+                        title = candidate.title
+                    if candidate.author != "Unknown Author":
+                        author = candidate.author
+                    if candidate.year:
+                        year = year or candidate.year
+                    narrator = narrator or candidate.narrator
+                    break
+                if ancestor.parent == ancestor:
+                    break  # filesystem root reached; nothing further to climb
+                ancestor = ancestor.parent
 
     # Swap when author is clearly a title and title is clearly a person
     cleaned_title = title.replace('"', "").replace("'", "")
@@ -2714,6 +2762,33 @@ def self_test() -> int:
         "The Day of the Triffids"
     )
     assert parse_name("01 - Chapter One").title == "Chapter One"
+
+    # ── format/scene tokens must not survive into the title ────────────────
+    # strip_quality only stripped AUDIO format tags (mp3/m4b/...), so an
+    # ebook release's own format name sailed straight through: a real
+    # download parsed to title="The Rock Eaters EPUB".
+    assert strip_quality("The Rock Eaters EPUB") == "The Rock Eaters"
+    assert strip_quality("Some Book MOBI") == "Some Book"
+    assert strip_quality("Some Book AZW3") == "Some Book"
+    assert strip_quality("Some Book PDF") == "Some Book"
+
+    # ── scene release: the release folder parses; the archive's own
+    # obfuscated inner name must not ──────────────────────────────────────
+    # extract_dir_for names the extracted directory after the ARCHIVE
+    # ("tr8e3el.rar" -> "tr8e3el/"), which a scene release deliberately does
+    # not resemble. parse_name must still read the release folder correctly
+    # on its own, and "tr8e3el" must still read as nothing at all — that
+    # contrast is the precondition normalize_meta's climb (see the comment
+    # there) relies on to know when to climb past a folder like it. The
+    # end-to-end regression, through build_plan after a real extraction, is
+    # tests/test_organizer.py::SceneReleaseMetadataTests.
+    release_meta = parse_name("Brenda.Peynado.-.The.Rock.Eaters.2021.RETAIL.EPUB.eBook-CTO")
+    assert release_meta.author == "Brenda Peynado", release_meta
+    assert release_meta.title == "The Rock Eaters", release_meta
+    assert release_meta.year == "2021", release_meta
+    opaque_meta = parse_name("tr8e3el")
+    assert opaque_meta.author == "Unknown Author", opaque_meta
+    assert opaque_meta.year is None, opaque_meta
 
     print("self-test OK")
     shutil.rmtree(tmp, ignore_errors=True)
