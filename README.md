@@ -371,10 +371,15 @@ unaffected either way.
 5. Unwraps numbered listicle packs — `Top 100 Sci-Fi Books/43 - Title - Author - Year/`
    becomes `Author/Year - Title/`, rather than filing all 100 books under an
    author called "Top 100 Sci-Fi Books"
-6. Applies known title/author fixes (e.g. missing King years, Clark → Clarke)
-7. Builds `Author / Year - Title /` and renumbers audio tracks
-8. Preserves known Audiobookshelf/ebook metadata sidecars and leaves unknown files for review
-9. Moves recognized junk into `trash/` (use `--trash-unknown` to opt into moving other files)
+6. Reads a scene release's metadata from the release folder, not the archive
+   it unpacked — `Brenda.Peynado.-.The.Rock.Eaters.2021.RETAIL.EPUB.eBook-CTO/`
+   holding an obfuscated `tr8e3el.rar` extracts to a `tr8e3el/` folder with no
+   author, title, or year in its name at all, so that name is skipped in
+   favor of the release folder one level up
+7. Applies known title/author fixes (e.g. missing King years, Clark → Clarke)
+8. Builds `Author / Year - Title /` and renumbers audio tracks
+9. Preserves known Audiobookshelf/ebook metadata sidecars and leaves unknown files for review
+10. Moves recognized junk into `trash/` (use `--trash-unknown` to opt into moving other files)
 
 ## Supported formats
 

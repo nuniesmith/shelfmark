@@ -297,6 +297,99 @@ class IsolatedExtractionTests(unittest.TestCase):
         self.assertTrue((outside / "secret.txt").exists())
 
 
+class SceneReleaseMetadataTests(unittest.TestCase):
+    """A scene release is a well-named folder holding an obfuscated archive:
+
+        Brenda.Peynado.-.The.Rock.Eaters.2021.RETAIL.EPUB.eBook-CTO/
+            tr8e3el.rar
+            tr8e3el.nfo
+            file_id.diz
+
+    extract_archive() unpacks tr8e3el.rar into a sibling "tr8e3el/" folder
+    (named after the ARCHIVE, see extract_dir_for), and the re-scan after
+    extraction used to read metadata from THAT name: "Unknown Author /
+    tr8e3el", every download filed as garbage. The release folder — the only
+    place author, title and year actually exist — was one level up and never
+    consulted. Every real download looks like this.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-scene-")
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "downloads"
+        self.source.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def make_zip(self, path: Path, names: dict[str, bytes]) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, payload in names.items():
+                archive.writestr(name, payload)
+        return path
+
+    def test_metadata_comes_from_release_folder_not_archive_stem(self) -> None:
+        release = (
+            self.source
+            / "Brenda.Peynado.-.The.Rock.Eaters.2021.RETAIL.EPUB.eBook-CTO"
+        )
+        # The archive's inner filename is the obfuscated one — the whole
+        # point of the bug. Its own name carries no author, title or year.
+        # A real release ships this as a .rar; zip exercises the identical
+        # code path (extract_dir_for names the folder from the archive stem
+        # regardless of archive kind) without needing an external unrar.
+        self.make_zip(release / "tr8e3el.zip", {"tr8e3el.epub": b"epub-bytes"})
+        (release / "tr8e3el.nfo").write_bytes(b"release info")
+        (release / "file_id.diz").write_bytes(b"diz")
+
+        library = self.root / "library"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main([str(self.source), "--dest", str(library), "--apply", "--yes"])
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        filed = sorted(library.rglob("*.epub"))
+        self.assertEqual(len(filed), 1, filed)
+        self.assertEqual(
+            filed[0],
+            library / "Brenda Peynado" / "2021 - The Rock Eaters" / "The Rock Eaters.epub",
+        )
+
+    def test_loose_ebook_title_has_no_dangling_extension_dot(self) -> None:
+        """A loose ebook file's own name runs through parse_name whole.
+
+        parse_name only strips a recognized AUDIO/ARCHIVE suffix up front;
+        ".epub" is neither, so it rides along as literal text. humanize()
+        only collapses dots when there are two or more (a real initial's
+        lone dot, "A. E.", must survive), so this single extension dot is
+        never touched there either — it only vanishes once strip_quality
+        removes the "epub" word sitting after it. Adding "epub" to
+        strip_quality's format-token list (the scene-release fix above) was
+        correct, but the cleanup that followed left the newly-orphaned dot
+        behind: title="Title ." instead of "Title".
+        """
+        source = self.root / "loose"
+        source.mkdir(parents=True)
+        (source / "Author Name - Title (1999).epub").write_bytes(b"epub-bytes")
+
+        plan = build_plan(
+            source=source,
+            dest=self.root / "loose-library",
+            trash=source / "trash",
+            folder_format="year-title",
+            keep_names=False,
+            include_non_cover_images=False,
+            media_mode="ebook",
+        )
+
+        self.assertEqual(len(plan.books), 1, plan.books)
+        meta = plan.books[0].meta
+        self.assertEqual(meta.author, "Author Name")
+        self.assertEqual(meta.title, "Title")
+        self.assertEqual(meta.year, "1999")
+
+
 class AtomicWriteTests(unittest.TestCase):
     """A file in the library is complete or absent, never half-written.
 
