@@ -31,6 +31,7 @@ from src.shelfmark_service.worker import (
     _maybe_record_liveness,
     _release_download_source,
     _split_webhook_url,
+    check_liveness_cli,
 )
 
 
@@ -950,6 +951,90 @@ class MaybeRecordLivenessTests(WorkerTestCase):
         with self.database.connect() as conn:
             count = conn.execute("SELECT COUNT(*) FROM worker_liveness").fetchone()[0]
         self.assertEqual(count, 2)
+
+
+class CheckLivenessCliTests(unittest.TestCase):
+    """`shelfmark-worker-healthcheck` (the Docker healthcheck command,
+    wired in pyproject.toml) -- must classify through the exact same
+    `Database.worker_liveness_status` /readyz uses. This replaced an inline
+    `python -c` one-liner in docker-compose.yml that checked liveness age
+    only, with no exception for a job legitimately still running: that
+    meant `docker ps` reported `shelfmark-worker` unhealthy during any long
+    transfer even after `/readyz` was fixed to say `busy` for the same
+    situation. These tests exist specifically to keep that from coming
+    back for THIS entry point too."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-healthcheck-cli-test-")
+        self.db_path = Path(self.tmp.name) / "shelfmark.db"
+        self.database = Database(self.db_path)
+        self.database.initialize()
+        env_patch = mock.patch.dict(
+            "os.environ",
+            {
+                "SHELFMARK_DB_PATH": str(self.db_path),
+                "SHELFMARK_WORKER_LIVENESS_STALE_SECONDS": "60",
+                "SHELFMARK_TRANSFER_TIMEOUT_SECONDS": "500",
+            },
+        )
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _age_liveness(self, worker_id: str) -> None:
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE worker_liveness SET last_seen_at = '2000-01-01T00:00:00+00:00' "
+                "WHERE worker_id = ?",
+                (worker_id,),
+            )
+
+    def test_exits_zero_when_no_worker_has_ever_ticked(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_exits_zero_for_a_fresh_liveness_row(self) -> None:
+        self.database.record_liveness("worker-a")
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_exits_one_for_a_stale_row_with_no_running_job(self) -> None:
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_exits_zero_for_a_stale_row_with_a_recently_started_running_job(self) -> None:
+        """The exact case that must not regress: a legitimate long transfer
+        must not flip `docker ps` to unhealthy."""
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        self.database.enqueue("transfer_completed", {"remote_path": "Some Book"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_exits_one_for_a_stale_row_with_an_old_running_job(self) -> None:
+        """A job stuck in `running` past its own timeout ceiling must not
+        hide a dead worker from `docker ps` forever."""
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        self.database.enqueue("transfer_completed", {"remote_path": "Some Book"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET started_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                (claimed.id,),
+            )
+        with self.assertRaises(SystemExit) as ctx:
+            check_liveness_cli()
+        self.assertEqual(ctx.exception.code, 1)
 
 
 if __name__ == "__main__":

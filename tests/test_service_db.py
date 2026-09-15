@@ -314,6 +314,79 @@ class YoungestRunningJobStartedAtTests(unittest.TestCase):
         self.assertEqual(self.database.youngest_running_job_started_at(), newer.started_at)
 
 
+class WorkerLivenessStatusTests(unittest.TestCase):
+    """`worker_liveness_status` is the ONE implementation of the
+    unknown/ok/busy/stale rule, shared by api.py's `/readyz` and worker.py's
+    `check_liveness_cli` (the Docker healthcheck) -- see the method's
+    docstring for why it used to be two separate implementations that
+    disagreed. `stale_after_seconds` and `running_job_bound_seconds` are
+    kept small and distinct in these tests so a bug that swaps the two
+    bounds, or confuses liveness age with job age, cannot pass by accident.
+    """
+
+    STALE_AFTER = 60.0
+    RUNNING_JOB_BOUND = 500.0
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-liveness-status-test-")
+        self.database = Database(Path(self.tmp.name) / "state" / "shelfmark.db")
+        self.database.initialize()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _status(self) -> dict[str, object]:
+        return self.database.worker_liveness_status(self.STALE_AFTER, self.RUNNING_JOB_BOUND)
+
+    def _age_liveness(self, worker_id: str) -> None:
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE worker_liveness SET last_seen_at = '2000-01-01T00:00:00+00:00' "
+                "WHERE worker_id = ?",
+                (worker_id,),
+            )
+
+    def test_no_row_reports_unknown(self) -> None:
+        self.assertEqual(self._status()["status"], "unknown")
+
+    def test_fresh_row_reports_ok(self) -> None:
+        self.database.record_liveness("worker-a")
+        result = self._status()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["worker_id"], "worker-a")
+
+    def test_stale_row_with_no_running_job_reports_stale(self) -> None:
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        self.assertEqual(self._status()["status"], "stale")
+
+    def test_stale_row_with_a_recently_started_running_job_reports_busy(self) -> None:
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        self.database.enqueue("transfer_completed", {"remote_path": "Some Book"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        result = self._status()
+        self.assertEqual(result["status"], "busy")
+        self.assertIn("running_job_age_seconds", result)
+
+    def test_stale_row_with_an_old_running_job_still_reports_stale(self) -> None:
+        """The bound's whole purpose: a job stuck in `running` past
+        `running_job_bound_seconds` is no longer credible evidence of
+        anything -- this must not be waved through as `busy` forever."""
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        self.database.enqueue("transfer_completed", {"remote_path": "Some Book"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET started_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                (claimed.id,),
+            )
+        self.assertEqual(self._status()["status"], "stale")
+
+
 class TorrentImportLedgerTests(unittest.TestCase):
     """`claim_torrent_import` is the reconciler's idempotency gate: see the
     docstring on the method itself for why the ledger row and the job row

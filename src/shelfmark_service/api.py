@@ -10,7 +10,6 @@ from __future__ import annotations
 import secrets
 import urllib.parse
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -183,69 +182,17 @@ def healthz() -> dict[str, str]:
 
 
 def _worker_liveness() -> dict[str, Any]:
-    """Classify the freshest `worker_liveness` row against the staleness threshold.
+    """The `worker` object /readyz reports: unknown / ok / busy / stale.
 
-    Four outcomes, not two -- see `Database.latest_worker_liveness`'s
-    docstring for why "no row" must never be reported the same as "stale",
-    and `Database.youngest_running_job_started_at`'s docstring for why a
-    stale liveness row alone is not enough to call a worker dead:
-
-    - `unknown`: no worker has ever ticked (a database from before migration
-      4, or a worker container that has not completed a loop iteration yet
-      -- at most a fraction of a second into a fresh deploy, since
-      worker.py's `main()` writes its first liveness row before claiming any
-      job). Reporting this as failure would fail /readyz on every upgrade
-      and the first moment of every deploy -- worse than no check at all,
-      since it trains whoever gets paged to ignore it.
-    - `ok`: the freshest row is newer than `worker_liveness_stale_seconds`.
-    - `busy`: the freshest row is older than that, BUT a job is `running`
-      that started within `transfer_timeout_seconds` -- the longest any
-      single job is meant to take. `Worker.run_once` runs one job to
-      completion synchronously with no mid-job tick (single process, no
-      threads -- see worker.py's `_maybe_record_liveness`), so a big
-      transfer's pull + settle-wait + checksum verify can outlast
-      `worker_liveness_stale_seconds` (default 180s) while nothing is wrong.
-      Reporting this as `stale` would page for a perfectly healthy import --
-      "an alert that fires when nothing is wrong trains whoever gets paged
-      to ignore it", which is worse than no check at all.
-    - `stale`: the freshest row is older than the threshold AND either no
-      job is running or the running job itself started longer ago than
-      `transfer_timeout_seconds`. That second case is deliberate, not a
-      loophole: a job stuck in `running` past its own timeout ceiling is no
-      longer credible evidence of anything -- it is a job that genuinely
-      overran, or a worker that died mid-job and left the row stuck in
-      `running` forever, which is exactly the "hides behind a permanently
-      running job" failure this bound exists to still catch.
+    A thin wrapper around `Database.worker_liveness_status` -- the ONE
+    implementation of this rule, shared with worker.py's
+    `check_liveness_cli` (the `shelfmark-worker` Docker healthcheck). See
+    that method's docstring for the full rule and for why it used to be
+    two separate implementations that could (and did) disagree.
     """
-    row = database.latest_worker_liveness()
-    if row is None:
-        return {"status": "unknown", "worker_id": None, "last_seen_at": None}
-    last_seen = datetime.fromisoformat(row["last_seen_at"])
-    age_seconds = (datetime.now(timezone.utc) - last_seen).total_seconds()
-    if age_seconds <= settings.worker_liveness_stale_seconds:
-        return {
-            "status": "ok",
-            "worker_id": row["worker_id"],
-            "last_seen_at": row["last_seen_at"],
-            "age_seconds": round(age_seconds, 1),
-        }
-    started_at = database.youngest_running_job_started_at()
-    if started_at is not None:
-        job_age_seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
-        if job_age_seconds <= settings.transfer_timeout_seconds:
-            return {
-                "status": "busy",
-                "worker_id": row["worker_id"],
-                "last_seen_at": row["last_seen_at"],
-                "age_seconds": round(age_seconds, 1),
-                "running_job_age_seconds": round(job_age_seconds, 1),
-            }
-    return {
-        "status": "stale",
-        "worker_id": row["worker_id"],
-        "last_seen_at": row["last_seen_at"],
-        "age_seconds": round(age_seconds, 1),
-    }
+    return database.worker_liveness_status(
+        settings.worker_liveness_stale_seconds, settings.transfer_timeout_seconds
+    )
 
 
 @app.get("/readyz")

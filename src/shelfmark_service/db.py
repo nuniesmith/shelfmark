@@ -573,3 +573,80 @@ class Database:
                 "SELECT MAX(started_at) AS started_at FROM jobs WHERE status = 'running'"
             ).fetchone()
         return row["started_at"] if row and row["started_at"] else None
+
+    def worker_liveness_status(
+        self, stale_after_seconds: float, running_job_bound_seconds: float
+    ) -> dict[str, Any]:
+        """Classify this worker fleet's liveness: `unknown` / `ok` / `busy` / `stale`.
+
+        This is the ONE implementation of the rule, called by both
+        api.py's `/readyz` and worker.py's `check_liveness_cli` (the
+        `shelfmark-worker` Docker healthcheck). It used to be two: `/readyz`
+        had this exact logic, and the Docker healthcheck was a separate
+        inline `python -c` one-liner that only checked liveness age with no
+        busy-job exception -- which meant `docker ps` reported
+        `shelfmark-worker` as unhealthy during any legitimately long
+        transfer, even after `/readyz` was fixed to say `busy` for the same
+        situation. Two health signals disagreeing is worse than either
+        alone, since now the operator has to know which one lies -- and
+        `docker ps` is the one people check first. Sharing this method is
+        what makes that impossible to reintroduce: there is nowhere left
+        for the two to drift apart.
+
+        Four outcomes:
+
+        - `unknown`: no worker has EVER ticked -- a database from before
+          migration 4, or a worker container a fraction of a second into
+          startup, before its first loop iteration. Must never read as
+          `stale`: that would fail every upgrade and the first moment of
+          every deploy.
+        - `ok`: the freshest `worker_liveness` row is within
+          `stale_after_seconds`.
+        - `busy`: that row is older, but a job is `running` that started
+          within `running_job_bound_seconds`. `Worker.run_once` executes
+          one job to completion synchronously -- no threads -- so a big
+          transfer's pull, settle-wait, and checksum verify can together
+          outlast `stale_after_seconds` with the worker perfectly healthy
+          the whole time; nothing refreshes `worker_liveness` until that
+          job returns. Reporting this as `stale` pages for a routine
+          import, and an alert that fires when nothing is wrong trains
+          whoever gets paged to ignore it.
+        - `stale`: the row is older AND either no job is running or the
+          running job itself started longer ago than
+          `running_job_bound_seconds`. That second half is deliberate, not
+          a loophole: a job stuck in `running` past its own ceiling is no
+          longer credible evidence of anything -- it either genuinely
+          overran, or the worker died mid-job and left the row stuck in
+          `running` forever, which is exactly the "wedged worker hides
+          behind a permanently running job" failure this bound exists to
+          still catch.
+        """
+        row = self.latest_worker_liveness()
+        if row is None:
+            return {"status": "unknown", "worker_id": None, "last_seen_at": None}
+        last_seen = datetime.fromisoformat(row["last_seen_at"])
+        age_seconds = (datetime.now(timezone.utc) - last_seen).total_seconds()
+        if age_seconds <= stale_after_seconds:
+            return {
+                "status": "ok",
+                "worker_id": row["worker_id"],
+                "last_seen_at": row["last_seen_at"],
+                "age_seconds": round(age_seconds, 1),
+            }
+        started_at = self.youngest_running_job_started_at()
+        if started_at is not None:
+            job_age_seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
+            if job_age_seconds <= running_job_bound_seconds:
+                return {
+                    "status": "busy",
+                    "worker_id": row["worker_id"],
+                    "last_seen_at": row["last_seen_at"],
+                    "age_seconds": round(age_seconds, 1),
+                    "running_job_age_seconds": round(job_age_seconds, 1),
+                }
+        return {
+            "status": "stale",
+            "worker_id": row["worker_id"],
+            "last_seen_at": row["last_seen_at"],
+            "age_seconds": round(age_seconds, 1),
+        }

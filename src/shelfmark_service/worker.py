@@ -6,6 +6,7 @@ import logging
 import os
 import posixpath
 import signal
+import sys
 import time
 import urllib.parse
 from pathlib import Path
@@ -871,6 +872,34 @@ def main() -> None:
         last_reconcile = _maybe_enqueue_reconcile(database, settings, now, last_reconcile)
         if not worker.run_once():
             time.sleep(settings.poll_interval)
+
+
+def check_liveness_cli() -> None:
+    """Console entry point for the `shelfmark-worker` Docker healthcheck.
+
+    Exits 0 for `unknown`/`ok`/`busy` (nothing wrong, or too soon to judge),
+    1 for `stale`. This calls `Database.worker_liveness_status` -- the exact
+    same classifier `/readyz` uses in api.py -- rather than re-implementing
+    any part of the rule here.
+
+    This used to be an inline `python -c` one-liner directly in
+    docker-compose.yml, checking only `worker_liveness` age with no
+    exception for a job that is legitimately still running. That meant
+    `docker ps` reported `shelfmark-worker` as unhealthy during any long
+    transfer even after `/readyz` was fixed to say `busy` for the very same
+    situation -- two health signals disagreeing, which is worse than either
+    alone, since it teaches an operator not to trust the one they check
+    first. A one-liner also could not grow the busy-job exception without
+    becoming unreadable and untestable. A named entry point fixes both: the
+    compose healthcheck becomes one word, and this function is unit-testable
+    like everything else in this module.
+    """
+    settings = Settings.from_env()
+    database = Database(settings.database_path)
+    status = database.worker_liveness_status(
+        settings.worker_liveness_stale_seconds, settings.transfer_timeout_seconds
+    )["status"]
+    sys.exit(1 if status == "stale" else 0)
 
 
 if __name__ == "__main__":
