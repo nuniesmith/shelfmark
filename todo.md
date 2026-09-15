@@ -287,15 +287,15 @@ Recommended commands:
 
 Implement:
 
-- [ ] Discord application and bot registration.
-- [ ] Guild-scoped slash commands during development.
+- [x] Discord application and bot registration. Connected as `Shelfmark#7251`.
+- [x] Guild-scoped slash commands during development, via `SHELFMARK_DISCORD_GUILD_ID` — guild sync is immediate, global sync can take an hour.
 - [~] Buttons, select menus, and modals for release and metadata selection. Buttons only (no select menus/modals yet), but now cover ebooks too: `/ebook-search` sends the on-server file straight to the requester's phone as an ephemeral attachment (path-traversal-safe opaque id, size checked against Discord's limit before any upload is attempted), and `/ebook-request` reuses the existing grab-button/job path against Prowlarr restricted to `PROWLARR_BOOK_CATEGORIES` (default 7000 — the one indexer here doesn't advertise 7020/EBook).
 - [x] Role/user allowlists for download, organize, metadata, and scan actions. **Fails closed** — an unset `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` refuses everyone rather than permitting everyone, which is what it did before. Applies to `/ebook-search` and `/ebook-request` the same as every other command.
-- [ ] Per-user and per-guild rate limits.
-- [ ] Audit records containing Discord user, guild, channel, and message IDs.
-- [ ] Immediate interaction deferral, followed by persistent job notifications.
-- [ ] Recovery notifications after bot or worker restarts.
-- [ ] No privileged message-content intent unless later required.
+- [ ] Per-user and per-guild rate limits. Not done. The role allow-list is the only throttle, so any permitted user can queue unlimited grabs.
+- [~] Audit records containing Discord user, guild, channel, and message IDs. Every command passes an actor string of `discord:<user>:<guild>:<channel>` which reaches the `audit_events` table; the message ID is not captured.
+- [x] Immediate interaction deferral, followed by persistent job notifications. Every command defers before any network call; the pipeline reports completion and failure through the Discord webhook.
+- [ ] Recovery notifications after bot or worker restarts. Not done — but the reconciler makes this less critical than it was: a restart mid-pipeline is re-claimed on the next pass rather than lost.
+- [x] No privileged message-content intent unless later required. The bot requests `Intents.none()` plus `guilds`, so nothing privileged needs justifying.
 
 Discord interactions should be acknowledged immediately and processed asynchronously. Interaction tokens are time-limited, so long-running jobs must use normal bot messages after the interaction window expires. The effective attachment limit is provided in the interaction payload and can vary, so large audiobooks should be delivered as Audiobookshelf or signed Shelfmark links rather than Discord attachments.
 
@@ -330,13 +330,13 @@ For downloads:
 
 Princess deployment tasks:
 
-- [ ] Create the `shelfmark.7gram.xyz` virtual host.
-- [ ] Route it to Freddy over WireGuard, Tailscale, or another private tunnel.
-- [ ] Configure TLS and secure headers.
-- [ ] Configure Authentik OIDC or forward authentication if web access is shared.
-- [ ] Configure long enough proxy timeouts for searches and job views.
-- [ ] Configure WebSocket/SSE forwarding only if live updates use it.
-- [ ] Keep qBittorrent, Prowlarr, and the Shelfmark API off the public internet.
+- [x] Create the `shelfmark.7gram.xyz` virtual host.
+- [x] Route it to Freddy over Tailscale (`100.106.65.55:8110`).
+- [x] Configure TLS and secure headers (HSTS, X-Frame-Options, X-Content-Type-Options).
+- [ ] Configure Authentik OIDC or forward authentication if web access is shared. Not done. The API's bearer token is currently the only gate, which is adequate while nothing but the bot calls it.
+- [x] Configure long enough proxy timeouts for searches and job views (180s).
+- [x] ~~Configure WebSocket/SSE forwarding~~ — not applicable; nothing uses live updates.
+- [~] Keep qBittorrent, Prowlarr, and the Shelfmark API off the public internet. Addresses are private (RFC1918 and CGNAT) and the API returns 401 without a token, but `shelfmark.7gram.xyz` resolves publicly and INVENTORY finding 8 records that ufw does not filter Docker-published ports.
 
 ## Detailed implementation backlog
 
@@ -433,14 +433,14 @@ Acceptance criteria:
 
 ### P4 — Freddy deployment
 
-- [ ] Create the Freddy Shelfmark directories.
-- [ ] Add `shelfmark-api`, `shelfmark-worker`, and `shelfmark-bot` to Freddy compose.
-- [ ] Mount only required audiobook, ebook, staging, quarantine, and data paths.
-- [ ] Run containers with the matching non-root UID/GID.
-- [ ] Use a private host port such as `8110`.
-- [ ] Add health checks, restart policies, resource limits, and log rotation.
-- [ ] Store secrets through Docker secrets or an external environment file.
-- [ ] Add Uptime Kuma checks for API, worker heartbeat, ABS, Prowlarr, and qBittorrent reachability.
+- [x] Create the Freddy Shelfmark directories. Named volumes: incoming, work, quarantine, data, ssh, ebooks.
+- [x] Add `shelfmark-api`, `shelfmark-worker`, and `shelfmark-bot` to Freddy compose. The bot sits behind the `discord` profile, activated by the deploy only when `DISCORD_BOT_TOKEN` is set.
+- [x] Mount only required audiobook, ebook, staging, quarantine, and data paths. The SSH secret is mounted read-only.
+- [x] Run containers with the matching non-root UID/GID (1001:1001, matching the `actions` owner of the bind mounts).
+- [x] Use a private host port such as `8110`.
+- [~] Add health checks, restart policies, resource limits, and log rotation. Verified live: `restart=unless-stopped`, memory limits 512m/512m/256m, logs capped 10m x 3. **Only `shelfmark-api` has a health check** — the worker and bot have none, so a wedged worker looks healthy to Docker.
+- [x] Store secrets through Docker secrets or an external environment file. The Sullivan key is a Docker secret; the rest come from `.env`, written by the deploy from repository secrets.
+- [ ] Add Uptime Kuma checks for API, worker heartbeat, ABS, Prowlarr, and qBittorrent reachability. **Not done** — Kuma is running on Freddy but has no Shelfmark monitor. Now that the pipeline runs unattended this is the main blind spot.
 
 Acceptance criteria:
 
@@ -450,14 +450,14 @@ Acceptance criteria:
 
 ### P5 — Sullivan deployment
 
-- [ ] Normalize `DOWNLOAD_PATH_COMPLETE` across qBittorrent, Unpackerr, Filebot, and all *arr services.
-- [ ] Create qBittorrent category `shelfmark-books` with a dedicated save path.
-- [ ] Configure Prowlarr's qBittorrent download client.
-- [ ] Restrict Prowlarr and qBittorrent host ports to the private network or Freddy's address.
-- [ ] Exclude the Shelfmark category from Unpackerr, or configure an entirely separate watcher.
-- [ ] Verify qBittorrent, organizer, and SSH user permissions.
+- [x] Normalize `DOWNLOAD_PATH_COMPLETE` across qBittorrent, Unpackerr, Filebot, and all *arr services — already consistent at `/media/qbittorrent/complete`, see INVENTORY finding 5.
+- [x] Create qBittorrent category `shelfmark-books` with a dedicated save path (`/shelfmark` in the container, bound to the host's `/media/qbittorrent/shelfmark`, which is the `rrsync -ro` root).
+- [x] ~~Configure Prowlarr's qBittorrent download client~~ — **no longer the route**. Prowlarr's own client is fixed to category `prowlarr`, which the reconciler does not watch, so grabs went nowhere. Shelfmark now adds to qBittorrent directly in its own category.
+- [ ] Restrict Prowlarr and qBittorrent host ports to the private network or Freddy's address. **Not done**, and note INVENTORY finding 8: ufw does not filter Docker-published ports, so this needs Docker-level rules, not ufw.
+- [x] Exclude the Shelfmark category from Unpackerr — by construction: the category lives outside `/complete`, which is Unpackerr's catch-all root. See INVENTORY finding 3.
+- [x] Verify qBittorrent, organizer, and SSH user permissions. `verify-sullivan-sync` asserts all four properties of the restricted account; qBittorrent writes as 1001:1001 and the sync account can read what it writes.
 - [ ] Correct Calibre-Web's application-data mount to `/config` if it remains in use.
-- [ ] Run a controlled end-to-end transfer using content that is authorized for download.
+- [x] Run a controlled end-to-end transfer. **Done 2026-09-15 with two real downloads.** The second filed correctly as `Edward St Aubyn/On the Edge/On the Edge.{epub,azw3,mobi}` in 41 seconds, grab to shelf, unattended.
 
 Acceptance criteria:
 
@@ -485,19 +485,19 @@ Acceptance criteria:
 
 ### P7 — Discord bot
 
-- [ ] Create and configure the Discord application.
-- [ ] Register guild-scoped slash commands.
+- [x] Create and configure the Discord application. Invited with permission integer `0` and no privileged intents — every reply is an ephemeral interaction response, which needs no channel permission.
+- [x] Register guild-scoped slash commands.
 - [x] Implement initial slash commands with immediate defer and persistent job IDs.
-- [ ] Implement library search embeds.
-- [ ] Implement Prowlarr result pagination and selection.
-- [ ] Implement confirmation buttons.
+- [x] Implement library search embeds. `/library-search` (Audiobookshelf), `/release-search` (Prowlarr), `/ebook-search` (on-server ebooks).
+- [~] Implement Prowlarr result pagination and selection. Selection works via grab buttons on the top five results; **there is no pagination** — result six onward is unreachable without refining the query.
+- [x] Implement confirmation buttons. Grab buttons on release search, Send buttons on ebook search.
 - [~] Implement download progress notifications. A Discord *webhook* posts a completion message and a chain-failure message from the worker (`SHELFMARK_DISCORD_WEBHOOK_URL`; see README's "Automatic download pipeline"). No in-progress/percentage updates, and it is a webhook post, not a bot-side embed tied to the original interaction.
-- [ ] Implement cancellation.
-- [ ] Implement organization preview and approval.
-- [ ] Implement metadata candidate comparison and approval.
-- [ ] Implement scan and stable-link commands.
-- [ ] Add role/user permissions and rate limits.
-- [ ] Test bot behavior after worker restarts and after the interaction token expires.
+- [ ] Implement cancellation. The database and worker support it (`cancel_requested`, `JobCancelled`, and the `cancelled` error code), but no Discord command exposes it.
+- [~] Implement organization preview and approval. `/organize-preview` queues a preview job, but there is no approval step — the automatic pipeline applies without one. Note the preview takes an arbitrary absolute path, which is why the role allow-list failing closed matters.
+- [ ] Implement metadata candidate comparison and approval. `/metadata-match` queues a match against Audiobookshelf, but nothing compares candidates or asks for approval.
+- [~] Implement scan and stable-link commands. `/scan` exists and the pipeline triggers scans itself; stable links do not exist.
+- [~] Add role/user permissions and rate limits. Permissions are done and **fail closed** — an unset `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` refuses everyone rather than permitting everyone, which is what it used to do. Rate limits are not implemented.
+- [ ] Test bot behavior after worker restarts and after the interaction token expires. Not tested. The 15-minute interaction token is the known limit: a grab whose download outlives it cannot be answered on the original interaction, which is why completion goes out through the webhook instead.
 
 Acceptance criteria:
 
