@@ -396,8 +396,28 @@ def list_jobs(
         default=None, alias="status"
     ),
     limit: int = Query(default=50, ge=1, le=200),
+    include_reconciler: bool = Query(default=False),
 ) -> dict[str, Any]:
-    return {"jobs": [_job_response(job) for job in database.list_jobs(job_status, limit)]}
+    """List recent jobs, newest first.
+
+    `include_reconciler` defaults to False: `reconcile_downloads` ticks once
+    every `SHELFMARK_RECONCILE_INTERVAL_SECONDS` (60s default) whether or
+    not there is anything to import, and on the live database it was 98.6%
+    of every job row and, at one point, the last 40 rows in a row --
+    burying every real pipeline job (grab, transfer, organize, scan) under
+    reconciler noise. `Database.list_jobs` itself still defaults to True
+    (every existing caller keeps seeing every kind unless it asks
+    otherwise) -- this endpoint is the one place that flips the default,
+    since it is the one a human actually reads. Pass
+    `?include_reconciler=true` to see reconciler ticks again, e.g. to check
+    the reconciler is alive at all.
+    """
+    return {
+        "jobs": [
+            _job_response(job)
+            for job in database.list_jobs(job_status, limit, include_reconciler=include_reconciler)
+        ]
+    }
 
 
 @app.post("/api/v1/jobs", status_code=status.HTTP_202_ACCEPTED)

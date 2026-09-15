@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -204,6 +205,54 @@ class ReadyzWorkerLivenessTests(unittest.TestCase):
             api_module.readyz()
         self.assertEqual(ctx.exception.status_code, 503)
         self.assertEqual(ctx.exception.detail["worker"]["status"], "stale")
+
+
+class ListJobsEndpointTests(unittest.TestCase):
+    """`GET /api/v1/jobs` -- on the live database, `reconcile_downloads`
+    ticks (one every `SHELFMARK_RECONCILE_INTERVAL_SECONDS`, 60s default,
+    forever) reached 98.6% of the `jobs` table, and at one point the last 40
+    jobs in a row were reconciler noise burying every real pipeline job. The
+    endpoint must default to hiding them; `include_reconciler=true` opts
+    back in."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-list-jobs-endpoint-test-")
+        self.database = Database(Path(self.tmp.name) / "shelfmark.db")
+        self.database.initialize()
+        db_patch = mock.patch.object(api_module, "database", self.database)
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.database.enqueue("reconcile_downloads", {})
+        self.database.enqueue("organize_apply", {"source": "/incoming"})
+
+    def test_default_excludes_reconciler_ticks(self) -> None:
+        """Calling with `include_reconciler=False` explicitly is what a
+        request that OMITS the query param resolves to --
+        `test_the_query_parameter_itself_defaults_to_false` below is what
+        proves that resolution, since calling the endpoint function
+        directly (there is no TestClient in this suite -- see
+        ReadyzWorkerLivenessTests above for the same pattern) always
+        requires passing every parameter explicitly."""
+        response = api_module.list_jobs(_actor="test", job_status=None, limit=50, include_reconciler=False)
+        kinds = {job["kind"] for job in response["jobs"]}
+        self.assertEqual(kinds, {"organize_apply"})
+
+    def test_include_reconciler_true_shows_them_again(self) -> None:
+        response = api_module.list_jobs(_actor="test", job_status=None, limit=50, include_reconciler=True)
+        kinds = {job["kind"] for job in response["jobs"]}
+        self.assertEqual(kinds, {"reconcile_downloads", "organize_apply"})
+
+    def test_the_query_parameter_itself_defaults_to_false(self) -> None:
+        """A request that omits `?include_reconciler=...` entirely must
+        still exclude reconciler ticks -- FastAPI resolves an omitted query
+        parameter from the `Query(default=...)` object bound as this
+        parameter's own Python default, so inspecting that default is what
+        actually proves the HTTP-level behavior the two tests above cannot:
+        both of them call the endpoint function directly and always pass
+        `include_reconciler` explicitly."""
+        default = inspect.signature(api_module.list_jobs).parameters["include_reconciler"].default
+        self.assertIs(default.default, False)
 
 
 if __name__ == "__main__":

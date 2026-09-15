@@ -134,6 +134,32 @@ class Settings:
     download_automation_enabled: bool = True
     reconcile_interval_seconds: float = 60.0
     discord_webhook_url: str | None = None
+    # How often the worker's main loop considers pruning old, terminal
+    # `jobs`/`audit_events` rows (see worker.py's `_maybe_sweep_retention`
+    # and db.py's `sweep_job_retention`). Defaults to once an hour, matching
+    # the shortest retention tier below (`retention_reconcile_empty_seconds`)
+    # -- running it more often would mean re-issuing the retention SELECTs
+    # far more frequently than the fastest tier actually changes, for no
+    # benefit; less often would let the empty-reconcile-tick tier -- the
+    # 98.6%-of-the-table one -- drift further past its own one-hour window.
+    retention_sweep_interval_seconds: float = 3600.0
+    # Below this age, a SUCCEEDED `reconcile_downloads` job that claimed
+    # nothing is still kept -- long enough to answer "is the reconciler
+    # actually ticking" by eye, short enough that this, the single largest
+    # source of row growth (one tick every `reconcile_interval_seconds`,
+    # forever), never accumulates.
+    retention_reconcile_empty_seconds: float = 60.0 * 60.0
+    # A `reconcile_downloads` job that claimed something, failed, or was
+    # cancelled -- not steady-state noise, but its useful detail already
+    # lives in the pipeline chain it triggered, so it gets that chain's own
+    # (pipeline) window, not a separate longer one.
+    retention_reconcile_seconds: float = 30.0 * 24.0 * 60.0 * 60.0
+    # Every other (non-reconciler) job kind: grab_release, transfer_completed,
+    # organize_preview/apply, metadata_*, library_scan.
+    retention_pipeline_seconds: float = 90.0 * 24.0 * 60.0 * 60.0
+    # Failed pipeline jobs are kept twice as long as succeeded ones -- rarer,
+    # and worth noticing a pattern in.
+    retention_pipeline_failed_seconds: float = 180.0 * 24.0 * 60.0 * 60.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -193,6 +219,21 @@ class Settings:
             download_automation_enabled=_bool_from_env("SHELFMARK_DOWNLOAD_AUTOMATION_ENABLED", True),
             reconcile_interval_seconds=_float_from_env("SHELFMARK_RECONCILE_INTERVAL_SECONDS", 60.0),
             discord_webhook_url=os.environ.get("SHELFMARK_DISCORD_WEBHOOK_URL") or None,
+            retention_sweep_interval_seconds=_float_from_env(
+                "SHELFMARK_RETENTION_SWEEP_INTERVAL_SECONDS", 3600.0
+            ),
+            retention_reconcile_empty_seconds=_float_from_env(
+                "SHELFMARK_RETENTION_RECONCILE_EMPTY_SECONDS", 60.0 * 60.0
+            ),
+            retention_reconcile_seconds=_float_from_env(
+                "SHELFMARK_RETENTION_RECONCILE_SECONDS", 30.0 * 24.0 * 60.0 * 60.0
+            ),
+            retention_pipeline_seconds=_float_from_env(
+                "SHELFMARK_RETENTION_PIPELINE_SECONDS", 90.0 * 24.0 * 60.0 * 60.0
+            ),
+            retention_pipeline_failed_seconds=_float_from_env(
+                "SHELFMARK_RETENTION_PIPELINE_FAILED_SECONDS", 180.0 * 24.0 * 60.0 * 60.0
+            ),
         )
 
     def configured_roots(self) -> dict[str, Path]:

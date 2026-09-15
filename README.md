@@ -410,14 +410,60 @@ throttle only matters when many quick jobs run back to back with no sleep
 in between, where it caps this at one small SQLite upsert per poll interval
 instead of one per job.
 
+**Job retention.** Left unpruned, `jobs` and `audit_events` grow forever:
+measured on the live database, `reconcile_downloads` alone reached 1,290 of
+1,308 job rows (98.6%) after about a day and a half, and a fresh check a
+few hours later found the last 40 jobs in a row were reconciler ticks —
+completely burying the pipeline history a human actually wants to read.
+Two separate fixes, for two separate costs:
+
+- `GET /api/v1/jobs` now defaults to **excluding** `reconcile_downloads`
+  jobs — `?include_reconciler=true` opts back in (e.g. to confirm the
+  reconciler is alive at all). This is what fixes readability; it does not
+  by itself bound disk use.
+- The worker's main loop (same single-threaded loop as
+  `_maybe_enqueue_reconcile`/`_maybe_record_liveness` — no threads, no
+  second process) now also runs `_maybe_sweep_retention`, throttled to once
+  per `SHELFMARK_RETENTION_SWEEP_INTERVAL_SECONDS` (default 1h), which
+  deletes TERMINAL jobs (`succeeded`/`failed`/`cancelled` only — a `queued`
+  or `running` job is never touched, at any age) past a tier-specific
+  window:
+
+  | Tier | Window | Why |
+  |------|--------|-----|
+  | `reconcile_downloads`, succeeded, claimed nothing | 1 hour | The steady-state tick — one every `SHELFMARK_RECONCILE_INTERVAL_SECONDS` forever, whether or not there's anything new. This is the 98.6%. It carries no information once its own hour has passed; an hour is enough to eyeball "is the reconciler actually running" |
+  | `reconcile_downloads`, claimed something / failed / cancelled | 30 days | Not noise, but its useful detail (which torrent, what error) already lives in the `transfer_completed`/`organize_apply`/`library_scan` chain it triggered and that chain's own audit trail — so it gets that chain's own window, not a separate longer one |
+  | Every other job kind (`grab_release`, `transfer_completed`, `organize_preview`/`apply`, `metadata_*`, `library_scan`) | 90 days | A real, human- or pipeline-triggered action, not a tick. Long enough to answer "what happened to the book I requested last month" |
+  | ...and it FAILED | 180 days | Failures are rarer and worth noticing a pattern in (the same release failing `organize_apply` three times this month is a signal) |
+
+  Each window is its own `SHELFMARK_RETENTION_*_SECONDS` env var if the
+  defaults above need adjusting on a given deployment.
+
+Whether a `reconcile_downloads` pass "claimed something" lives inside its
+`result_json` (`claimed_jobs`), which this reads with plain `json.loads` —
+the same way every other job result is read in this codebase — rather than
+leaning on SQLite's own JSON functions being compiled into whatever build
+happens to be deployed. `audit_events` rows are deleted in the same
+transaction as the job row they describe (every row in that table is
+`target_type='job'`/`target_id=<job id>` — there has never been another
+`target_type`), so an audit trail never outlives the job it is about.
+Deletes are batched (500 rows per transaction, a scan cap of 5,000 rows for
+the JSON-inspecting tier) rather than one huge transaction per sweep: the
+worker claims/heartbeats jobs on this same SQLite database from this same
+single-threaded loop, so a delete holding the write lock over an entire
+backlog (a worker down for a week, or this feature's first run against an
+already-1,290-row database) would delay every job in flight behind it.
+
+**`reconciled_torrents` (the reconciler's idempotency ledger, migration 3)
+is never pruned by any of this, on purpose.** qBittorrent reports a
+finished, still-seeding torrent as complete forever — deleting a row here
+would make the reconciler treat an already-imported torrent as new,
+re-transferring and re-organizing a book already in the library. That
+table is meant to grow forever; see the comment on its own `CREATE TABLE`
+in `db.py`.
+
 **Known gaps, left out of scope for this feature:**
 
-- No retention policy on `jobs` or `audit_events`. The live database
-  reached roughly 801 job rows after about one day, almost entirely
-  `reconcile_downloads` ticking every `SHELFMARK_RECONCILE_INTERVAL_SECONDS`
-  (default 60s). Nothing here causes that growth, but this feature is what
-  makes anyone actually look at that table, so it is worth flagging: there
-  is currently nothing that prunes old, finished job or audit rows.
 - `shelfmark-bot` still has no Docker `healthcheck` at all — only
   `shelfmark-api` and now `shelfmark-worker` do.
 
