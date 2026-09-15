@@ -550,3 +550,26 @@ class Database:
             except sqlite3.OperationalError:
                 return None
         return dict(row) if row else None
+
+    def youngest_running_job_started_at(self) -> str | None:
+        """The most recent `started_at` among currently RUNNING jobs, or None.
+
+        `Worker.run_once` executes exactly one job to completion, synchronously,
+        before the main loop returns to write another `worker_liveness` row
+        (see `_maybe_record_liveness`) -- so a single long job (a big
+        `transfer_completed` pull, its settle wait, then its checksum verify)
+        can legitimately leave that row unrefreshed for the job's entire
+        duration with nothing wrong. `/readyz` uses this to tell that case
+        apart from an actually dead or wedged worker: a RUNNING job that
+        started recently is itself evidence someone is home, even though the
+        liveness row alone looks stale. `MAX(started_at)` picks the most
+        favorable evidence available -- the freshest running job, in the rare
+        case more than one exists (e.g. two worker containers briefly
+        overlapping) -- since any one sufficiently recent running job is
+        enough to explain the silence.
+        """
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(started_at) AS started_at FROM jobs WHERE status = 'running'"
+            ).fetchone()
+        return row["started_at"] if row and row["started_at"] else None

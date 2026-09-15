@@ -348,21 +348,18 @@ including when idle — keyed by `worker_id`, so a second worker never
 clobbers the first's row. Two ways this surfaces:
 
 - `GET /readyz` includes a `worker` object (`status`: `unknown` / `ok` /
-  `stale`, plus `worker_id`, `last_seen_at`, `age_seconds`) and returns
-  **503** when the freshest worker's row is older than
-  `SHELFMARK_WORKER_LIVENESS_STALE_SECONDS` (default `180`, three times the
-  reconcile interval). A 200 with "stale" in the body would be invisible to
-  an uptime monitor that only reads the status code, so this fails the same
-  way `/readyz` already fails for a missing media root — and it stays on
-  `/readyz`, not `/healthz`: the API process itself is fine even when the
-  worker is dead, and `shelfmark-api`'s own Docker healthcheck targets
-  `/healthz` specifically, so a stale worker never makes Docker think the
-  *API* container needs restarting. **`unknown`** (no row at all) is
-  reported instead of `stale` whenever no worker has ever ticked yet — a
-  database from before migration 4, or a fresh deploy in the first fraction
-  of a second before the worker container completes its first loop — and
-  never fails `/readyz`; only a row that WAS written and has since gone
-  quiet counts as stale.
+  `busy` / `stale`, plus `worker_id`, `last_seen_at`, `age_seconds`) and
+  returns **503** only for `stale`. A 200 with "stale" in the body would be
+  invisible to an uptime monitor that only reads the status code, so a
+  stale worker fails the same way `/readyz` already fails for a missing
+  media root — and it stays on `/readyz`, not `/healthz`: the API process
+  itself is fine even when the worker is dead, and `shelfmark-api`'s own
+  Docker healthcheck targets `/healthz` specifically, so a stale worker
+  never makes Docker think the *API* container needs restarting.
+  **`unknown`** (no row at all) is reported whenever no worker has ever
+  ticked yet — a database from before migration 4, or a fresh deploy in the
+  first fraction of a second before the worker container completes its
+  first loop — and never fails `/readyz`.
 - The `shelfmark-worker` container has its own Docker `healthcheck` now
   too. The image is python-slim with no `curl` (only `openssh-client`,
   `rsync`, `7zip`, and `unrar-free` are installed, for the Sullivan
@@ -371,17 +368,32 @@ clobbers the first's row. Two ways this surfaces:
   SQLite — the same `Database.latest_worker_liveness()` method `/readyz`
   calls, so the two can never disagree about what counts as stale.
 
-Writing on every loop iteration is throttled to at most once per
-`SHELFMARK_WORKER_POLL_SECONDS` (default 2s): when idle, the loop already
-sleeps that long between iterations so nothing changes; the throttle only
-matters when many quick jobs run back to back with no sleep in between,
-where it caps this at one small SQLite upsert per poll interval instead of
-one per job. Note that a single long-running job (a big `transfer_completed`
-pull, uncapped up to `SHELFMARK_TRANSFER_TIMEOUT_SECONDS`) blocks the
-whole loop — and this write with it — for its entire duration, since the
-worker is a single process with no threads; that job's own `heartbeat_at`
-(set at claim and at completion) is the liveness signal during that window,
-not this table.
+**The busy-worker case, and the bound that still catches it.**
+`Worker.run_once` runs one job to completion synchronously — no threads —
+so a big `transfer_completed` pull, its 30s settle-wait, and its
+`--checksum` verify pass can together outlast `worker_liveness_stale_seconds`
+(default `180`, three times the reconcile interval) with the worker
+perfectly healthy the whole time; nothing refreshes `worker_liveness` until
+that job returns. Reporting that as `stale` would page for a routine
+import, and an alert that fires when nothing is wrong trains whoever gets
+paged to ignore it — worse than no check at all. So a stale
+`worker_liveness` row is not immediately `stale`: `/readyz` also checks the
+`jobs` table for a `running` job. One that started within
+`SHELFMARK_TRANSFER_TIMEOUT_SECONDS` (the longest any single job is meant
+to take, already configured) reports `busy` and stays a 200 — that job's
+own `started_at` is itself evidence someone is home. A `running` job
+older than that bound is no longer credible evidence of anything: either
+it genuinely overran its own ceiling, or the worker died mid-job and left
+the row stuck in `running` forever — exactly the "wedged worker hides
+behind a permanently running job" failure this bound exists to still
+catch, so that case reports `stale` and fails `/readyz` regardless.
+
+Writing the liveness row on every loop iteration is throttled to at most
+once per `SHELFMARK_WORKER_POLL_SECONDS` (default 2s): when idle, the loop
+already sleeps that long between iterations so nothing changes; the
+throttle only matters when many quick jobs run back to back with no sleep
+in between, where it caps this at one small SQLite upsert per poll interval
+instead of one per job.
 
 ## CLI options
 

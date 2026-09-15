@@ -268,6 +268,52 @@ class WorkerLivenessTests(unittest.TestCase):
         self.assertIsNone(legacy_db.latest_worker_liveness())
 
 
+class YoungestRunningJobStartedAtTests(unittest.TestCase):
+    """Backs /readyz's `busy` classification: see api.py's `_worker_liveness`
+    for why a recently-started RUNNING job is treated as evidence the
+    worker is alive even when its `worker_liveness` row looks stale."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-running-job-test-")
+        self.database = Database(Path(self.tmp.name) / "state" / "shelfmark.db")
+        self.database.initialize()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_none_when_nothing_is_running(self) -> None:
+        self.assertIsNone(self.database.youngest_running_job_started_at())
+
+    def test_returns_the_running_jobs_started_at(self) -> None:
+        self.database.enqueue("organize_preview", {"source": "/incoming"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        self.assertEqual(self.database.youngest_running_job_started_at(), claimed.started_at)
+
+    def test_ignores_queued_and_finished_jobs(self) -> None:
+        self.database.enqueue("organize_preview", {"source": "/incoming"})  # stays queued
+        self.database.enqueue("organize_preview", {"source": "/incoming"})
+        finished = self.database.claim_next("worker-a")
+        assert finished is not None
+        self.database.complete(finished.id, "worker-a", {})
+        self.assertIsNone(self.database.youngest_running_job_started_at())
+
+    def test_returns_the_most_recent_started_at_when_more_than_one_job_is_running(self) -> None:
+        """Not reachable through a single worker (`Worker.run_once` claims
+        one job at a time), but the query must still pick the freshest
+        evidence if two worker containers ever overlap during a deploy."""
+        self.database.enqueue("organize_preview", {"source": "/a"})
+        self.database.enqueue("organize_preview", {"source": "/b"})
+        older = self.database.claim_next("worker-a")
+        newer = self.database.claim_next("worker-b")
+        assert older is not None and newer is not None
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET started_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (older.id,)
+            )
+        self.assertEqual(self.database.youngest_running_job_started_at(), newer.started_at)
+
+
 class TorrentImportLedgerTests(unittest.TestCase):
     """`claim_torrent_import` is the reconciler's idempotency gate: see the
     docstring on the method itself for why the ledger row and the job row

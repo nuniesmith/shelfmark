@@ -118,6 +118,7 @@ class ReadyzWorkerLivenessTests(unittest.TestCase):
         self.settings = Settings(
             database_path=self.database.path,
             worker_liveness_stale_seconds=60.0,
+            transfer_timeout_seconds=500.0,
         )
         db_patch = mock.patch.object(api_module, "database", self.database)
         settings_patch = mock.patch.object(api_module, "settings", self.settings)
@@ -126,6 +127,14 @@ class ReadyzWorkerLivenessTests(unittest.TestCase):
         self.addCleanup(db_patch.stop)
         self.addCleanup(settings_patch.stop)
         self.addCleanup(self.tmp.cleanup)
+
+    def _age_liveness(self, worker_id: str) -> None:
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE worker_liveness SET last_seen_at = '2000-01-01T00:00:00+00:00' "
+                "WHERE worker_id = ?",
+                (worker_id,),
+            )
 
     def test_no_liveness_row_reports_unknown_and_stays_ready(self) -> None:
         """A fresh deploy (or a database older than migration 4) must not be
@@ -142,13 +151,10 @@ class ReadyzWorkerLivenessTests(unittest.TestCase):
 
     def test_stale_liveness_row_fails_readyz_with_503(self) -> None:
         """A 200 saying "stale" in the body is invisible to an uptime monitor
-        that only reads the status code -- this must be a non-2xx."""
+        that only reads the status code -- this must be a non-2xx. No job is
+        running, so there is no competing explanation for the silence."""
         self.database.record_liveness("worker-a")
-        with self.database.connect() as conn:
-            conn.execute(
-                "UPDATE worker_liveness SET last_seen_at = '2000-01-01T00:00:00+00:00' "
-                "WHERE worker_id = 'worker-a'"
-            )
+        self._age_liveness("worker-a")
         with self.assertRaises(HTTPException) as ctx:
             api_module.readyz()
         self.assertEqual(ctx.exception.status_code, 503)
@@ -156,15 +162,48 @@ class ReadyzWorkerLivenessTests(unittest.TestCase):
 
     def test_the_freshest_of_two_workers_is_reported(self) -> None:
         self.database.record_liveness("worker-old")
-        with self.database.connect() as conn:
-            conn.execute(
-                "UPDATE worker_liveness SET last_seen_at = '2000-01-01T00:00:00+00:00' "
-                "WHERE worker_id = 'worker-old'"
-            )
+        self._age_liveness("worker-old")
         self.database.record_liveness("worker-new")
         response = api_module.readyz()
         self.assertEqual(response["worker"]["worker_id"], "worker-new")
         self.assertEqual(response["worker"]["status"], "ok")
+
+    def test_stale_liveness_with_a_recently_started_running_job_reports_busy(self) -> None:
+        """The false-alarm case: `Worker.run_once` runs one job to completion
+        synchronously (no threads), so a big transfer's pull + settle-wait +
+        checksum verify can legitimately outlast `worker_liveness_stale_seconds`
+        with nothing wrong. A running job that started well within
+        `transfer_timeout_seconds` (500s here) is evidence of that, not of a
+        dead worker -- this must stay a 200, not page anyone."""
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        self.database.enqueue("transfer_completed", {"remote_path": "Some Book"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        response = api_module.readyz()
+        self.assertEqual(response["status"], "ready")
+        self.assertEqual(response["worker"]["status"], "busy")
+
+    def test_stale_liveness_with_an_old_running_job_still_reports_stale(self) -> None:
+        """The case the bound exists to prevent hiding forever: a job stuck
+        in `running` past its own `transfer_timeout_seconds` ceiling is no
+        longer credible evidence anyone is home -- either the job genuinely
+        overran or the worker died mid-job and left the row stuck. Must
+        still fail with 503, not be waved through as `busy` forever."""
+        self.database.record_liveness("worker-a")
+        self._age_liveness("worker-a")
+        self.database.enqueue("transfer_completed", {"remote_path": "Some Book"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET started_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                (claimed.id,),
+            )
+        with self.assertRaises(HTTPException) as ctx:
+            api_module.readyz()
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail["worker"]["status"], "stale")
 
 
 if __name__ == "__main__":
