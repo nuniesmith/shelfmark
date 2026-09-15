@@ -14,6 +14,67 @@ from typing import Any
 
 JOB_STATUSES = {"queued", "running", "succeeded", "failed", "cancelled"}
 
+# Retention tiers for `sweep_job_retention` below. Measured live: after
+# roughly a day and a half this service's own `jobs` table held 1,308 rows,
+# 1,290 of them (98.6%) a single `reconcile_downloads` tick -- one is
+# enqueued every `SHELFMARK_RECONCILE_INTERVAL_SECONDS` (60s default)
+# forever, whether or not qBittorrent has anything new, and a fresh check a
+# few hours later found the last 40 jobs in a row were reconciler noise. Two
+# separate costs, addressed separately: these windows bound disk growth,
+# while `list_jobs`'s `include_reconciler` (default False at the API layer)
+# is what makes the history human-readable again -- shrinking the windows
+# alone would not have fixed "I had to filter these out by hand to watch a
+# real download."
+#
+# A `reconcile_downloads` job that SUCCEEDED and claimed nothing
+# (`result["claimed_jobs"]` empty) is the steady-state tick -- it is what
+# the 98.6% above almost entirely consists of, and it carries no
+# information once its own hour has passed: nobody debugging an import days
+# later cares that a tick at 3:14am saw nothing new. One hour keeps enough
+# of them around to answer "is the reconciler actually running" right now,
+# without keeping the bulk of the table.
+RECONCILE_EMPTY_RETENTION_SECONDS = 60.0 * 60.0
+# A `reconcile_downloads` job that claimed at least one torrent, OR that
+# FAILED outright (a qBittorrent outage, bad credentials), OR was cancelled,
+# is not steady-state noise -- but the useful forensic detail (which
+# torrent, what error) already lives in the `transfer_completed` /
+# `organize_apply` / `library_scan` chain it triggered and that chain's own
+# audit trail, not in the reconcile tick itself. Kept as long as an ordinary
+# pipeline job (see PIPELINE_RETENTION_SECONDS below) rather than the
+# shorter empty-tick window, but no longer -- it is not itself the primary
+# record of what happened.
+RECONCILE_CLAIMED_OR_FAILED_RETENTION_SECONDS = 30.0 * 24.0 * 60.0 * 60.0
+# Every job kind OTHER than `reconcile_downloads` -- grab_release,
+# transfer_completed, organize_preview/apply, metadata_*, library_scan -- is
+# a real, human- or pipeline-triggered action, not a periodic tick. Ninety
+# days is long enough to answer "what happened to the book I requested last
+# month" the way that question actually gets asked, short enough that this
+# table still bounds itself with nobody touching it.
+PIPELINE_RETENTION_SECONDS = 90.0 * 24.0 * 60.0 * 60.0
+# A FAILED pipeline job is kept twice as long as a succeeded one: failures
+# are the thing worth noticing a pattern in (the same release failing
+# organize_apply three times this month is a real signal to chase), and
+# they are far rarer than successes, so the extra retention costs almost
+# nothing in row count.
+PIPELINE_FAILED_RETENTION_SECONDS = 180.0 * 24.0 * 60.0 * 60.0
+# Rows deleted per DELETE statement (and per matching audit_events delete).
+# `Worker.run_once` claims and heartbeats jobs on this same SQLite database
+# from the SAME single-threaded loop the retention sweep runs in (see
+# worker.py's `_maybe_sweep_retention` -- no threads), so a delete that held
+# the write lock for the whole backlog at once (a worker down for a week,
+# or this feature's first run against an already-1,290-row live database)
+# would delay every claim/heartbeat/complete behind it. Batching bounds each
+# transaction to a few milliseconds regardless of backlog size; a large
+# backlog is drained over several sweeps instead of one.
+RETENTION_BATCH_SIZE = 500
+# Upper bound on how many succeeded `reconcile_downloads` candidates
+# `_sweep_empty_reconciles` reads (and JSON-parses) in one sweep. In steady
+# state that tier only ever has about one hour's worth of candidates (~60 at
+# the default 60s reconcile interval), so this is normally never reached; it
+# exists only to cap the read side's memory/time if the sweep has not run
+# for a long time, the same way RETENTION_BATCH_SIZE caps the write side.
+RECONCILE_EMPTY_SCAN_LIMIT = 5000
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -143,6 +204,18 @@ class Database:
             # table shows up in that history like every other schema change,
             # rather than being the one silent exception to it.
             if conn.execute("SELECT 1 FROM schema_migrations WHERE version = 3").fetchone() is None:
+                # NEVER prune this table -- not from `sweep_job_retention`
+                # below, not from any future "tidy up old rows" pass. It is
+                # the reconciler's idempotency ledger (see
+                # `claim_torrent_import`'s docstring), and qBittorrent
+                # reports a finished, still-seeding torrent as complete
+                # FOREVER. Deleting a row here does not free anything
+                # meaningful -- it makes the reconciler treat an
+                # already-imported torrent as new the next time it sees that
+                # hash, re-transferring and re-organizing a book already in
+                # the library. This table is meant to grow forever; that is
+                # the deliberate tradeoff, not an oversight this feature
+                # should "fix".
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS reconciled_torrents (
@@ -300,20 +373,37 @@ class Database:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return Job.from_row(row) if row else None
 
-    def list_jobs(self, status: str | None = None, limit: int = 50) -> list[Job]:
+    def list_jobs(
+        self, status: str | None = None, limit: int = 50, include_reconciler: bool = True
+    ) -> list[Job]:
+        """List recent jobs, newest first.
+
+        `include_reconciler` defaults to True here so every existing caller
+        (and every test written against this method before reconciler
+        filtering existed) keeps seeing every kind, unchanged. api.py's
+        `GET /api/v1/jobs` is the one caller that flips its OWN default to
+        False -- see that endpoint's docstring for why the public-facing
+        default needs to differ from this method's.
+        """
         if status is not None and status not in JOB_STATUSES:
             raise ValueError(f"unknown job status: {status}")
         limit = max(1, min(int(limit), 200))
+        clauses = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if not include_reconciler:
+            # A literal, not a bound parameter: this is a fixed job kind
+            # this codebase defines, never user input, so there is nothing
+            # here for a parameter to protect against.
+            clauses.append("kind != 'reconcile_downloads'")
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
         with closing(self.connect()) as conn:
-            if status:
-                rows = conn.execute(
-                    "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-                    (status, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
-                ).fetchall()
+            rows = conn.execute(
+                f"SELECT * FROM jobs {where}ORDER BY created_at DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
         return [Job.from_row(row) for row in rows]
 
     def has_active_job(self, kind: str) -> bool:
@@ -650,3 +740,195 @@ class Database:
             "last_seen_at": row["last_seen_at"],
             "age_seconds": round(age_seconds, 1),
         }
+
+    @staticmethod
+    def _delete_jobs_batch(conn: sqlite3.Connection, job_ids: list[str]) -> None:
+        """Delete these job rows and every `audit_events` row that describes them, atomically.
+
+        Every `_audit()` call site in this module (`enqueue`,
+        `claim_torrent_import`, `complete`, `fail`, `cancel`,
+        `cancel_running`, `requeue_stale`) writes `target_type='job'`,
+        `target_id=<job id>` -- there is no other `target_type` anywhere in
+        this codebase, so joining on that pair is not a guess at an implied
+        schema, it is the one relationship that has ever existed. Deleting
+        both tables' rows inside one `BEGIN IMMEDIATE` transaction is what
+        "in lockstep" means in practice: a crash between the two statements
+        must never leave an audit row pointing at a job that no longer
+        exists, any more than `claim_torrent_import` above tolerates its
+        ledger and job writes landing separately.
+        """
+        if not job_ids:
+            return
+        placeholders = ",".join("?" for _ in job_ids)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            f"DELETE FROM audit_events WHERE target_type = 'job' AND target_id IN ({placeholders})",
+            job_ids,
+        )
+        conn.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", job_ids)
+        conn.commit()
+
+    @classmethod
+    def _sweep_terminal_jobs(
+        cls,
+        conn: sqlite3.Connection,
+        where_sql: str,
+        params: tuple[Any, ...],
+        batch_size: int,
+    ) -> int:
+        """Repeatedly delete up to `batch_size` matching jobs until none remain.
+
+        Safe to loop this way (unlike `_sweep_empty_reconciles` below)
+        specifically because EVERY row this query matches gets deleted --
+        each iteration's DELETE shrinks the candidate set, so the next
+        SELECT (same WHERE clause, no OFFSET needed) can only return rows
+        that were not already removed. `_sweep_empty_reconciles` cannot
+        reuse this helper because it must skip some matching rows
+        (non-empty claims) while deleting others, which would make this
+        same loop re-select the untouched leftovers forever.
+        """
+        total = 0
+        while True:
+            rows = conn.execute(
+                f"SELECT id FROM jobs WHERE {where_sql} LIMIT ?",
+                (*params, batch_size),
+            ).fetchall()
+            ids = [row["id"] for row in rows]
+            if not ids:
+                return total
+            cls._delete_jobs_batch(conn, ids)
+            total += len(ids)
+            if len(ids) < batch_size:
+                return total
+
+    @classmethod
+    def _sweep_empty_reconciles(
+        cls,
+        conn: sqlite3.Connection,
+        cutoff_iso: str,
+        batch_size: int,
+        scan_limit: int,
+    ) -> int:
+        """Delete succeeded `reconcile_downloads` jobs whose `result.claimed_jobs` was empty.
+
+        Whether a pass claimed anything lives inside `result_json`, a JSON
+        blob this codebase always reads with `json.loads` (see
+        `Job.from_row` above) -- never with SQLite's own json1 functions, so
+        this does the same rather than leaning on a new, untested assumption
+        about how the deployed SQLite build was compiled.
+
+        The SELECT itself is read-only and unbounded by `batch_size` (capped
+        instead by `scan_limit`, see that constant's own comment) precisely
+        because this tier does NOT delete everything it reads: a row with
+        non-empty claims is inspected and left alone, to be picked up later
+        by `RECONCILE_CLAIMED_OR_FAILED_RETENTION_SECONDS` instead. Batching
+        the SELECT itself the way `_sweep_terminal_jobs` batches its DELETE
+        would risk getting stuck: if the oldest `batch_size` candidates
+        happened to all have claims (none deleted), a LIMIT-and-re-query
+        loop would re-fetch that exact same undeleted set forever and never
+        reach the newer, empty-claim rows sitting after them. Reading every
+        candidate once up front and only batching the DELETEs sidesteps
+        that -- the read holds no write lock (WAL mode), and only the
+        writes need to stay short.
+        """
+        rows = conn.execute(
+            """
+            SELECT id, result_json FROM jobs
+             WHERE kind = 'reconcile_downloads'
+               AND status = 'succeeded'
+               AND COALESCE(finished_at, created_at) < ?
+             LIMIT ?
+            """,
+            (cutoff_iso, scan_limit),
+        ).fetchall()
+        empty_ids = []
+        for row in rows:
+            try:
+                result = json.loads(row["result_json"]) if row["result_json"] else {}
+            except (TypeError, ValueError):
+                # Malformed or otherwise unreadable result_json -- never let
+                # one bad row crash the sweep. Treated as "not provably
+                # empty" rather than deleted on a guess: it falls through to
+                # the 30-day catch-all tier instead.
+                continue
+            if not result.get("claimed_jobs"):
+                empty_ids.append(row["id"])
+        total = 0
+        for start in range(0, len(empty_ids), batch_size):
+            batch = empty_ids[start : start + batch_size]
+            cls._delete_jobs_batch(conn, batch)
+            total += len(batch)
+        return total
+
+    def sweep_job_retention(
+        self,
+        *,
+        reconcile_empty_retention_seconds: float = RECONCILE_EMPTY_RETENTION_SECONDS,
+        reconcile_claimed_or_failed_retention_seconds: float = RECONCILE_CLAIMED_OR_FAILED_RETENTION_SECONDS,
+        pipeline_retention_seconds: float = PIPELINE_RETENTION_SECONDS,
+        pipeline_failed_retention_seconds: float = PIPELINE_FAILED_RETENTION_SECONDS,
+        batch_size: int = RETENTION_BATCH_SIZE,
+        scan_limit: int = RECONCILE_EMPTY_SCAN_LIMIT,
+    ) -> dict[str, int]:
+        """Delete terminal jobs (and their audit_events) past their retention window.
+
+        Called from worker.py's `_maybe_sweep_retention`, throttled to once
+        per `SHELFMARK_RETENTION_SWEEP_INTERVAL_SECONDS` in that same
+        single-threaded loop -- see that function's docstring for why this
+        is not a second thread, process, or cron entry.
+
+        Every tier's WHERE clause below filters on
+        `status IN ('succeeded', 'failed', 'cancelled')` (or a subset of
+        those) -- NEVER `queued` or `running` -- so a job still live or
+        in flight can never be touched here, independent of how old
+        `created_at` is. `reconciled_torrents` is never referenced by any of
+        this: see the comment on its own `CREATE TABLE` in `initialize()`
+        for why that ledger is pruned by nothing, ever.
+
+        Returns a dict of rows deleted per tier, purely for logging --
+        `_maybe_sweep_retention` reports it, tests assert on it.
+        """
+        now_iso = utc_now()
+        now = datetime.fromisoformat(now_iso)
+
+        def cutoff(seconds: float) -> str:
+            return (now - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+        deleted = {
+            "reconcile_empty": 0,
+            "reconcile_claimed_or_failed": 0,
+            "pipeline": 0,
+            "pipeline_failed": 0,
+        }
+        with closing(self.connect()) as conn:
+            deleted["reconcile_empty"] = self._sweep_empty_reconciles(
+                conn, cutoff(reconcile_empty_retention_seconds), batch_size, scan_limit
+            )
+            # Every OTHER terminal reconcile_downloads row (claimed
+            # something, failed, or cancelled) -- the empty-claim tier above
+            # already removed every succeeded-and-empty row past ITS much
+            # shorter cutoff, so anything reconcile_downloads reaching this
+            # cutoff is, by construction, one of those three, and no JSON
+            # inspection is needed to tell them apart.
+            deleted["reconcile_claimed_or_failed"] = self._sweep_terminal_jobs(
+                conn,
+                "kind = 'reconcile_downloads' AND status IN ('succeeded', 'failed', 'cancelled') "
+                "AND COALESCE(finished_at, created_at) < ?",
+                (cutoff(reconcile_claimed_or_failed_retention_seconds),),
+                batch_size,
+            )
+            deleted["pipeline"] = self._sweep_terminal_jobs(
+                conn,
+                "kind != 'reconcile_downloads' AND status IN ('succeeded', 'cancelled') "
+                "AND COALESCE(finished_at, created_at) < ?",
+                (cutoff(pipeline_retention_seconds),),
+                batch_size,
+            )
+            deleted["pipeline_failed"] = self._sweep_terminal_jobs(
+                conn,
+                "kind != 'reconcile_downloads' AND status = 'failed' "
+                "AND COALESCE(finished_at, created_at) < ?",
+                (cutoff(pipeline_failed_retention_seconds),),
+                batch_size,
+            )
+        return deleted

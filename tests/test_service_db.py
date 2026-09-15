@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.shelfmark_service.db import Database
@@ -466,6 +467,235 @@ class HasActiveJobTests(unittest.TestCase):
         assert claimed is not None
         self.database.complete(claimed.id, "worker-a", {})
         self.assertFalse(self.database.has_active_job("reconcile_downloads"))
+
+
+class JobRetentionSweepTests(unittest.TestCase):
+    """`sweep_job_retention` -- see its own docstring in db.py, and the four
+    module-level RECONCILE_*/PIPELINE_* constants above it, for the
+    reasoning behind each tier's window."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-retention-test-")
+        self.database = Database(Path(self.tmp.name) / "state" / "shelfmark.db")
+        self.database.initialize()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _age_job(self, job_id: str, age_seconds: float) -> None:
+        """Back-date a job's created_at/finished_at so it looks `age_seconds` old.
+
+        Both columns are set, not just finished_at: `sweep_job_retention`
+        ages off `COALESCE(finished_at, created_at)` specifically to stay
+        correct even for a row that somehow has no finished_at, so a test
+        that only aged one of the two would not actually exercise the
+        column real terminal jobs always have populated.
+        """
+        aged = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat(timespec="seconds")
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET created_at = ?, finished_at = ? WHERE id = ?",
+                (aged, aged, job_id),
+            )
+
+    def _make_reconcile(self, claimed_jobs: list[str], status: str = "succeeded") -> str:
+        self.database.enqueue("reconcile_downloads", {})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        if status == "succeeded":
+            self.database.complete(
+                claimed.id,
+                "worker-a",
+                {"category": "shelfmark-books", "seen": 0, "completed": 0, "claimed_jobs": claimed_jobs},
+            )
+        elif status == "failed":
+            self.database.fail(claimed.id, "worker-a", "qBittorrent unreachable", code="upstream_unavailable")
+        else:
+            raise ValueError(status)
+        return claimed.id
+
+    def _make_pipeline(self, kind: str = "organize_apply", status: str = "succeeded") -> str:
+        self.database.enqueue(kind, {"source": "/incoming"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        if status == "succeeded":
+            self.database.complete(claimed.id, "worker-a", {"books": 1})
+        elif status == "failed":
+            self.database.fail(claimed.id, "worker-a", "boom", code="internal")
+        else:
+            raise ValueError(status)
+        return claimed.id
+
+    def test_empty_reconcile_older_than_its_own_window_is_deleted(self) -> None:
+        job_id = self._make_reconcile([])
+        self._age_job(job_id, 2 * 60 * 60)  # 2h old, past the 1h default window
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(deleted["reconcile_empty"], 1)
+        self.assertIsNone(self.database.get_job(job_id))
+
+    def test_empty_reconcile_within_its_window_is_kept(self) -> None:
+        job_id = self._make_reconcile([])
+        self._age_job(job_id, 60)  # 1 minute old
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(deleted["reconcile_empty"], 0)
+        self.assertIsNotNone(self.database.get_job(job_id))
+
+    def test_reconcile_that_claimed_something_survives_the_empty_tier_but_not_the_30_day_one(self) -> None:
+        job_id = self._make_reconcile(["some-other-job-id"])
+        # Past the empty tier's 1h window, but well inside the 30-day one --
+        # must survive because it claimed something.
+        self._age_job(job_id, 2 * 60 * 60)
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(deleted["reconcile_empty"], 0)
+        self.assertEqual(deleted["reconcile_claimed_or_failed"], 0)
+        self.assertIsNotNone(self.database.get_job(job_id))
+
+        self._age_job(job_id, 31 * 24 * 60 * 60)
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(deleted["reconcile_claimed_or_failed"], 1)
+        self.assertIsNone(self.database.get_job(job_id))
+
+    def test_failed_reconcile_follows_the_30_day_tier_not_the_1_hour_one(self) -> None:
+        job_id = self._make_reconcile([], status="failed")
+        self._age_job(job_id, 2 * 60 * 60)
+        deleted = self.database.sweep_job_retention()
+        # The empty-claim tier only ever inspects SUCCEEDED reconcile jobs --
+        # a failed one has no result_json to read "claimed_jobs" off of, and
+        # must not be swept this early.
+        self.assertEqual(deleted["reconcile_empty"], 0)
+        self.assertIsNotNone(self.database.get_job(job_id))
+
+        self._age_job(job_id, 31 * 24 * 60 * 60)
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(deleted["reconcile_claimed_or_failed"], 1)
+        self.assertIsNone(self.database.get_job(job_id))
+
+    def test_succeeded_pipeline_job_survives_89_days_but_not_91(self) -> None:
+        job_id = self._make_pipeline("organize_apply", "succeeded")
+        self._age_job(job_id, 89 * 24 * 60 * 60)
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(deleted["pipeline"], 0)
+        self.assertIsNotNone(self.database.get_job(job_id))
+
+        self._age_job(job_id, 91 * 24 * 60 * 60)
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(deleted["pipeline"], 1)
+        self.assertIsNone(self.database.get_job(job_id))
+
+    def test_failed_pipeline_job_survives_91_days_but_not_181(self) -> None:
+        job_id = self._make_pipeline("organize_apply", "failed")
+        self._age_job(job_id, 91 * 24 * 60 * 60)
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(deleted["pipeline"], 0)
+        self.assertEqual(deleted["pipeline_failed"], 0)
+        self.assertIsNotNone(self.database.get_job(job_id))
+
+        self._age_job(job_id, 181 * 24 * 60 * 60)
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(deleted["pipeline_failed"], 1)
+        self.assertIsNone(self.database.get_job(job_id))
+
+    def test_queued_and_running_jobs_are_never_deleted_regardless_of_age(self) -> None:
+        """The hard constraint: a job not in a terminal state must survive
+        no matter how old created_at claims it is."""
+        queued = self.database.enqueue("organize_apply", {"source": "/incoming"})
+        self._age_job(queued.id, 400 * 24 * 60 * 60)
+        self.database.enqueue("organize_apply", {"source": "/incoming"})
+        running = self.database.claim_next("worker-a")
+        assert running is not None
+        self._age_job(running.id, 400 * 24 * 60 * 60)
+
+        deleted = self.database.sweep_job_retention()
+        self.assertEqual(sum(deleted.values()), 0)
+        self.assertIsNotNone(self.database.get_job(queued.id))
+        self.assertIsNotNone(self.database.get_job(running.id))
+
+    def test_audit_events_are_deleted_alongside_their_job(self) -> None:
+        """`audit_events` must not outlive the job row it describes -- every
+        row in that table is target_type='job'/target_id=<job id> (see
+        `_delete_jobs_batch`'s docstring), so a leftover row here would be
+        pointing at a job that no longer exists."""
+        job_id = self._make_pipeline("organize_apply", "succeeded")
+        self._age_job(job_id, 91 * 24 * 60 * 60)
+        with self.database.connect() as conn:
+            before = conn.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE target_type = 'job' AND target_id = ?",
+                (job_id,),
+            ).fetchone()[0]
+        self.assertGreater(before, 0)
+
+        self.database.sweep_job_retention()
+
+        with self.database.connect() as conn:
+            after = conn.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE target_type = 'job' AND target_id = ?",
+                (job_id,),
+            ).fetchone()[0]
+        self.assertEqual(after, 0)
+
+    def test_reconciled_torrents_ledger_is_never_touched_by_a_sweep(self) -> None:
+        """The hard safety constraint: sweeping job history must never prune
+        the reconciler's idempotency ledger -- see the comment on that
+        table's CREATE TABLE in initialize() for why a missing row there
+        would make the reconciler re-import an already-imported torrent."""
+        claimed = self.database.claim_torrent_import(
+            "abc123", "Some Book (2020)", "transfer_completed", {"remote_path": "Some Book (2020)"}
+        )
+        assert claimed is not None
+        self._age_job(claimed.id, 400 * 24 * 60 * 60)
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE reconciled_torrents SET created_at = '2000-01-01T00:00:00+00:00' WHERE hash = ?",
+                ("abc123",),
+            )
+        self.database.sweep_job_retention()
+        with self.database.connect() as conn:
+            row = conn.execute("SELECT 1 FROM reconciled_torrents WHERE hash = ?", ("abc123",)).fetchone()
+        self.assertIsNotNone(row)
+
+    def test_batch_size_deletes_every_eligible_row_across_multiple_batches(self) -> None:
+        """A regression guard for the batching itself: with batch_size=2 and
+        5 eligible rows, the sweep must still remove every one of them by
+        looping, not silently stop after the first batch."""
+        job_ids = [self._make_pipeline("organize_apply", "succeeded") for _ in range(5)]
+        for job_id in job_ids:
+            self._age_job(job_id, 91 * 24 * 60 * 60)
+        deleted = self.database.sweep_job_retention(batch_size=2)
+        self.assertEqual(deleted["pipeline"], 5)
+        for job_id in job_ids:
+            self.assertIsNone(self.database.get_job(job_id))
+
+
+class ListJobsIncludeReconcilerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-list-jobs-test-")
+        self.database = Database(Path(self.tmp.name) / "state" / "shelfmark.db")
+        self.database.initialize()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_default_still_includes_every_kind(self) -> None:
+        """`list_jobs`'s OWN default must stay True: every existing caller
+        (see e.g. TorrentImportLedgerTests and HasActiveJobTests above) relies
+        on it seeing every kind unless told otherwise -- only api.py's
+        endpoint flips its default at the HTTP boundary."""
+        self.database.enqueue("reconcile_downloads", {})
+        self.database.enqueue("organize_apply", {"source": "/incoming"})
+        kinds = {job.kind for job in self.database.list_jobs(limit=50)}
+        self.assertEqual(kinds, {"reconcile_downloads", "organize_apply"})
+
+    def test_include_reconciler_false_hides_reconciler_ticks(self) -> None:
+        self.database.enqueue("reconcile_downloads", {})
+        self.database.enqueue("organize_apply", {"source": "/incoming"})
+        kinds = {job.kind for job in self.database.list_jobs(limit=50, include_reconciler=False)}
+        self.assertEqual(kinds, {"organize_apply"})
+
+    def test_include_reconciler_false_combines_with_a_status_filter(self) -> None:
+        self.database.enqueue("reconcile_downloads", {})
+        self.database.enqueue("organize_apply", {"source": "/incoming"})
+        jobs = self.database.list_jobs(status="queued", limit=50, include_reconciler=False)
+        self.assertEqual([job.kind for job in jobs], ["organize_apply"])
 
 
 if __name__ == "__main__":
