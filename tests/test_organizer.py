@@ -356,6 +356,39 @@ class SceneReleaseMetadataTests(unittest.TestCase):
             library / "Brenda Peynado" / "2021 - The Rock Eaters" / "The Rock Eaters.epub",
         )
 
+    def test_loose_ebook_title_has_no_dangling_extension_dot(self) -> None:
+        """A loose ebook file's own name runs through parse_name whole.
+
+        parse_name only strips a recognized AUDIO/ARCHIVE suffix up front;
+        ".epub" is neither, so it rides along as literal text. humanize()
+        only collapses dots when there are two or more (a real initial's
+        lone dot, "A. E.", must survive), so this single extension dot is
+        never touched there either — it only vanishes once strip_quality
+        removes the "epub" word sitting after it. Adding "epub" to
+        strip_quality's format-token list (the scene-release fix above) was
+        correct, but the cleanup that followed left the newly-orphaned dot
+        behind: title="Title ." instead of "Title".
+        """
+        source = self.root / "loose"
+        source.mkdir(parents=True)
+        (source / "Author Name - Title (1999).epub").write_bytes(b"epub-bytes")
+
+        plan = build_plan(
+            source=source,
+            dest=self.root / "loose-library",
+            trash=source / "trash",
+            folder_format="year-title",
+            keep_names=False,
+            include_non_cover_images=False,
+            media_mode="ebook",
+        )
+
+        self.assertEqual(len(plan.books), 1, plan.books)
+        meta = plan.books[0].meta
+        self.assertEqual(meta.author, "Author Name")
+        self.assertEqual(meta.title, "Title")
+        self.assertEqual(meta.year, "1999")
+
 
 class AtomicWriteTests(unittest.TestCase):
     """A file in the library is complete or absent, never half-written.

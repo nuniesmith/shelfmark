@@ -462,7 +462,17 @@ def strip_quality(text: str) -> str:
     text = SCENE_RE.sub(" ", text)
     text = QUALITY_RE.sub(" ", text)
     text = ASIN_RE.sub(" ", text)
-    text = re.sub(r"\s+", " ", text).strip(" -_|")
+    # "." joins the strip set here, not everywhere .strip(" -_|") appears in
+    # this file: a loose ebook file's own extension dot never gets collapsed
+    # by humanize (that only fires on 2+ separator-style dots, so a single
+    # ".epub" survives as a literal character), so removing "epub" above
+    # leaves "Title ." rather than "Title" -- the extension's separator dot
+    # with nothing after it. Titles legitimately ending in an abbreviation's
+    # period aren't affected: this only trims the EDGE of the string, after
+    # the token that used to sit there is already gone, and humanize keeps a
+    # real initial's dot (followed by a space, e.g. "A. E.") out of this
+    # function's input in the first place.
+    text = re.sub(r"\s+", " ", text).strip(" -_.|")
     return text
 
 
@@ -2789,6 +2799,19 @@ def self_test() -> int:
     opaque_meta = parse_name("tr8e3el")
     assert opaque_meta.author == "Unknown Author", opaque_meta
     assert opaque_meta.year is None, opaque_meta
+
+    # ── a removed format token must not leave a dangling separator ─────────
+    # A loose ebook file's own extension is not stripped by parse_name's
+    # initial suffix check (that only knows AUDIO_EXT/ARCHIVE_EXT, not
+    # ebook extensions) and is not collapsed by humanize either (which only
+    # fires on 2+ separator-style dots), so "Title (1999).epub" still has a
+    # literal ".epub" in it by the time strip_quality removes "epub" -- and
+    # used to leave "Title ." behind, the extension's dot with nothing after
+    # it. This is the initials assertion above ("A. E. van Vogt") in
+    # reverse: a real initial's dot is followed by a space, not the end of
+    # the string, so it is kept; a dot stranded at the very end by a
+    # removed token is not an initial and must go.
+    assert parse_name("Author Name - Title (1999).epub").title == "Title"
 
     print("self-test OK")
     shutil.rmtree(tmp, ignore_errors=True)
