@@ -74,6 +74,11 @@ TRASH_EXT = {
     ".nfo", ".sfv", ".md5", ".url", ".torrent", ".m3u", ".m3u8", ".pls",
     ".html", ".htm", ".log", ".cue", ".txt", ".ini", ".db", ".ds_store",
     ".part", ".crc", ".par2", ".exe", ".nzb",
+    # "file_id.diz" rides along in every scene release, same as the .nfo
+    # already above. Without this it fell through to "Unassigned file
+    # (skipped)", so a real download printed a warning on every single
+    # import — training the operator to stop reading them.
+    ".diz",
 }
 JUNK_NAMES = {
     "thumbs.db", "desktop.ini", ".ds_store",
@@ -1561,6 +1566,14 @@ class Plan:
     extracts: list[FileOp] = field(default_factory=list)
     trash: list[FileOp] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Books build_plan pulled OUT of `books` because their dest_dir already
+    # holds a different book under the same name (see colliding_tracks).
+    # Kept separate rather than left in `books` with a flag: every count in
+    # print_plan and _plan_summary ("Books N", "Tracks N") reads `books`
+    # directly, and a collision is not going to be organized normally, so
+    # counting it there would tell the operator files are landing somewhere
+    # they are not. apply_plan quarantines these instead of touching dest_dir.
+    collisions: list[BookPlan] = field(default_factory=list)
 
 
 def pick_cover(files: list[Path]) -> Path | None:
@@ -1901,6 +1914,26 @@ def build_plan(
             for op in book.extras:
                 if op.kind != "trash":
                     op.dest = dest_dir / op.dest.name
+
+    # A book whose dest_dir already holds different content is not this
+    # run's to merge in (see colliding_tracks). Pull it out of `books` now,
+    # after dest_dir has taken its final value above, so nothing downstream
+    # ever sees a destination that isn't safe to write straight into.
+    kept: list[BookPlan] = []
+    for book in plan.books:
+        hits = colliding_tracks(book)
+        if not hits:
+            kept.append(book)
+            continue
+        names = sorted({op.dest.name for op in hits})
+        shown = ", ".join(names[:5]) + ("…" if len(names) > 5 else "")
+        plan.warnings.append(
+            f"Collision: {rel(book.dest_dir, dest)} already exists with different "
+            f"content for {shown} — {book.meta.author} / {book.meta.title} was NOT "
+            f"merged in; the incoming copy will be quarantined for review instead."
+        )
+        plan.collisions.append(book)
+    plan.books = kept
     return plan
 
 
@@ -1916,6 +1949,42 @@ def files_identical(src: Path, dest: Path) -> bool:
         return filecmp.cmp(src, dest, shallow=False)
     except OSError:
         return False
+
+
+def colliding_tracks(book: BookPlan) -> list[FileOp]:
+    """Which of this book's own tracks/ebooks would overwrite a DIFFERENT
+    file already sitting at that destination path.
+
+    A test book named "Mary Shelley - Frankenstein (1818)" was organised
+    into a library that already held "Mary Shelley/1818 - Frankenstein/"
+    with tracks 01.mp3-09.mp3. Both parsed to the same dest_dir and the same
+    numbering, so the organiser wrote straight into the existing folder.
+    `unique_file` stopped an overwrite (the new tracks landed as
+    "01 (2).mp3", "02 (2).mp3") but nothing asked whether these were the
+    same book before writing — the library was left holding two overlapping
+    track sets with no warning at all.
+
+    `files_identical` already answers "is this the same content, already
+    here" (a rerun, or dest == source during an in-place reorganise) — this
+    only has to catch what it correctly says no to: a different file that
+    would still land on that name. Only `tracks` counts as evidence of "a
+    different copy of this book": extras (cover art, metadata.json) commonly
+    differ between two legitimate deliveries of the same book — a rescan, a
+    higher-resolution cover — and must not block a genuine addition on their
+    own. See apply_plan and build_plan for what this decides.
+    """
+    if not book.dest_dir.exists():
+        return []
+    hits: list[FileOp] = []
+    for op in book.tracks:
+        if not op.dest.exists():
+            continue
+        if op.src.resolve() == op.dest.resolve():
+            continue  # in-place reorganise: dest IS this file, not a rival copy
+        if files_identical(op.src, op.dest):
+            continue
+        hits.append(op)
+    return hits
 
 
 def unique_file(path: Path) -> Path:
@@ -2027,7 +2096,7 @@ def dirs_the_plan_empties(plan: "Plan") -> set[Path]:
     remove.
     """
     dirs: set[Path] = set()
-    for book in plan.books:
+    for book in plan.books + plan.collisions:
         for op in book.tracks + book.extras:
             dirs.add(op.src.parent)
     for op in plan.trash:
@@ -2223,7 +2292,9 @@ def _stage_book(book: BookPlan, copy: bool) -> tuple[Path, list[tuple[Path, Path
     return staging, moved
 
 
-def apply_plan(plan: Plan, trash: Path, dry_run: bool, copy: bool) -> None:
+def apply_plan(
+    plan: Plan, trash: Path, dry_run: bool, copy: bool, quarantine: Path | None = None
+) -> None:
     """Write the plan. In copy mode the source is READ, never written.
 
     Trashing is skipped entirely under --copy. It used to run, which meant a
@@ -2242,10 +2313,40 @@ def apply_plan(plan: Plan, trash: Path, dry_run: bool, copy: bool) -> None:
     file by file, exactly as before: it is already visible to a scan either
     way, so staging buys nothing, and `rename` cannot merge into a
     destination that already has files in it regardless.
+
+    `plan.collisions` never reaches either path above: build_plan already
+    pulled those books out because their dest_dir holds a DIFFERENT book
+    (colliding_tracks), and this writes each one's tracks and extras into its
+    own directory under `quarantine` instead — reusing the same holding area
+    a failed extraction uses rather than inventing a second one. The existing
+    dest_dir is never opened, read, or written for these.
     """
     transfer = copy_file if copy else move_file
     if not dry_run and not copy:
         trash.mkdir(parents=True, exist_ok=True)
+    for book in plan.collisions:
+        if dry_run:
+            continue
+        ops = book.tracks + book.extras
+        keep_ops = [op for op in ops if op.kind != "trash"]
+        trash_ops = [op for op in ops if op.kind == "trash"]
+        if keep_ops:
+            qroot = quarantine if quarantine is not None else trash.parent / ".shelfmark-quarantine"
+            qdir = quarantine_dir_for(qroot, book.source_dir)
+            for op in keep_ops:
+                try:
+                    target = qdir / op.dest.relative_to(book.dest_dir)
+                except ValueError:
+                    target = qdir / op.dest.name
+                ensure_parent(target)
+                transfer(op.src, target)
+            eprint(
+                f"  collision: {book.dest_dir} already exists with different "
+                f"content — quarantined incoming copy at {qdir}"
+            )
+        if not copy:
+            for op in trash_ops:
+                transfer(op.src, unique_trash_path(trash, op.src.name))
     for book in plan.books:
         if dry_run:
             continue
@@ -2299,6 +2400,8 @@ def print_plan(plan: Plan, source: Path, dest: Path) -> None:
         1 for b in plan.books for e in b.extras if e.kind == "trash"
     )
     print(f"Trash       {trash_n}")
+    if plan.collisions:
+        print(f"Quarantine  {len(plan.collisions)}  (dest already holds a different book — see Warnings)")
     print()
 
     if plan.extracts:
@@ -2430,7 +2533,7 @@ def run(args: argparse.Namespace) -> int:
     )
     print_plan(plan, source, dest)
 
-    if not plan.books and not plan.extracts:
+    if not plan.books and not plan.extracts and not plan.collisions:
         print("Nothing to do.")
         return 0
 
@@ -2496,7 +2599,7 @@ def run(args: argparse.Namespace) -> int:
                 return 1
 
     print("Moving files…")
-    apply_plan(plan, trash=trash, dry_run=False, copy=args.copy)
+    apply_plan(plan, trash=trash, dry_run=False, copy=args.copy, quarantine=quarantine)
 
     # Not under --copy: an empty directory in the dump is the operator's, and
     # nothing was taken out of it to make it empty.
@@ -2563,9 +2666,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--quarantine",
         help=(
-            "Where to hold the partial output of a failed extraction. "
-            "Defaults to <source>/.shelfmark-quarantine. The archive itself is "
-            "never moved there — a failed extract leaves it untouched."
+            "Where to hold the partial output of a failed extraction, and any "
+            "incoming book whose destination already holds a DIFFERENT book "
+            "under the same name (see Warnings in the plan). Defaults to "
+            "<source>/.shelfmark-quarantine. Neither the archive nor the "
+            "existing library book is ever moved there — only the new, "
+            "unmerged copy is."
         ),
     )
     p.add_argument(

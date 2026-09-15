@@ -352,7 +352,7 @@ unaffected either way.
 | `--keep-names` | Audio tracks as `01 - Chapter.mp3` instead of `01.mp3` |
 | `--keep-images` | Keep all images, not only cover |
 | `--yes` / `-y` | Skip confirmation. Required when there is no terminal (a pipe, cron, a script) — without it, `--apply` refuses rather than guessing |
-| `--quarantine DIR` | Where to hold the partial output of a failed extraction (default: `<source>/.shelfmark-quarantine`). The archive itself is never moved there |
+| `--quarantine DIR` | Where to hold the partial output of a failed extraction, and any incoming book whose destination already holds a *different* book under the same name (default: `<source>/.shelfmark-quarantine`). Neither the archive nor the existing library book is ever moved there |
 | `--trash-name NAME` | Junk folder name under source (default: `trash`) |
 | `--trash-unknown` | Move unrecognized non-media files to trash (default is to leave them for review) |
 | `--self-test` | Run built-in smoke tests |
@@ -379,7 +379,10 @@ unaffected either way.
 7. Applies known title/author fixes (e.g. missing King years, Clark → Clarke)
 8. Builds `Author / Year - Title /` and renumbers audio tracks
 9. Preserves known Audiobookshelf/ebook metadata sidecars and leaves unknown files for review
-10. Moves recognized junk into `trash/` (use `--trash-unknown` to opt into moving other files)
+10. Moves recognized junk into `trash/` — including scene-release clutter like `.nfo` and
+    `file_id.diz` (use `--trash-unknown` to opt into moving other files too)
+11. Refuses to merge an incoming book into a destination that already holds a *different*
+    book under the same name — the whole incoming copy goes to quarantine instead (see below)
 
 ## Supported formats
 
@@ -447,6 +450,41 @@ new tracks arriving for one already imported — still writes straight in, file
 by file, exactly as before: that folder is already visible to a scan either
 way, so staging buys nothing there, and `rename` cannot merge into a
 destination that already has files in it regardless.
+
+### What happens when the destination already holds a different book
+
+A test book named `Mary Shelley - Frankenstein (1818)` was once organised
+into a library that already had `Mary Shelley/1818 - Frankenstein/` with
+tracks `01.mp3`-`09.mp3`. Both parsed to the same destination folder and the
+same track numbering, so the organiser wrote straight into it. Nothing was
+lost — a half-written destination is impossible either way — but nothing
+distinguished "the same book, again" from "a different rip of the same
+book", so the new tracks landed beside the originals as `01 (2).mp3`,
+`02 (2).mp3`, with no warning that two overlapping track sets now shared one
+folder.
+
+Every incoming track and ebook is now compared against whatever already
+sits at its destination name. Identical content (the same file, delivered
+again, or an in-place reorganise scanning its own output) is always a
+no-op, exactly as before. Anything **different** at that name means the
+whole incoming book — not just the colliding file — is left alone by the
+library and moved to quarantine instead: printed as a warning in the plan,
+naming the destination and what is already there, and held under
+`--quarantine` for the operator to compare and merge by hand. The existing
+book is never opened, read, or written.
+
+This only catches a collision when the **incoming** file names actually
+match names already at the destination. Under the default renumbering
+(`01.mp3`, `02.mp3`, …) two rips of similar length reliably collide on name,
+which covers the common case above. Under `--keep-names`, or when the
+incoming rip has a very different track count, two genuinely different
+copies of the same book can still end up filed into one folder with
+disjoint names and no warning — this checks file identity at each shared
+name, not whether the two deliveries are "the same edition" as a whole. A
+differing cover image or `metadata.json` alone does not trigger this either:
+those commonly differ between two honest deliveries of the same book, so
+only the tracks and ebook files themselves count as evidence of a different
+copy.
 
 ### What happens when an archive is broken
 

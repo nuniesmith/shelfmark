@@ -99,6 +99,25 @@ class OrganizerSafetyTests(unittest.TestCase):
             )
         )
 
+    def test_scene_release_junk_is_trashed_not_flagged(self) -> None:
+        """file_id.diz and .nfo ride along with every scene release. Left
+        unclassified they became "Unassigned sidecar (skipped)" warnings on
+        every single real import, training the operator to stop reading
+        them. Both must be trashed, silently, like the rest of the release
+        clutter (.sfv, .nzb, ...) already is.
+        """
+        source = self.root / "scene"
+        book = source / "Some Author - The Book (2001)"
+        self.touch(book / "01.mp3")
+        self.touch(book / "file_id.diz", b"ascii art")
+        self.touch(book / "some-group.nfo", b"release notes")
+
+        result = self.plan(source, media_mode="audio")
+
+        self.assertFalse(result.warnings, result.warnings)
+        trashed = {op.src.name for item in result.books for op in item.extras if op.kind == "trash"}
+        self.assertEqual(trashed, {"file_id.diz", "some-group.nfo"})
+
     def test_multipart_sets_are_isolated_by_parent_directory(self) -> None:
         source = self.root / "multipart"
         for folder in (source / "first", source / "second"):
@@ -137,6 +156,122 @@ class OrganizerSafetyTests(unittest.TestCase):
 
         files = sorted(path.name for path in dest.rglob("*.mp3"))
         self.assertEqual(files, ["01.mp3"])
+
+    def test_existing_book_with_different_content_is_quarantined_not_merged(self) -> None:
+        """The Frankenstein defect: a test book named "Mary Shelley -
+        Frankenstein (1818)" organised into a library that already held
+        "Mary Shelley/1818 - Frankenstein/" with tracks 01.mp3-09.mp3. Both
+        parsed to the same dest_dir and the same track numbering, so the
+        organiser wrote straight in; `unique_file` stopped an overwrite but
+        the library was left holding two overlapping track sets with
+        nothing reported. The incoming copy must be quarantined instead,
+        and the existing book must not be touched at all.
+        """
+        dest = self.root / "library"
+        existing = dest / "Mary Shelley" / "1818 - Frankenstein"
+        for i in range(1, 10):
+            self.touch(existing / f"{i:02d}.mp3", f"original track {i}".encode())
+
+        source = self.root / "dump"
+        self.touch(
+            source / "Mary Shelley - Frankenstein (1818)" / "01.mp3",
+            b"a completely different rip - track 1",
+        )
+        self.touch(
+            source / "Mary Shelley - Frankenstein (1818)" / "02.mp3",
+            b"a completely different rip - track 2",
+        )
+
+        plan = self.plan(source, dest, media_mode="audio")
+
+        self.assertEqual(plan.books, [], "a colliding book must not be planned as a normal write")
+        self.assertEqual(len(plan.collisions), 1)
+        self.assertTrue(
+            any("Mary Shelley" in w and "Frankenstein" in w for w in plan.warnings),
+            plan.warnings,
+        )
+
+        quarantine = source / ".shelfmark-quarantine"
+        apply_plan(plan, trash=source / "trash", dry_run=False, copy=False, quarantine=quarantine)
+
+        # The existing book is completely untouched: still nine tracks, and
+        # track 1 still holds the ORIGINAL bytes, not the incoming ones.
+        self.assertEqual(
+            sorted(p.name for p in existing.glob("*.mp3")),
+            [f"{i:02d}.mp3" for i in range(1, 10)],
+        )
+        self.assertEqual((existing / "01.mp3").read_bytes(), b"original track 1")
+        self.assertFalse(
+            any((existing / name).exists() for name in ("01 (2).mp3", "02 (2).mp3")),
+            "unique_file's renamed duplicates must never have been written at all",
+        )
+
+        # The incoming copy landed under quarantine, not in the library.
+        quarantined = list(quarantine.rglob("*.mp3"))
+        self.assertEqual(len(quarantined), 2)
+        self.assertEqual(
+            {p.read_bytes() for p in quarantined},
+            {b"a completely different rip - track 1", b"a completely different rip - track 2"},
+        )
+
+    def test_quarantined_collision_leaves_no_empty_folder_in_the_dump(self) -> None:
+        """A quarantined collision still has to be swept from the dump like
+        any other consumed book. `remove_empty_dirs` only prunes a directory
+        `dirs_the_plan_empties` names, and that helper originally listed only
+        `plan.books` — a collision's source folder was left behind, empty,
+        in the dump after every one of its files had already been moved to
+        quarantine.
+        """
+        dest = self.root / "library"
+        existing = dest / "Mary Shelley" / "1818 - Frankenstein"
+        self.touch(existing / "01.mp3", b"original")
+
+        source = self.root / "dump"
+        book_dir = source / "Mary Shelley - Frankenstein (1818)"
+        self.touch(book_dir / "01.mp3", b"a different rip")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main([str(source), "--dest", str(dest), "--apply", "--yes"])
+
+        self.assertEqual(code, 0)
+        self.assertFalse(book_dir.exists(), "the emptied source folder was left behind")
+
+    def test_genuinely_new_tracks_still_merge_into_an_existing_book(self) -> None:
+        """The other half of the same line: a book already on disk can
+        legitimately receive more tracks later (a supplementary download, a
+        sync re-delivering new chapters). When the incoming file names do
+        not collide with anything already at dest_dir, this is an addition,
+        not a collision, and must land in the existing folder untouched.
+        """
+        dest = self.root / "library"
+        existing = dest / "Some Author" / "2001 - The Book"
+        self.touch(existing / "01.mp3", b"track one")
+        self.touch(existing / "02.mp3", b"track two")
+
+        source = self.root / "dump"
+        # keep_names so the freshly-scanned file does not get renumbered
+        # back down to "01.mp3" and collide with what's already there.
+        self.touch(source / "Some Author - The Book (2001)" / "03 - Bonus Chapter.mp3", b"bonus")
+
+        plan = build_plan(
+            source=source,
+            dest=dest,
+            trash=source / "trash",
+            folder_format="year-title",
+            keep_names=True,
+            include_non_cover_images=False,
+            media_mode="audio",
+        )
+
+        self.assertEqual(plan.collisions, [])
+        self.assertEqual(plan.warnings, [])
+
+        apply_plan(plan, trash=source / "trash", dry_run=False, copy=False)
+
+        self.assertEqual((existing / "01.mp3").read_bytes(), b"track one")
+        self.assertEqual((existing / "02.mp3").read_bytes(), b"track two")
+        self.assertTrue(any(existing.glob("*Bonus Chapter.mp3")), list(existing.iterdir()))
 
 
 class IsolatedExtractionTests(unittest.TestCase):
