@@ -273,6 +273,63 @@ class OrganizerSafetyTests(unittest.TestCase):
         self.assertEqual((existing / "02.mp3").read_bytes(), b"track two")
         self.assertTrue(any(existing.glob("*Bonus Chapter.mp3")), list(existing.iterdir()))
 
+    def test_KNOWN_GAP_keep_names_lets_a_different_copy_merge_silently(self) -> None:
+        """colliding_tracks only catches a collision when the INCOMING file
+        names happen to match names already at dest_dir. Default renumbering
+        (01.mp3, 02.mp3, ...) makes that reliable, but `--keep-names` keeps
+        whatever the source called its files -- so a genuinely different
+        copy of the same book, ripped/named differently upstream, produces
+        disjoint filenames and is not detected at all. Both copies land in
+        the same folder, interleaved, with no warning.
+
+        This is a documented, accepted gap (see README's "What happens when
+        the destination already holds a different book" and todo.md), not a
+        regression to silently tolerate: it asserts CURRENT behaviour so a
+        future fix for --keep-names has something concrete to flip red.
+        The automatic/service pipeline never passes --keep-names, so this
+        does not affect the unattended path.
+        """
+        dest = self.root / "library"
+        existing = dest / "Some Author" / "2001 - The Book"
+        self.touch(existing / "01 - Part A.mp3", b"original part A")
+        self.touch(existing / "02 - Part B.mp3", b"original part B")
+
+        source = self.root / "dump"
+        book = source / "Some Author - The Book (2001)"
+        self.touch(book / "Chapter One.mp3", b"a completely different rip - chapter one")
+        self.touch(book / "Chapter Two.mp3", b"a completely different rip - chapter two")
+
+        plan = build_plan(
+            source=source,
+            dest=dest,
+            trash=source / "trash",
+            folder_format="year-title",
+            keep_names=True,
+            include_non_cover_images=False,
+            media_mode="audio",
+        )
+
+        # Not detected: this is the gap, not the fix.
+        self.assertEqual(plan.collisions, [])
+        self.assertEqual(plan.warnings, [])
+
+        apply_plan(plan, trash=source / "trash", dry_run=False, copy=False)
+
+        # Both copies now sit in the same folder, interleaved, silently.
+        # --keep-names still prefixes with a LOCAL index ("01 - ", "02 - ",
+        # renumbered from 1 within this incoming set alone), so the full
+        # names happen not to collide even though both are "track one" of
+        # their respective copies.
+        self.assertEqual(
+            sorted(p.name for p in existing.glob("*.mp3")),
+            ["01 - Chapter One.mp3", "01 - Part A.mp3", "02 - Chapter Two.mp3", "02 - Part B.mp3"],
+        )
+        self.assertEqual((existing / "01 - Part A.mp3").read_bytes(), b"original part A")
+        self.assertEqual(
+            (existing / "01 - Chapter One.mp3").read_bytes(),
+            b"a completely different rip - chapter one",
+        )
+
 
 class IsolatedExtractionTests(unittest.TestCase):
     """Extraction stages, validates, then moves into place in one step.

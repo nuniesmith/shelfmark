@@ -474,17 +474,38 @@ naming the destination and what is already there, and held under
 book is never opened, read, or written.
 
 This only catches a collision when the **incoming** file names actually
-match names already at the destination. Under the default renumbering
-(`01.mp3`, `02.mp3`, …) two rips of similar length reliably collide on name,
-which covers the common case above. Under `--keep-names`, or when the
-incoming rip has a very different track count, two genuinely different
-copies of the same book can still end up filed into one folder with
-disjoint names and no warning — this checks file identity at each shared
-name, not whether the two deliveries are "the same edition" as a whole. A
-differing cover image or `metadata.json` alone does not trigger this either:
-those commonly differ between two honest deliveries of the same book, so
-only the tracks and ebook files themselves count as evidence of a different
-copy.
+match names already at the destination — it checks file identity at each
+shared name, not whether the two deliveries are "the same edition" as a
+whole. A differing cover image or `metadata.json` alone does not trigger
+this either: those commonly differ between two honest deliveries of the same
+book, so only the tracks and ebook files themselves count as evidence of a
+different copy.
+
+Without `--keep-names` (the default, and what the automatic/service
+pipeline always uses), tracks are unconditionally renumbered from `01`
+within the incoming set alone, so a track count very different from what's
+already at the destination does **not** avoid detection — the incoming
+`01.mp3` still lands on the existing `01.mp3` and the mismatch is still
+caught. Measured directly: delivering a genuinely missing track by itself
+(e.g. just a `03.mp3` for a book that already has two tracks) gets
+renumbered to `01.mp3` too, collides with the existing first track, and
+quarantines the whole one-file delivery — nothing is lost, and the warning
+names the path, so this fails safe, but "I have the track that was missing"
+is an ordinary thing to want to do and it now needs pulling out of
+quarantine by hand. The reliable workaround is to re-deliver the **whole**
+book (all its existing tracks, bit-identical, plus the new one) in one
+folder: every already-present track then matches on both name and content,
+only the new one is actually new, and it merges into the existing folder
+with no collision.
+
+**The real gap is `--keep-names`.** It preserves whatever the source called
+its files instead of renumbering, so a genuinely different copy of the same
+book — ripped and named differently upstream — can produce file names that
+never match anything already at the destination. Detection never fires,
+and both copies are filed into the same folder, interleaved, with no
+warning at all. This does not affect the automatic/unattended pipeline,
+which never passes `--keep-names`; it is a real risk only for a manual,
+`--keep-names` run.
 
 ### What happens when an archive is broken
 
