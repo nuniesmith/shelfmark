@@ -7,10 +7,11 @@ import os
 import posixpath
 import signal
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from .clients import AudiobookshelfClient, HttpClient, ProwlarrClient, QBittorrentClient, ServiceError
+from .clients import AudiobookshelfClient, HttpClient, QBittorrentClient, ServiceError
 from .config import Settings
 from .db import Database, Job
 from .errors import ErrorCode, ShelfmarkError
@@ -45,6 +46,74 @@ def _upstream_failure(exc: ServiceError) -> ShelfmarkError:
         f"{exc.service} request failed",
         details={"service": exc.service, "status": exc.status},
     )
+
+
+def _release_download_source(release: dict[str, Any], qbittorrent_prowlarr_base_url: str) -> str:
+    """Resolve the URL `grab_release` hands to qBittorrent from one release.
+
+    Prowlarr's own `/api/v1/search` grab endpoint routes to WHATEVER download
+    client Prowlarr itself has configured -- on the live system that is one
+    client, with category `prowlarr`, not `shelfmark-books`. The reconciler
+    only ever watches the latter, so a release grabbed that way sits in
+    qBittorrent forever and never reaches the pipeline. The fix is to skip
+    Prowlarr's routing entirely and hand qBittorrent the release directly, in
+    the category the reconciler actually watches (see the `grab_release`
+    branch of `execute()` below) -- which means resolving a URL qBittorrent
+    itself can fetch, from data the release object already carries.
+
+    A magnet URI needs no rewriting: it has no proxying host in front of it,
+    just an info-hash qBittorrent resolves over DHT/trackers directly. An
+    http(s) `downloadUrl` is different -- for a private tracker (IPTorrents)
+    it is a PROWLARR-proxied link
+    (`http://<prowlarr-host>:9696/1/download?apikey=...&link=...`): Prowlarr
+    fetches the real .torrent from the tracker using its own credentials and
+    serves it back, which is what lets qBittorrent fetch it with no tracker
+    auth of its own. But the host in that URL is Prowlarr's OWN view of
+    itself, which is not necessarily reachable from qBittorrent's network
+    namespace -- verified live from inside the qBittorrent container on
+    Sullivan: `sullivan:9696` (Prowlarr's own hostname) refused the
+    connection, while `prowlarr:9696` -- the name both containers resolve on
+    their shared `sullivan_download` Docker network -- answered fine. So only
+    the scheme and host are rewritten, to `qbittorrent_prowlarr_base_url`;
+    the path and the ENTIRE query string are passed through untouched,
+    because `apikey` and `link` both live there and are what actually
+    authorizes the download. Passing the original host through unchanged
+    would have qBittorrent silently accept the add and then never fetch
+    anything -- there would be no error, just nothing arriving.
+
+    Release results never carry a `downloadClientId`, so there is no way to
+    redirect Prowlarr's OWN grab to a different one of its download clients
+    through the release body -- going around Prowlarr's routing entirely, as
+    this function does, is the only lever available.
+    """
+    download_url = release.get("downloadUrl")
+    magnet_url = release.get("magnetUrl")
+    source = (
+        download_url
+        if isinstance(download_url, str) and download_url.strip()
+        else magnet_url if isinstance(magnet_url, str) and magnet_url.strip() else None
+    )
+    if not source:
+        raise ShelfmarkError(
+            ErrorCode.INVALID_PAYLOAD, "release has neither a downloadUrl nor a magnetUrl"
+        )
+    if source.startswith("magnet:"):
+        return source
+    parsed = urllib.parse.urlsplit(source)
+    if not parsed.scheme or not parsed.netloc:
+        # Deliberately never interpolate `source` (or any part of it) into
+        # this message: it is a Prowlarr downloadUrl, and its query string
+        # carries Prowlarr's own apikey. A job's stored error is exactly the
+        # kind of place `_upstream_failure` above already refuses to leak
+        # upstream detail into -- the same rule applies here.
+        raise ShelfmarkError(ErrorCode.INVALID_PAYLOAD, "release downloadUrl is not a valid http(s) URL")
+    base = urllib.parse.urlsplit(qbittorrent_prowlarr_base_url)
+    if not base.scheme or not base.netloc:
+        raise ShelfmarkError(
+            ErrorCode.PROVIDER_NOT_CONFIGURED,
+            "QBITTORRENT_PROWLARR_BASE_URL is not a valid http(s) URL",
+        )
+    return urllib.parse.urlunsplit((base.scheme, base.netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 # qBittorrent's own "genuinely done" states, from GET /api/v2/torrents/info.
@@ -308,23 +377,43 @@ class Worker:
                 "verified": True,
             }
         if job.kind == "grab_release":
-            if not self.settings.prowlarr_url or not self.settings.prowlarr_api_key:
-                raise ShelfmarkError(ErrorCode.PROVIDER_NOT_CONFIGURED, "Prowlarr integration is not configured")
+            # NOT ProwlarrClient.grab() -- that POSTs to Prowlarr's own
+            # /api/v1/search, which hands the release to WHATEVER download
+            # client Prowlarr itself has configured. On the live system that
+            # is one client, fixed to category `prowlarr`, never
+            # `shelfmark-books` -- so a release grabbed that way sat in
+            # qBittorrent forever, in a category the reconciler does not
+            # watch, and never reached the pipeline. This adds the release to
+            # qBittorrent directly, in the SAME category the reconciler reads
+            # (`self.settings.qbittorrent_category`), so the two can never
+            # drift apart. See `_release_download_source` for how the URL
+            # itself is resolved.
+            if not self.settings.qbittorrent_url:
+                raise ShelfmarkError(ErrorCode.PROVIDER_NOT_CONFIGURED, "qBittorrent integration is not configured")
+            if not self.settings.qbittorrent_api_key and not (
+                self.settings.qbittorrent_username and self.settings.qbittorrent_password
+            ):
+                raise ShelfmarkError(ErrorCode.PROVIDER_NOT_CONFIGURED, "qBittorrent credentials are not configured")
             release = job.payload.get("release")
             if not isinstance(release, dict) or not release:
                 raise ShelfmarkError(ErrorCode.INVALID_PAYLOAD, "job payload requires a release object")
-            client = ProwlarrClient(
-                self.settings.prowlarr_url,
-                self.settings.prowlarr_api_key,
+            add_url = _release_download_source(release, self.settings.qbittorrent_prowlarr_base_url)
+            client = QBittorrentClient(
+                self.settings.qbittorrent_url,
+                username=self.settings.qbittorrent_username,
+                password=self.settings.qbittorrent_password,
+                api_key=self.settings.qbittorrent_api_key,
                 timeout=self.settings.http_timeout,
                 retries=self.settings.http_retries,
                 breaker_failure_threshold=self.settings.circuit_breaker_failure_threshold,
                 breaker_cooldown_seconds=self.settings.circuit_breaker_cooldown_seconds,
             )
             try:
-                return {"release": release, "upstream": client.grab(release), "submitted": True}
+                client.login()
+                upstream = client.add_urls([add_url], category=self.settings.qbittorrent_category)
             except ServiceError as exc:
                 raise _upstream_failure(exc) from exc
+            return {"release": release, "upstream": upstream, "submitted": True}
         if job.kind == "reconcile_downloads":
             return self._reconcile_downloads(job)
         if job.kind not in {"organize_preview", "organize_apply"}:

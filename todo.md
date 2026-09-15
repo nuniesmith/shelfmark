@@ -17,6 +17,8 @@ Docker is not installed in the review environment.
 
 ## Current progress
 
+**Fixed 2026-09-14.** PR #17's `reconcile_downloads` only ever watches qBittorrent's `shelfmark-books` category, but `grab_release` still called `ProwlarrClient.grab()`, which POSTs to Prowlarr's OWN `/api/v1/search` and hands the release to whatever download client Prowlarr itself has configured — on the live system, one client fixed to category `prowlarr`. Every grabbed release landed in a category the reconciler never watches and sat there forever, making the whole automated pipeline inert. `grab_release` now adds the release to qBittorrent directly with `QBittorrentClient.add_urls()`, reading the SAME `QBITTORRENT_CATEGORY` setting the reconciler does so the two can never drift apart again. See the "Automatic download pipeline" section in README.md and `QBITTORRENT_PROWLARR_BASE_URL` in `.env.example` for the URL-rewrite this required.
+
 **Deployed 2026-09-12.** Shelfmark runs on Freddy beside Audiobookshelf:
 `shelfmark-api` and `shelfmark-worker` from `ghcr.io/nuniesmith/shelfmark:latest`,
 published at `shelfmark.7gram.xyz` through Princess. The Discord bot sits behind a
@@ -220,7 +222,7 @@ Use Prowlarr for new-release search and grabbing:
 - `GET /api/v1/search` for results.
 - `POST /api/v1/search` for the selected release.
 
-Prefer the Prowlarr grab path so its configured download client and indexer handling remain authoritative. Store the release GUID and Prowlarr response for recovery and duplicate detection.
+~~Prefer the Prowlarr grab path so its configured download client and indexer handling remain authoritative.~~ **Reversed 2026-09-14**: `POST /api/v1/search` routes to WHATEVER download client Prowlarr itself has configured — on the live system that is one client, fixed to category `prowlarr`, never `shelfmark-books`, so a release grabbed that way sat in qBittorrent forever, in a category the reconciler never watches. `grab_release` now adds the release to qBittorrent directly (`QBittorrentClient.add_urls`), in the exact category the reconciler reads (`QBITTORRENT_CATEGORY`), and rewrites the scheme+host of a `downloadUrl` to `QBITTORRENT_PROWLARR_BASE_URL` (default `http://prowlarr:9696`) since Prowlarr's own view of its hostname is not always reachable from qBittorrent's network namespace — see the "Automatic download pipeline" section in README.md. Store the release GUID and Prowlarr response for recovery and duplicate detection.
 
 Reference: <https://github.com/devopsarr/prowlarr-py/blob/main/docs/SearchApi.md>
 
@@ -251,7 +253,7 @@ Reference: <https://github.com/qbittorrent/qBittorrent/wiki/Web-API-Documentatio
 2. Shelfmark searches Prowlarr.
 3. The bot displays title, author, format, size, indexer, seeders, and quality.
 4. User selects a result and confirms.
-5. Shelfmark submits the selected release through Prowlarr. **[x] implemented** — `grab_release` job via the `Grab` button on `/release-search` and `/ebook-request`.
+5. Shelfmark submits the selected release. **[x] implemented** — `grab_release` job via the `Grab` button on `/release-search` and `/ebook-request`. **Not through Prowlarr's own grab endpoint** (fixed 2026-09-14: that routed to Prowlarr's own configured download client, in a category the reconciler never watched, so nothing ever reached step 7) — the job adds the release directly to qBittorrent instead, in the reconciler's own configured category.
 6. ~~The worker records the Prowlarr release ID and qBittorrent hash.~~ **Not needed as designed**: the `reconcile_downloads` reconciler (step 7) identifies completed torrents directly from qBittorrent's own listing by hash, rather than needing grab_release to hand one forward.
 7. The worker polls qBittorrent until files are complete and stable. **[x] implemented** — periodic `reconcile_downloads` job (not a per-torrent watcher; see the "Automatic download pipeline" section in README.md), checking qBittorrent's *state*, not just `progress == 1` (a recheck or an in-progress move both report 100% while unsafe to pull).
 8. Freddy pulls only the Shelfmark category over restricted SSH/rsync. **[x] implemented** — `transfer_completed`, now auto-enqueued by the reconciler for any newly-claimed torrent hash.
@@ -458,7 +460,7 @@ Acceptance criteria:
 Acceptance criteria:
 
 - Freddy can search Prowlarr and receive results.
-- A selected release is grabbed by Prowlarr into the Shelfmark qBittorrent category.
+- A selected release is added directly to qBittorrent in the Shelfmark category by the worker (not routed through Prowlarr's own download client — see the "Prowlarr" section above).
 - The worker can detect completion and transfer the files to Freddy.
 - Unpackerr does not race with Shelfmark.
 

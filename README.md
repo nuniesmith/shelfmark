@@ -232,6 +232,34 @@ notice qBittorrent finished, call `/transfers/pull`, run the organizer, and
 trigger a library scan by hand. The worker now does all four stages on its
 own once a grab lands.
 
+**The grab itself goes straight to qBittorrent, not through Prowlarr.**
+`grab_release` used to call `ProwlarrClient.grab()`, which POSTs to
+Prowlarr's own `/api/v1/search` and hands the release to whatever download
+client PROWLARR itself has configured. On a deployment with one configured
+client, every grab lands in that client's own category — not necessarily
+`QBITTORRENT_CATEGORY` — so the reconciler above never sees it and the
+whole pipeline sits inert with releases stuck in qBittorrent forever.
+`grab_release` now calls `QBittorrentClient.add_urls()` directly, in the
+exact same `QBITTORRENT_CATEGORY` the reconciler reads, so the two settings
+can never drift apart. It takes the release's `downloadUrl` (or `magnetUrl`
+if that's what the release carries instead — a magnet needs no proxy and is
+passed through byte for byte). A private-tracker `downloadUrl` looks like
+`http://<prowlarr-host>:9696/1/download?apikey=...&link=...`: Prowlarr
+fetches the actual `.torrent` from the tracker using its own credentials and
+serves it back, which is what lets qBittorrent fetch a private-tracker
+release (IPTorrents, here) with no tracker auth of its own. But the host in
+that URL is Prowlarr's own view of itself, and that is not guaranteed to be
+reachable from qBittorrent's network namespace — on this deployment,
+Prowlarr's `sullivan:9696` hostname refused the connection from inside the
+qBittorrent container, while `prowlarr:9696` (the name both resolve on
+their shared Docker network) answered fine. So only the scheme and host are
+rewritten, to `QBITTORRENT_PROWLARR_BASE_URL` (default `http://prowlarr:9696`,
+matching `PROWLARR_URL`'s own container-name convention); the path and the
+entire query string are left untouched, since `apikey` and `link` both live
+there and are what actually authorizes the download. Passing the original
+host through unchanged would not raise an error — qBittorrent would simply
+accept the add and never fetch anything.
+
 **A reconciler, not a per-torrent watcher.** The worker enqueues its own
 `reconcile_downloads` job on a timer (default every
 `SHELFMARK_RECONCILE_INTERVAL_SECONDS=60`, driven from the same `while`

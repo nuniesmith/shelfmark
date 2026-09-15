@@ -64,6 +64,26 @@ class DownloadAutomationSettingsTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"QBITTORRENT_CATEGORY": "other-books"}, clear=True):
             self.assertEqual(Settings.from_env().qbittorrent_category, "other-books")
 
+    def test_qbittorrent_prowlarr_base_url_defaults_to_the_shared_docker_network_name(self) -> None:
+        # Verified live: `prowlarr:9696` answers from inside the qBittorrent
+        # container on the shared `sullivan_download` network; Prowlarr's own
+        # `sullivan:9696` hostname does not. Matches the container-name
+        # convention PROWLARR_URL already uses in .env.example.
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(
+                Settings.from_env().qbittorrent_prowlarr_base_url, "http://prowlarr:9696"
+            )
+
+    def test_qbittorrent_prowlarr_base_url_is_configurable(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {"QBITTORRENT_PROWLARR_BASE_URL": "http://100.87.125.19:9696"},
+            clear=True,
+        ):
+            self.assertEqual(
+                Settings.from_env().qbittorrent_prowlarr_base_url, "http://100.87.125.19:9696"
+            )
+
     def test_discord_webhook_url_defaults_to_none(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertIsNone(Settings.from_env().discord_webhook_url)
