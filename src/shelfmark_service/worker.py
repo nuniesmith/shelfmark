@@ -837,6 +837,55 @@ def _maybe_enqueue_reconcile(database: Database, settings: Settings, now: float,
     return now
 
 
+def _maybe_sweep_retention(database: Database, settings: Settings, now: float, last_sweep: float) -> float:
+    """Delete terminal jobs (and their audit_events) past their retention window, if due.
+
+    Mirrors `_maybe_enqueue_reconcile`/`_maybe_record_liveness` in every
+    respect that matters: `now`/`last_sweep` are both `time.monotonic()`
+    values, not wall clock, so a system clock step can never cause a burst
+    of skipped or duplicated sweeps; it is split out of `main()` so a test
+    can ask "is a sweep due" without an actual infinite loop running; and it
+    runs inside THIS same single-threaded loop rather than a second thread,
+    process, or cron entry, for the identical reason neither of those two
+    functions does either (see the module docstring: no threads). Deleting
+    is a SQLite write like any job claim, so it goes through the one loop
+    that already owns every other write to this database.
+
+    Throttled to once per `settings.retention_sweep_interval_seconds`
+    (default 1h): `reconcile_downloads` ticks every
+    `reconcile_interval_seconds` (60s default), so running this on every
+    idle loop iteration would mean re-issuing all four retention SELECTs
+    roughly sixty times more often than even the shortest tier
+    (`retention_reconcile_empty_seconds`, itself 1h by default) actually
+    changes -- all cost, no benefit, since nothing new becomes eligible for
+    deletion between two sweeps a few seconds apart.
+    """
+    if now - last_sweep < settings.retention_sweep_interval_seconds:
+        return last_sweep
+    deleted = database.sweep_job_retention(
+        reconcile_empty_retention_seconds=settings.retention_reconcile_empty_seconds,
+        reconcile_claimed_or_failed_retention_seconds=settings.retention_reconcile_seconds,
+        pipeline_retention_seconds=settings.retention_pipeline_seconds,
+        pipeline_failed_retention_seconds=settings.retention_pipeline_failed_seconds,
+    )
+    total = sum(deleted.values())
+    if total:
+        # Silent when there is nothing to report -- an hourly "deleted
+        # nothing" line for the entire lifetime of a quiet deployment would
+        # be pure log noise, the same reasoning `run_once` already applies
+        # by only logging when a job actually existed to claim.
+        logger.info(
+            "retention sweep deleted total=%s reconcile_empty=%s "
+            "reconcile_claimed_or_failed=%s pipeline=%s pipeline_failed=%s",
+            total,
+            deleted["reconcile_empty"],
+            deleted["reconcile_claimed_or_failed"],
+            deleted["pipeline"],
+            deleted["pipeline_failed"],
+        )
+    return now
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("SHELFMARK_LOG_LEVEL", "INFO"),
@@ -865,11 +914,13 @@ def main() -> None:
     # under a second rather than a full `worker_liveness_stale_seconds`.
     last_reconcile = 0.0
     last_liveness = 0.0
+    last_retention_sweep = 0.0
     while not stopping:
         database.requeue_stale(settings.worker_stale_seconds, actor=settings.worker_id)
         now = time.monotonic()
         last_liveness = _maybe_record_liveness(database, settings, now, last_liveness)
         last_reconcile = _maybe_enqueue_reconcile(database, settings, now, last_reconcile)
+        last_retention_sweep = _maybe_sweep_retention(database, settings, now, last_retention_sweep)
         if not worker.run_once():
             time.sleep(settings.poll_interval)
 

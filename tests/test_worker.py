@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -29,6 +30,7 @@ from src.shelfmark_service.worker import (
     _is_torrent_complete,
     _maybe_enqueue_reconcile,
     _maybe_record_liveness,
+    _maybe_sweep_retention,
     _release_download_source,
     _split_webhook_url,
     check_liveness_cli,
@@ -951,6 +953,60 @@ class MaybeRecordLivenessTests(WorkerTestCase):
         with self.database.connect() as conn:
             count = conn.execute("SELECT COUNT(*) FROM worker_liveness").fetchone()[0]
         self.assertEqual(count, 2)
+
+
+class MaybeSweepRetentionTests(WorkerTestCase):
+    """`_maybe_sweep_retention` -- the throttle itself; `sweep_job_retention`'s
+    own tests (test_service_db.py's JobRetentionSweepTests) cover which rows
+    a sweep actually deletes."""
+
+    def _make_old_pipeline_job(self, age_seconds: float) -> str:
+        self.database.enqueue("organize_apply", {"source": "/incoming"})
+        claimed = self.database.claim_next("worker-a")
+        assert claimed is not None
+        self.database.complete(claimed.id, "worker-a", {"books": 1})
+        aged = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat(timespec="seconds")
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET created_at = ?, finished_at = ? WHERE id = ?",
+                (aged, aged, claimed.id),
+            )
+        return claimed.id
+
+    def test_sweeps_when_due(self) -> None:
+        job_id = self._make_old_pipeline_job(91 * 24 * 60 * 60)
+        settings = Settings(retention_sweep_interval_seconds=3600.0)
+        result = _maybe_sweep_retention(self.database, settings, now=3600.0, last_sweep=0.0)
+        self.assertEqual(result, 3600.0)
+        self.assertIsNone(self.database.get_job(job_id))
+
+    def test_does_not_sweep_before_the_interval_elapses(self) -> None:
+        job_id = self._make_old_pipeline_job(91 * 24 * 60 * 60)
+        settings = Settings(retention_sweep_interval_seconds=3600.0)
+        result = _maybe_sweep_retention(self.database, settings, now=1800.0, last_sweep=0.0)
+        self.assertEqual(result, 0.0)  # timer unchanged: the throttle held
+        self.assertIsNotNone(self.database.get_job(job_id))
+
+    def test_sweeps_again_once_the_interval_elapses(self) -> None:
+        settings = Settings(retention_sweep_interval_seconds=3600.0)
+        first = _maybe_sweep_retention(self.database, settings, now=100.0, last_sweep=0.0)
+        job_id = self._make_old_pipeline_job(91 * 24 * 60 * 60)
+        second = _maybe_sweep_retention(self.database, settings, now=100.0 + 3600.0, last_sweep=first)
+        self.assertEqual(second, 100.0 + 3600.0)
+        self.assertIsNone(self.database.get_job(job_id))
+
+    def test_settings_windows_reach_the_database_call(self) -> None:
+        """A job aged past the DEFAULT 90-day pipeline window, but inside a
+        deliberately widened `retention_pipeline_seconds`, must survive --
+        proving the Settings fields actually reach `sweep_job_retention`
+        rather than the sweep silently using its own hardcoded defaults."""
+        job_id = self._make_old_pipeline_job(91 * 24 * 60 * 60)
+        settings = Settings(
+            retention_sweep_interval_seconds=3600.0,
+            retention_pipeline_seconds=365 * 24 * 60 * 60.0,
+        )
+        _maybe_sweep_retention(self.database, settings, now=3600.0, last_sweep=0.0)
+        self.assertIsNotNone(self.database.get_job(job_id))
 
 
 class CheckLivenessCliTests(unittest.TestCase):
