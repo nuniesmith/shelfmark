@@ -142,6 +142,17 @@ class Settings:
     download_automation_enabled: bool = True
     reconcile_interval_seconds: float = 60.0
     discord_webhook_url: str | None = None
+    # A release whose reported size is at or above this many megabytes is not
+    # queued on the first Grab press in Discord -- see ReleaseView in
+    # discord_bot.py. A real `/request` search returned a 26736 MB "Westerns
+    # ... GraphicAudio Collection" that outranked the single book actually
+    # searched for (it matched on "Stand-Alone" containing "stand"); one
+    # mis-click there pulls the whole 26 GB collection. The longest single
+    # audiobooks seen in practice stay well under this: Stephen King's THE
+    # STAND, unabridged, is 2813 MB. 5000 MB clears every normal single-book
+    # grab without an extra press while still catching a multi-book
+    # collection roughly an order of magnitude bigger.
+    discord_large_release_threshold_mb: float = 5000.0
     # How often the worker's main loop considers pruning old, terminal
     # `jobs`/`audit_events` rows (see worker.py's `_maybe_sweep_retention`
     # and db.py's `sweep_job_retention`). Defaults to once an hour, matching
@@ -230,6 +241,9 @@ class Settings:
             download_automation_enabled=_bool_from_env("SHELFMARK_DOWNLOAD_AUTOMATION_ENABLED", True),
             reconcile_interval_seconds=_float_from_env("SHELFMARK_RECONCILE_INTERVAL_SECONDS", 60.0),
             discord_webhook_url=os.environ.get("SHELFMARK_DISCORD_WEBHOOK_URL") or None,
+            discord_large_release_threshold_mb=_float_from_env(
+                "SHELFMARK_DISCORD_LARGE_RELEASE_THRESHOLD_MB", 5000.0
+            ),
             retention_sweep_interval_seconds=_float_from_env(
                 "SHELFMARK_RETENTION_SWEEP_INTERVAL_SECONDS", 3600.0
             ),

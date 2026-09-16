@@ -140,7 +140,9 @@ by Discord as a picker, not free text) and a query:
   ebooks live in two different places on the server.
 - **`/request type:<audiobook|ebook> query:<text>`** — find something new and
   download it. Searches Prowlarr filtered to that type's configured
-  categories and offers a **Grab** button.
+  categories and offers a **Grab** button. A release at or above
+  `SHELFMARK_DISCORD_LARGE_RELEASE_THRESHOLD_MB` (default 5000 MB) doesn't
+  queue on that first press — see "Confirming a large grab" below.
 
 These replace four earlier commands — `/library-search`, `/ebook-search`,
 `/ebook-request`, `/release-search` — retired outright rather than kept as
@@ -204,6 +206,35 @@ reader app just to browse files isn't wanted, so Shelfmark indexes
   request built from someone else's search result, or a raw path, matches
   nothing.
 
+**Confirming a large grab.** Prowlarr ranks on text match, not on what was
+actually asked for. A real `/request type:audiobook query:"the stand"` search
+returned a 26 GB "Westerns ... GraphicAudio Collection" ahead of the book
+itself, because it matched on "Stand-Alone" containing "stand" — one press of
+its Grab button would have pulled the entire 26 GB collection instead of the
+2.8 GB audiobook that was actually wanted. This is not a disk-space guard (a
+26 GB download fits fine on either box); it exists because undoing a
+mis-click means finding and removing the download in qBittorrent, on
+Sullivan's disk, and possibly out of the library.
+
+- A release at or above `SHELFMARK_DISCORD_LARGE_RELEASE_THRESHOLD_MB`
+  (default `5000`, i.e. 5 GB) doesn't queue on the first Grab press. The bot
+  instead replies with the release's title and size and a **Grab anyway** /
+  **Cancel** pair; only pressing **Grab anyway** queues it, exactly as a
+  normal Grab would. Below the threshold, one press still queues
+  immediately — nothing changes for a normal 2–3 GB audiobook (Stephen
+  King's unabridged *The Stand* is 2813 MB, comfortably under the default).
+- A release with **no reported size** also stops for confirmation rather than
+  being waved through. A grab has no second, real-bytes check the way the
+  ebook attachment path does (that one re-checks the actual fetched size
+  before sending) — the job goes straight to a remote worker and its true
+  size is never seen again here, so an unusable size is treated as the risky
+  case, not an exempt one.
+- The confirm button re-checks `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` at the
+  moment it's pressed, not just at the original `/request`. The size-warning
+  message can sit for up to 15 minutes; someone whose role was revoked in
+  that window cannot complete the grab just because the warning is still on
+  their screen.
+
 **Invite it with zero permissions.** Scopes `bot` and
 `applications.commands`, permission integer `0`. Every reply is an ephemeral
 interaction response, which needs no channel permission at all. It also
@@ -217,6 +248,7 @@ is nothing to justify in the developer portal and no verification gate later.
 | `SHELFMARK_DISCORD_GUILD_ID` | Syncs commands to one guild, which is instant. Without it they sync globally and can take up to an hour to appear. |
 | `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` | Comma-separated role IDs permitted to use the bot. **Empty means nobody.** |
 | `SHELFMARK_DISCORD_MAX_ATTACHMENT_MB` | `/library type:ebook`'s file-size ceiling before Discord would refuse the upload. Default `10`; raise it if the server is boosted. |
+| `SHELFMARK_DISCORD_LARGE_RELEASE_THRESHOLD_MB` | Size (in MB) at or above which `/request`'s Grab button asks for confirmation instead of queuing immediately. Default `5000`. |
 | `PROWLARR_BOOK_CATEGORIES` | Categories `/request type:ebook` restricts to. Default `7000`, since a typical indexer advertises the general Books bucket rather than 7020 (EBook) specifically. |
 | `PROWLARR_AUDIOBOOK_CATEGORIES` | Categories `/request type:audiobook` restricts to. Default `3030,100064` (standard Newznab Audio/Audiobook plus this indexer's own AudioBook category) — verified against the live indexer; `book_only`'s 7000 alone returns zero audiobooks. |
 

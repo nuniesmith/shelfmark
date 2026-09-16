@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
 from typing import Any
 
 import discord
@@ -22,6 +22,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from .clients import HttpClient, ServiceError
+from .config import Settings
 
 DEFAULT_MAX_ATTACHMENT_MB = 10.0
 
@@ -69,6 +70,29 @@ def _too_large(size: Any, limit: int) -> bool:
     than refused, since there's nothing to compare against.
     """
     return isinstance(size, (int, float)) and size > limit
+
+
+def _needs_confirmation(size: Any, threshold_bytes: int) -> bool:
+    """Whether a Grab press must stop for confirmation instead of queuing.
+
+    Deliberately the OPPOSITE of `_too_large`'s call on a missing size.
+    `_too_large` treats "no number to compare" as fine to attempt, because
+    EbookView re-checks the real fetched byte count immediately afterward --
+    a stale or absent search-result size there is caught before anything
+    reaches the user. A grab has no such second look: the job is handed to a
+    remote worker and its real size is never seen again on this side.
+    Treating a missing size as "fine" here would let exactly the release this
+    guard exists for -- a mis-ranked, wrongly-categorized result with no
+    usable size field -- slip through on the one un-confirmed press this
+    feature is meant to stop (a real `/request "the stand"` search returned a
+    26 GB "Westerns ... GraphicAudio Collection" ranked above the book
+    actually searched for, because it matched on "Stand-Alone" containing
+    "stand"). So an unusable size is treated as the risky case, not exempted
+    from it.
+    """
+    if not isinstance(size, (int, float)):
+        return True
+    return size > threshold_bytes
 
 
 def _human_size(num_bytes: int) -> str:
@@ -266,12 +290,90 @@ def _request_query(kind: str, query: str) -> tuple[str, dict[str, Any]]:
     return "/api/v1/releases/search", {"q": query, "media_type": kind, "limit": 25}
 
 
+async def _queue_grab(api: ShelfmarkApi, release: dict[str, Any], interaction: discord.Interaction) -> None:
+    """POST the grab and report the queued job id.
+
+    Shared by ReleaseView's immediate Grab press and _ConfirmGrabView's
+    confirmed one -- the only difference between the two paths is whether a
+    size-confirmation round trip happened first. The payload and endpoint are
+    identical either way.
+    """
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        result = await api.post(
+            "/api/v1/releases/grab",
+            json_body={"release": release},
+            actor=_actor(interaction),
+        )
+        job_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
+        await interaction.followup.send(
+            f"Queued release **{job_id}**. Use `/job {job_id}` for status.",
+            ephemeral=True,
+        )
+    except ServiceError:
+        await interaction.followup.send("The Shelfmark API could not queue that release.", ephemeral=True)
+
+
+class _ConfirmGrabView(discord.ui.View):
+    """Second confirmation for one release ReleaseView has already flagged.
+
+    Not a parallel implementation of ReleaseView: it holds no release list
+    and makes no size decision -- `_needs_confirmation` already made that
+    call, in ReleaseView's own callback. This class exists only because the
+    size-warning message is a NEW ephemeral reply with its own component row
+    (a `discord.ui.View` cannot be reattached to the message that first
+    carried it), so a second, single-release view is the minimum needed to
+    carry a Confirm/Cancel pair for it.
+    """
+
+    def __init__(
+        self,
+        api: ShelfmarkApi,
+        release: dict[str, Any],
+        guard: Callable[[discord.Interaction], Awaitable[bool]],
+    ) -> None:
+        super().__init__(timeout=900)
+        self.api = api
+        self.release = release
+        self.guard = guard
+
+    @discord.ui.button(label="Grab anyway", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.response.is_done():
+            return
+        # Re-checked HERE, not assumed from the /request press that led to
+        # this message: a role can be revoked during the up-to-15-minute
+        # window this view stays alive, and THIS button is the action that
+        # actually queues a download -- the earlier Grab press only
+        # previewed the size. Someone who could not have started a grab must
+        # not be able to complete one just because the size warning is still
+        # sitting in their DM/channel.
+        if not await self.guard(interaction):
+            return
+        await _queue_grab(self.api, self.release, interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.response.is_done():
+            return
+        await interaction.response.edit_message(content="Cancelled -- nothing was queued.", view=None)
+
+
 class ReleaseView(discord.ui.View):
-    def __init__(self, api: ShelfmarkApi, releases: list[dict[str, Any]], actor: str):
+    def __init__(
+        self,
+        api: ShelfmarkApi,
+        releases: list[dict[str, Any]],
+        actor: str,
+        large_release_threshold_bytes: int,
+        guard: Callable[[discord.Interaction], Awaitable[bool]],
+    ):
         super().__init__(timeout=900)
         self.api = api
         self.releases = releases
         self.actor = actor
+        self.large_release_threshold_bytes = large_release_threshold_bytes
+        self.guard = guard
         for index, release in enumerate(releases[:5]):
             button = discord.ui.Button(
                 label=f"Grab {index + 1}",
@@ -285,20 +387,27 @@ class ReleaseView(discord.ui.View):
         async def callback(interaction: discord.Interaction) -> None:
             if interaction.response.is_done():
                 return
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            try:
-                result = await self.api.post(
-                    "/api/v1/releases/grab",
-                    json_body={"release": self.releases[index]},
-                    actor=_actor(interaction),
+            release = self.releases[index]
+            size = release.get("size")
+            if _needs_confirmation(size, self.large_release_threshold_bytes):
+                # Stop here instead of queuing: a large or unusably-sized
+                # release gets one extra, explicit press rather than being
+                # pulled by the same accidental tap that would have grabbed
+                # a normal audiobook.
+                title = str(release.get("title") or release.get("name") or "That release")
+                size_text = (
+                    _human_size(int(size)) if isinstance(size, (int, float)) else "an unknown size"
                 )
-                job_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
-                await interaction.followup.send(
-                    f"Queued release **{job_id}**. Use `/job {job_id}` for status.",
+                await interaction.response.send_message(
+                    f"**{title[:100]}** is {size_text} -- at or above the "
+                    f"{_human_size(self.large_release_threshold_bytes)} confirmation "
+                    "threshold. A mis-ranked search result can be many times the size "
+                    "of what was actually searched for. Confirm to grab it anyway.",
+                    view=_ConfirmGrabView(self.api, release, self.guard),
                     ephemeral=True,
                 )
-            except ServiceError:
-                await interaction.followup.send("The Shelfmark API could not queue that release.", ephemeral=True)
+                return
+            await _queue_grab(self.api, release, interaction)
 
         return callback
 
@@ -404,6 +513,7 @@ def install_commands(
     api: ShelfmarkApi,
     allowed_roles: set[int],
     max_attachment_bytes: int = int(DEFAULT_MAX_ATTACHMENT_MB * 1_000_000),
+    large_release_threshold_bytes: int = int(Settings().discord_large_release_threshold_mb * 1_000_000),
 ) -> None:
     def permitted(interaction: discord.Interaction) -> bool:
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
@@ -517,7 +627,9 @@ def install_commands(
             embed.description = "\n".join(f"{index + 1}. {_release_label(item)}" for index, item in enumerate(results))
             await interaction.followup.send(
                 embed=embed,
-                view=ReleaseView(api, results, _actor(interaction)),
+                view=ReleaseView(
+                    api, results, _actor(interaction), large_release_threshold_bytes, guard
+                ),
                 ephemeral=True,
             )
         except ServiceError:
@@ -700,8 +812,23 @@ def build_bot() -> commands.Bot:
         # rather than trust a value that failed to parse.
         print(f"{exc}. Using the {DEFAULT_MAX_ATTACHMENT_MB:g} MB default.", flush=True)
         max_attachment_bytes = _max_attachment_bytes(None)
+    try:
+        settings = Settings.from_env()
+    except ValueError as exc:
+        # Same reasoning again: a bad value in ANY Settings field (this bot
+        # only reads discord_large_release_threshold_mb from it) must not
+        # crash-loop the container -- fall back to Settings' own defaults.
+        print(f"{exc}. Using the default Shelfmark settings.", flush=True)
+        settings = Settings()
+    large_release_threshold_bytes = int(settings.discord_large_release_threshold_mb * 1_000_000)
     bot = ShelfmarkBot(command_prefix=commands.when_mentioned, intents=intents)
-    install_commands(bot, ShelfmarkApi(api_url, api_token), allowed_roles, max_attachment_bytes)
+    install_commands(
+        bot,
+        ShelfmarkApi(api_url, api_token),
+        allowed_roles,
+        max_attachment_bytes,
+        large_release_threshold_bytes,
+    )
     return bot
 
 
