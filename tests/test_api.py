@@ -132,6 +132,64 @@ class BookOnlyCategoryTests(unittest.TestCase):
         self.assertEqual(fake.calls[0]["categories"], [7060])
 
 
+class MediaTypeCategoryTests(unittest.TestCase):
+    """`/request type:audiobook` was previously impossible: `book_only`
+    (and, before this change, every code path reaching this route) only ever
+    applied PROWLARR_BOOK_CATEGORIES (7000), which is verified to return zero
+    audiobooks — they live under 3030/100064. `media_type` is the new,
+    additive parameter that lets a caller ask for either bucket by name
+    instead of memorizing category ids.
+    """
+
+    def test_media_type_audiobook_applies_the_audiobook_categories(self) -> None:
+        fake = FakeProwlarr()
+        with mock.patch.object(api_module, "_prowlarr_client", return_value=fake):
+            api_module.release_search(
+                q="dune", search_type=None, categories=None, media_type="audiobook",
+                book_only=True, limit=50, offset=0, _actor="test",
+            )
+        self.assertEqual(
+            fake.calls[0]["categories"], list(api_module.settings.prowlarr_audiobook_categories)
+        )
+
+    def test_media_type_ebook_applies_the_book_categories(self) -> None:
+        fake = FakeProwlarr()
+        with mock.patch.object(api_module, "_prowlarr_client", return_value=fake):
+            api_module.release_search(
+                q="dune", search_type=None, categories=None, media_type="ebook",
+                book_only=True, limit=50, offset=0, _actor="test",
+            )
+        self.assertEqual(
+            fake.calls[0]["categories"], list(api_module.settings.prowlarr_book_categories)
+        )
+
+    def test_media_type_audiobook_wins_even_when_book_only_is_false(self) -> None:
+        """`/request` always sends media_type; book_only is the OLDER, more
+        generic flag. If book_only's False branch were checked first (or
+        media_type merely OR'd in), passing book_only=False alongside
+        media_type would silently drop the audiobook filter and search every
+        category again -- the exact bug `book_only` itself was added to fix,
+        recurring through the new parameter instead of the old one."""
+        fake = FakeProwlarr()
+        with mock.patch.object(api_module, "_prowlarr_client", return_value=fake):
+            api_module.release_search(
+                q="dune", search_type=None, categories=None, media_type="audiobook",
+                book_only=False, limit=50, offset=0, _actor="test",
+            )
+        self.assertEqual(
+            fake.calls[0]["categories"], list(api_module.settings.prowlarr_audiobook_categories)
+        )
+
+    def test_explicit_categories_override_media_type(self) -> None:
+        fake = FakeProwlarr()
+        with mock.patch.object(api_module, "_prowlarr_client", return_value=fake):
+            api_module.release_search(
+                q="dune", search_type=None, categories=[42], media_type="audiobook",
+                book_only=True, limit=50, offset=0, _actor="test",
+            )
+        self.assertEqual(fake.calls[0]["categories"], [42])
+
+
 class ReadyzWorkerLivenessTests(unittest.TestCase):
     """`/readyz` is the endpoint a monitoring probe (Uptime Kuma) actually
     watches for a dead or wedged worker -- see api._worker_liveness's

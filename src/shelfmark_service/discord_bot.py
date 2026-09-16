@@ -241,6 +241,31 @@ def _library_label(item: dict[str, Any]) -> str:
     return f"{title[:80]} — {str(author)[:50]}"
 
 
+# `/library`'s two type choices hit two different backends the wife has no
+# reason to know about: Audiobookshelf for audiobooks she already owns, the
+# on-disk ebooks root (walked by ebooks.py) for ebooks she already owns. This
+# mapping is the one fact that split used to leak into two separate commands
+# — pulled into a plain function so the type->backend choice is asserted
+# directly, without a Discord interaction object graph (the same reason
+# is_permitted and _job_status_message are split out above).
+def _library_query(kind: str, query: str) -> tuple[str, dict[str, Any]]:
+    if kind == "ebook":
+        return "/api/v1/ebooks/search", {"q": query, "limit": 10}
+    return "/api/v1/library/search", {"q": query}
+
+
+# `/request`'s two type choices hit the SAME Prowlarr endpoint — unlike
+# /library, there is only one backend for "find something new" — but need
+# different category filters, which is what `media_type` tells the API route
+# to apply (see api.release_search). This used to be two commands
+# (/ebook-request and /release-search) that had drifted into calling this
+# exact endpoint with this exact book_only flag; the only real difference
+# left was cosmetic (embed title, an unused limit), which is why they were
+# collapsed into one command with a type choice instead of kept apart.
+def _request_query(kind: str, query: str) -> tuple[str, dict[str, Any]]:
+    return "/api/v1/releases/search", {"q": query, "media_type": kind, "limit": 25}
+
+
 class ReleaseView(discord.ui.View):
     def __init__(self, api: ShelfmarkApi, releases: list[dict[str, Any]], actor: str):
         super().__init__(timeout=900)
@@ -401,92 +426,94 @@ def install_commands(
         await interaction.response.send_message(message, ephemeral=True)
         return False
 
-    @bot.tree.command(name="library-search", description="Search books already in Audiobookshelf")
-    @app_commands.describe(query="Title, author, or series to search for")
-    async def library_search(interaction: discord.Interaction, query: str) -> None:
-        if not await guard(interaction):
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            payload = await api.get("/api/v1/library/search", params={"q": query}, actor=_actor(interaction))
-            results = _result_list(payload)[:10]
-            if not results:
-                await interaction.followup.send("No matching library items found.", ephemeral=True)
-                return
-            embed = discord.Embed(title=f"Library results for {query}")
-            embed.description = "\n".join(f"{index + 1}. {_library_label(item)}" for index, item in enumerate(results))
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        except ServiceError:
-            await interaction.followup.send("Audiobookshelf search is unavailable.", ephemeral=True)
+    # Both commands below take a TYPE CHOICE, not free text, so Discord
+    # renders a picker (Audiobook / Ebook) instead of asking a non-technical
+    # user to type tracker jargon like "release" or know that audiobooks and
+    # ebooks live in different places on the server.
+    #
+    # This replaces four commands that used to exist:
+    #   /library-search  -> /library type:audiobook  (Audiobookshelf, unchanged)
+    #   /ebook-search    -> /library type:ebook       (on-disk root, unchanged)
+    #   /ebook-request   -> /request type:ebook       (Prowlarr, unchanged)
+    #   /release-search  -> /request type:audiobook or type:ebook
+    # /release-search and /ebook-request had drifted into being the exact
+    # same call (same endpoint, same book_only=true, same ReleaseView) with
+    # only a cosmetic difference left, which is what made merging them safe.
+    #
+    # Retired outright rather than kept as aliases: there are exactly two
+    # users of this bot, one of whom is the operator, and `SHELFMARK_DISCORD_
+    # GUILD_ID` makes the new commands appear the instant this syncs (no
+    # week-long global-propagation gap to bridge with a fallback). A thin
+    # alias here would be permanent maintenance load — two more commands to
+    # keep in sync with every future change to /library and /request — for a
+    # transition that a single Discord message ("it's /library and /request
+    # now") covers just as well.
+    _TYPE_CHOICES = [
+        app_commands.Choice(name="Audiobook", value="audiobook"),
+        app_commands.Choice(name="Ebook", value="ebook"),
+    ]
 
-    @bot.tree.command(name="ebook-search", description="Search ebooks already on the server and send one to your phone")
-    @app_commands.describe(query="Title or author to search for")
-    async def ebook_search(interaction: discord.Interaction, query: str) -> None:
+    @bot.tree.command(name="library", description="Search books already on the server")
+    @app_commands.describe(type="Audiobook or ebook", query="Title, author, or series to search for")
+    @app_commands.choices(type=_TYPE_CHOICES)
+    async def library(interaction: discord.Interaction, type: app_commands.Choice[str], query: str) -> None:
         if not await guard(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
+        kind = type.value
+        endpoint, params = _library_query(kind, query)
         try:
-            payload = await api.get("/api/v1/ebooks/search", params={"q": query, "limit": 10}, actor=_actor(interaction))
-            results = _result_list(payload)[:5]
-            if not results:
-                await interaction.followup.send("No ebooks on the server matched that search.", ephemeral=True)
-                return
-            embed = discord.Embed(title=f"Ebook matches for {query}")
-            embed.description = "\n".join(f"{index + 1}. {_ebook_label(item)}" for index, item in enumerate(results))
+            payload = await api.get(endpoint, params=params, actor=_actor(interaction))
+        except ServiceError:
+            # Audiobookshelf and the on-disk ebook walk are two independent
+            # failure surfaces (a remote API vs. a local directory read) —
+            # naming which one is down saves a round trip of "which command
+            # did you mean" before anyone can even start diagnosing it.
+            service = "Ebook search" if kind == "ebook" else "Audiobookshelf search"
+            await interaction.followup.send(f"{service} is unavailable.", ephemeral=True)
+            return
+        results = _result_list(payload)[: 5 if kind == "ebook" else 10]
+        if not results:
+            message = (
+                "No ebooks on the server matched that search."
+                if kind == "ebook"
+                else "No matching library items found."
+            )
+            await interaction.followup.send(message, ephemeral=True)
+            return
+        label = _ebook_label if kind == "ebook" else _library_label
+        embed = discord.Embed(title=f"{type.name} library results for {query}")
+        embed.description = "\n".join(f"{index + 1}. {label(item)}" for index, item in enumerate(results))
+        if kind == "ebook":
+            # Only ebooks get the Send-to-phone button: an audiobook result
+            # is an Audiobookshelf catalog entry, not a file this server can
+            # hand over as a Discord attachment.
             await interaction.followup.send(
                 embed=embed,
                 view=EbookView(api, results, _actor(interaction), max_attachment_bytes),
                 ephemeral=True,
             )
-        except ServiceError:
-            await interaction.followup.send("Ebook search is unavailable.", ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @bot.tree.command(name="ebook-request", description="Search for a new ebook to download onto the server")
-    @app_commands.describe(query="Title, author, or ISBN to search for")
-    async def ebook_request(interaction: discord.Interaction, query: str) -> None:
+    @bot.tree.command(name="request", description="Search Prowlarr for a new audiobook or ebook to download")
+    @app_commands.describe(type="Audiobook or ebook", query="Title, author, ISBN, or other search text")
+    @app_commands.choices(type=_TYPE_CHOICES)
+    async def request(interaction: discord.Interaction, type: app_commands.Choice[str], query: str) -> None:
         if not await guard(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
+        kind = type.value
+        endpoint, params = _request_query(kind, query)
         try:
-            payload = await api.get(
-                "/api/v1/releases/search",
-                params={"q": query, "book_only": "true", "limit": 25},
-                actor=_actor(interaction),
-            )
+            payload = await api.get(endpoint, params=params, actor=_actor(interaction))
             results = _result_list(payload)[:5]
             if not results:
-                await interaction.followup.send("No matching ebooks were found to download.", ephemeral=True)
+                await interaction.followup.send(
+                    f"No matching {kind}s were found to download.", ephemeral=True
+                )
                 return
-            embed = discord.Embed(title=f"Ebook downloads for {query}")
-            embed.description = "\n".join(f"{index + 1}. {_release_label(item)}" for index, item in enumerate(results))
-            await interaction.followup.send(
-                embed=embed,
-                view=ReleaseView(api, results, _actor(interaction)),
-                ephemeral=True,
-            )
-        except ServiceError:
-            await interaction.followup.send("Prowlarr search is unavailable.", ephemeral=True)
-
-    @bot.tree.command(name="release-search", description="Search Prowlarr for new audiobook or ebook releases")
-    @app_commands.describe(query="Title, author, ISBN, or other release query", type="Prowlarr search type")
-    async def release_search(interaction: discord.Interaction, query: str, type: str | None = None) -> None:
-        if not await guard(interaction):
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            # Explicit even though the API now defaults to it: this is the
-            # command that returned Blu-rays, and the next person reading it
-            # should not have to go and check a route's default to know why
-            # it only finds books.
-            params = {"q": query, "limit": 50, "book_only": "true"}
-            if type:
-                params["type"] = type
-            payload = await api.get("/api/v1/releases/search", params=params, actor=_actor(interaction))
-            results = _result_list(payload)[:5]
-            if not results:
-                await interaction.followup.send("No matching releases found.", ephemeral=True)
-                return
-            embed = discord.Embed(title=f"Release results for {query}")
+            embed = discord.Embed(title=f"{type.name} downloads for {query}")
             embed.description = "\n".join(f"{index + 1}. {_release_label(item)}" for index, item in enumerate(results))
             await interaction.followup.send(
                 embed=embed,

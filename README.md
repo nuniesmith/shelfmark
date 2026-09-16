@@ -130,20 +130,53 @@ paths. Provider calls still require the corresponding `AUDIOBOOKSHELF_*` and
 
 ### Discord bot
 
-`/release-search` and `/ebook-request` both search **books only** by default.
-Prowlarr indexes everything, so an unfiltered search for "dune" returns
+Two commands, each taking a **type** choice (`Audiobook` / `Ebook`, rendered
+by Discord as a picker, not free text) and a query:
+
+- **`/library type:<audiobook|ebook> query:<text>`** — what's already here.
+  `audiobook` searches Audiobookshelf; `ebook` walks the on-disk ebooks root
+  and offers a **Send** button. The type choice is the only thing that
+  changes: the person searching doesn't need to know that audiobooks and
+  ebooks live in two different places on the server.
+- **`/request type:<audiobook|ebook> query:<text>`** — find something new and
+  download it. Searches Prowlarr filtered to that type's configured
+  categories and offers a **Grab** button.
+
+These replace four earlier commands — `/library-search`, `/ebook-search`,
+`/ebook-request`, `/release-search` — retired outright rather than kept as
+aliases. `/release-search` and `/ebook-request` had drifted into being the
+exact same call (`/api/v1/releases/search`, `book_only=true`, the same grab
+buttons) with only a cosmetic difference left; and with exactly two users of
+this bot and `SHELFMARK_DISCORD_GUILD_ID` making new commands appear
+instantly, a transition alias would only be permanent upkeep for a switch one
+Discord message covers.
+
+**Both types search only their own categories, on purpose.** Prowlarr indexes
+everything, so an unfiltered search for "dune" returns
 `Dune Part Two 2024 BluRay 1080p` (category 2050) and a Car SOS episode about
-a dune buggy (5010) before it returns a single book. Pass `book_only=false` to
-the API route to search every category deliberately; no command does.
+a dune buggy (5010) before it returns a single book. `/request` always sends
+Prowlarr an explicit category set for the chosen type — it never searches
+every category. Verified against the live indexer: filtering to `book_only`'s
+7000 alone returns zero audiobooks across a 103-result sample; audiobooks are
+under `3030` (Audio/Audiobook, standard Newznab) and `100064` (this indexer's
+own AudioBook category).
 
-The filter is `PROWLARR_BOOK_CATEGORIES` (default `7000`) rather than a
-hardcoded `7020`/EBook, because an indexer that does not advertise 7020 would
-silently return nothing at all.
+- `PROWLARR_BOOK_CATEGORIES` (default `7000`) — the ebook filter. Not `7020`
+  (EBook specifically): this indexer doesn't advertise that category, and a
+  literal 7020 filter silently returns nothing.
+- `PROWLARR_AUDIOBOOK_CATEGORIES` (default `3030,100064`) — the audiobook
+  filter. `100064` is this indexer's own category id; a different indexer
+  would need a different value here, which is why both stay configurable
+  rather than hardcoded.
 
-Commands: `/library-search`, `/release-search` (with grab buttons),
-`/ebook-search` (with send-to-phone buttons), `/ebook-request` (with grab
-buttons), `/downloads`, `/job`, `/metadata-match`, `/scan`,
-`/organize-preview`. Each one is deferred before any network call and
+The underlying API route, `/api/v1/releases/search`, still has its older
+`book_only` flag (default `true`, searches `PROWLARR_BOOK_CATEGORIES`) for
+any caller that only wants "books, generically" without picking a type. The
+newer `media_type` parameter the Discord commands use sits beside it and
+takes precedence when set — pass `categories` explicitly to bypass both.
+
+Other commands: `/downloads`, `/job`, `/metadata-match`, `/scan`,
+`/organize-preview`. Every command is deferred before any network call and
 answered ephemerally, so the interaction token is never used as a
 long-running task channel.
 
@@ -151,15 +184,15 @@ long-running task channel.
 reader app just to browse files isn't wanted, so Shelfmark indexes
 `SHELFMARK_EBOOKS_ROOT` itself:
 
-- `/ebook-search <query>` walks the ebooks root, matching on author, title,
-  and filename, and shows up to 5 results with a **Send** button per result.
-  Pressing one fetches the file and attaches it to an ephemeral reply — open
-  it from Discord on a phone and it lands in whichever app is registered for
-  that format. When a book has more than one file (an epub next to a pdf,
-  say), the better format wins automatically, in `EBOOK_PREF` order.
-- `/ebook-request <query>` searches Prowlarr restricted to the configured
-  book categories (`PROWLARR_BOOK_CATEGORIES`, default `7000`) and offers the
-  same grab buttons as `/release-search`.
+- `/library type:ebook query:<text>` walks the ebooks root, matching on
+  author, title, and filename, and shows up to 5 results with a **Send**
+  button per result. Pressing one fetches the file and attaches it to an
+  ephemeral reply — open it from Discord on a phone and it lands in
+  whichever app is registered for that format. When a book has more than one
+  file (an epub next to a pdf, say), the better format wins automatically,
+  in `EBOOK_PREF` order.
+- `/request type:ebook query:<text>` searches Prowlarr restricted to
+  `PROWLARR_BOOK_CATEGORIES` and offers a grab button.
 - Discord refuses attachments over 10 MB on an unboosted server. The size is
   checked and reported in plain language (naming the book and its size)
   *before* any upload is attempted, rather than surfacing as a failed
@@ -183,8 +216,9 @@ is nothing to justify in the developer portal and no verification gate later.
 | `SHELFMARK_API_TOKEN` | Required — the bot calls the API with it. |
 | `SHELFMARK_DISCORD_GUILD_ID` | Syncs commands to one guild, which is instant. Without it they sync globally and can take up to an hour to appear. |
 | `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` | Comma-separated role IDs permitted to use the bot. **Empty means nobody.** |
-| `SHELFMARK_DISCORD_MAX_ATTACHMENT_MB` | `/ebook-search`'s file-size ceiling before Discord would refuse the upload. Default `10`; raise it if the server is boosted. |
-| `PROWLARR_BOOK_CATEGORIES` | Categories `/ebook-request` restricts to. Default `7000`, since a typical indexer advertises the general Books bucket rather than 7020 (EBook) specifically. |
+| `SHELFMARK_DISCORD_MAX_ATTACHMENT_MB` | `/library type:ebook`'s file-size ceiling before Discord would refuse the upload. Default `10`; raise it if the server is boosted. |
+| `PROWLARR_BOOK_CATEGORIES` | Categories `/request type:ebook` restricts to. Default `7000`, since a typical indexer advertises the general Books bucket rather than 7020 (EBook) specifically. |
+| `PROWLARR_AUDIOBOOK_CATEGORIES` | Categories `/request type:audiobook` restricts to. Default `3030,100064` (standard Newznab Audio/Audiobook plus this indexer's own AudioBook category) — verified against the live indexer; `book_only`'s 7000 alone returns zero audiobooks. |
 
 To collect the IDs, turn on **User Settings → Advanced → Developer Mode**, then
 right-click the server for its ID and a role (in **Server Settings → Roles**)

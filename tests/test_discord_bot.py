@@ -8,7 +8,9 @@ from src.shelfmark_service.discord_bot import (
     _human_size,
     _int_set,
     _job_status_message,
+    _library_query,
     _max_attachment_bytes,
+    _request_query,
     _too_large,
     blocking_problems,
     is_permitted,
@@ -197,6 +199,49 @@ class EbookLabelTests(unittest.TestCase):
     def test_missing_author_is_left_out_rather_than_shown_as_none(self) -> None:
         label = _ebook_label({"title": "Dune", "size": 2_500_000})
         self.assertNotIn("None", label)
+
+
+class LibraryQueryTests(unittest.TestCase):
+    """`/library type:<choice> query:<text>` used to be two separate commands
+    (`/library-search` hit Audiobookshelf, `/ebook-search` hit the on-disk
+    root) so the wife had to know where her own books live before she could
+    search for them. `_library_query` is the one function that now makes
+    that call for her -- if the branch were flipped, `/library
+    type:audiobook` would silently start walking the ebooks directory (or
+    vice versa) while every other part of the command kept working, which is
+    why this is asserted directly rather than only exercised end-to-end."""
+
+    def test_audiobook_hits_audiobookshelf(self) -> None:
+        endpoint, params = _library_query("audiobook", "dune")
+        self.assertEqual(endpoint, "/api/v1/library/search")
+        self.assertEqual(params, {"q": "dune"})
+
+    def test_ebook_hits_the_on_disk_root(self) -> None:
+        endpoint, params = _library_query("ebook", "dune")
+        self.assertEqual(endpoint, "/api/v1/ebooks/search")
+        self.assertEqual(params, {"q": "dune", "limit": 10})
+
+
+class RequestQueryTests(unittest.TestCase):
+    """`/request type:<choice> query:<text>` replaces `/ebook-request` and
+    `/release-search`, which had drifted into being the same call
+    (`/api/v1/releases/search`, `book_only=true`) with no real difference
+    left. `_request_query` is what now tells the API route which category
+    bucket to apply via `media_type` -- see api.release_search. If `kind`
+    were passed through under the wrong key (or dropped), the API would fall
+    back to book_only's default and an audiobook request would silently
+    search ebook categories instead, the exact gap this whole change closes.
+    """
+
+    def test_audiobook_sends_the_audiobook_media_type(self) -> None:
+        endpoint, params = _request_query("audiobook", "dune")
+        self.assertEqual(endpoint, "/api/v1/releases/search")
+        self.assertEqual(params["media_type"], "audiobook")
+        self.assertEqual(params["q"], "dune")
+
+    def test_ebook_sends_the_ebook_media_type(self) -> None:
+        _endpoint, params = _request_query("ebook", "dune")
+        self.assertEqual(params["media_type"], "ebook")
 
 
 if __name__ == "__main__":
