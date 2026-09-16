@@ -290,10 +290,20 @@ def release_search(
     search_type: str | None = Query(default=None, alias="type", max_length=40),
     categories: list[int] | None = Query(default=None),
     book_only: bool = Query(
-        default=False,
+        # Defaults to TRUE. Shelfmark is a book library, and Prowlarr indexes
+        # everything — with no category filter, `/release-search dune` came
+        # back with "Dune Part Two 2024 BluRay 1080p" (category 2050) and a
+        # Car SOS episode about a dune buggy (5010), and not one book. The
+        # operator's wife hit exactly that on her first real search.
+        #
+        # Defaulting to False made the unfiltered, useless answer the one you
+        # get by forgetting a parameter. Pass book_only=false to search every
+        # category deliberately; nothing here does.
+        default=True,
         description=(
             "Restrict to the configured book categories (PROWLARR_BOOK_CATEGORIES, "
-            "default 7000) instead of naming a category id the indexer may not advertise."
+            "default 7000) instead of naming a category id the indexer may not "
+            "advertise. Defaults to true: this is a book library."
         ),
     ),
     limit: int = Query(default=50, ge=1, le=200),

@@ -130,6 +130,16 @@ paths. Provider calls still require the corresponding `AUDIOBOOKSHELF_*` and
 
 ### Discord bot
 
+`/release-search` and `/ebook-request` both search **books only** by default.
+Prowlarr indexes everything, so an unfiltered search for "dune" returns
+`Dune Part Two 2024 BluRay 1080p` (category 2050) and a Car SOS episode about
+a dune buggy (5010) before it returns a single book. Pass `book_only=false` to
+the API route to search every category deliberately; no command does.
+
+The filter is `PROWLARR_BOOK_CATEGORIES` (default `7000`) rather than a
+hardcoded `7020`/EBook, because an indexer that does not advertise 7020 would
+silently return nothing at all.
+
 Commands: `/library-search`, `/release-search` (with grab buttons),
 `/ebook-search` (with send-to-phone buttons), `/ebook-request` (with grab
 buttons), `/downloads`, `/job`, `/metadata-match`, `/scan`,

@@ -86,8 +86,12 @@ class BookOnlyCategoryTests(unittest.TestCase):
         self.assertEqual(fake.calls[0]["categories"], list(api_module.settings.prowlarr_book_categories))
 
     def test_book_only_false_leaves_categories_unset(self) -> None:
-        """Must not change /release-search's existing (audiobook-inclusive)
-        behavior for the command that doesn't ask for books specifically."""
+        """Opting OUT explicitly still searches every category.
+
+        This used to be the default, and that was the bug: an unfiltered
+        `/release-search dune` returned "Dune Part Two 2024 BluRay" and a Car
+        SOS episode about a dune buggy. Searching everything is now something
+        you have to ask for, not something you get by omission."""
         fake = FakeProwlarr()
         with mock.patch.object(api_module, "_prowlarr_client", return_value=fake):
             api_module.release_search(
@@ -95,6 +99,28 @@ class BookOnlyCategoryTests(unittest.TestCase):
                 limit=50, offset=0, _actor="test",
             )
         self.assertIsNone(fake.calls[0]["categories"])
+
+    def test_release_search_defaults_to_books(self) -> None:
+        """The DEFAULT, not a value any caller passes.
+
+        Every other test here names `book_only` explicitly, so all of them
+        passed while the default was False and `/release-search` returned
+        Blu-rays. The declared default is the thing that was wrong, so it is
+        the thing to assert on.
+        """
+        default = inspect.signature(api_module.release_search).parameters["book_only"].default
+        self.assertIs(default.default, True, "/release-search must find books unless told otherwise")
+
+        # And that the default actually routes to the book categories.
+        fake = FakeProwlarr()
+        with mock.patch.object(api_module, "_prowlarr_client", return_value=fake):
+            api_module.release_search(
+                q="dune", search_type=None, categories=None, book_only=default.default,
+                limit=50, offset=0, _actor="test",
+            )
+        self.assertEqual(
+            fake.calls[0]["categories"], list(api_module.settings.prowlarr_book_categories)
+        )
 
     def test_explicit_categories_override_book_only(self) -> None:
         fake = FakeProwlarr()
