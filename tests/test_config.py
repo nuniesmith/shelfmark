@@ -30,6 +30,34 @@ class ProwlarrBookCategoriesTests(unittest.TestCase):
                 Settings.from_env()
 
 
+class ProwlarrAudiobookCategoriesTests(unittest.TestCase):
+    """Measured against the live indexer (2026-09-16): 3030 (Audio/Audiobook,
+    standard Newznab) and 100064 (this indexer's own AudioBook category) both
+    return audiobooks; book_only's 7000 alone returns zero across a 103-result
+    sample. 100064 is indexer-specific, so — like prowlarr_book_categories —
+    this has to stay configurable rather than hardcoded.
+    """
+
+    def test_default_is_the_measured_audiobook_categories(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(Settings.from_env().prowlarr_audiobook_categories, (3030, 100064))
+
+    def test_the_category_list_is_configurable(self) -> None:
+        with mock.patch.dict(
+            "os.environ", {"PROWLARR_AUDIOBOOK_CATEGORIES": "3030, 100064, 100065"}, clear=True
+        ):
+            self.assertEqual(
+                Settings.from_env().prowlarr_audiobook_categories, (3030, 100064, 100065)
+            )
+
+    def test_malformed_categories_are_rejected_not_silently_dropped(self) -> None:
+        with mock.patch.dict(
+            "os.environ", {"PROWLARR_AUDIOBOOK_CATEGORIES": "3030,not-a-number"}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                Settings.from_env()
+
+
 class DownloadAutomationSettingsTests(unittest.TestCase):
     """The reconciler's off switch and timing knobs -- defaults must keep
     automation ON (per the brief: "an off switch, defaulting to ON")."""

@@ -289,6 +289,18 @@ def release_search(
     q: str = Query(min_length=1, max_length=200),
     search_type: str | None = Query(default=None, alias="type", max_length=40),
     categories: list[int] | None = Query(default=None),
+    media_type: Literal["ebook", "audiobook"] | None = Query(
+        default=None,
+        description=(
+            "Restrict to one media type's configured categories: 'ebook' uses "
+            "PROWLARR_BOOK_CATEGORIES (default 7000), 'audiobook' uses "
+            "PROWLARR_AUDIOBOOK_CATEGORIES (default 3030,100064 — the standard "
+            "Newznab Audiobook bucket plus this indexer's own AudioBook "
+            "category; book_only's 7000 alone returns zero audiobooks, "
+            "measured against the live indexer). Takes precedence over "
+            "book_only when set — see that parameter for why they coexist."
+        ),
+    ),
     book_only: bool = Query(
         # Defaults to TRUE. Shelfmark is a book library, and Prowlarr indexes
         # everything — with no category filter, `/release-search dune` came
@@ -299,23 +311,37 @@ def release_search(
         # Defaulting to False made the unfiltered, useless answer the one you
         # get by forgetting a parameter. Pass book_only=false to search every
         # category deliberately; nothing here does.
+        #
+        # Kept alongside `media_type` rather than replaced by it: book_only is
+        # the generic "this is a book library, filter out the movies and TV"
+        # switch and stays the default for any caller that doesn't know or
+        # care whether it wants an ebook or an audiobook specifically.
+        # `media_type` is strictly more specific — ebook-vs-audiobook — and
+        # wins when both would apply, since `/request` always sends it.
         default=True,
         description=(
             "Restrict to the configured book categories (PROWLARR_BOOK_CATEGORIES, "
             "default 7000) instead of naming a category id the indexer may not "
-            "advertise. Defaults to true: this is a book library."
+            "advertise. Defaults to true: this is a book library. Ignored when "
+            "media_type is set."
         ),
     ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     _actor: str = Depends(_actor),
 ) -> dict[str, Any]:
-    # `/ebook-request` sends book_only=true rather than a hardcoded category
-    # id: the one indexer configured here advertises 7000/7010/7030/7050 but
-    # neither 7020 (EBook) nor 7060 (Audiobook), so a literal 7020 filter
+    # `/request` sends media_type rather than a hardcoded category id: the one
+    # indexer configured here advertises 7000/7010/7030/7050 for books and
+    # 3030/100064 for audiobooks, but neither 7020 (EBook specifically) nor
+    # 7060 (a made-up "Audiobook" id) — a literal filter on either of those
     # would silently return zero results every time.
-    if book_only and categories is None:
-        categories = list(settings.prowlarr_book_categories)
+    if categories is None:
+        if media_type == "audiobook":
+            categories = list(settings.prowlarr_audiobook_categories)
+        elif media_type == "ebook":
+            categories = list(settings.prowlarr_book_categories)
+        elif book_only:
+            categories = list(settings.prowlarr_book_categories)
     try:
         return {
             "results": _prowlarr_client().search(

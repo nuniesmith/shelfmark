@@ -17,6 +17,25 @@ Docker is not installed in the review environment.
 
 ## Current progress
 
+**Changed 2026-09-16.** The Discord bot had four search-ish commands
+(`/library-search`, `/ebook-search`, `/ebook-request`, `/release-search`) split
+by where the data lives, not by what a non-technical user wants — and
+`/release-search`/`/ebook-request` had converged to the exact same call
+(same endpoint, same `book_only=true`, same grab buttons), differing only in
+embed title and an unused `limit`. Replaced with `/library` and `/request`,
+each taking a `type:<audiobook|ebook>` choice rendered by Discord as a picker
+(`app_commands.Choice`, not free text). The four old commands were retired
+outright, not aliased — two users of this bot, and guild-scoped sync is
+instant, so a transition period buys nothing a Discord message doesn't.
+Also fixed a real gap this surfaced: audiobooks were unfindable through
+Prowlarr search at all, since `book_only`'s only category bucket
+(`PROWLARR_BOOK_CATEGORIES`, default 7000) returns zero audiobooks — verified
+against the live indexer across 103 results. `/api/v1/releases/search` gained
+`media_type` (`ebook`/`audiobook`), which applies the new
+`PROWLARR_AUDIOBOOK_CATEGORIES` setting (default `3030,100064`) and takes
+precedence over `book_only` when set; `book_only` itself is unchanged and
+still the default for any caller that doesn't specify a type.
+
 **Fixed 2026-09-14.** A real download filed as `Unknown Author/tr8e3el/tr8e3el.epub` instead of `Brenda Peynado/2021 - The Rock Eaters/…` — and this hits every scene release, not an edge case. A scene release always ships as a well-named release folder holding an obfuscated archive (`Brenda.Peynado.-.The.Rock.Eaters.2021.RETAIL.EPUB.eBook-CTO/tr8e3el.rar`); `extract_dir_for` names the extracted directory after the ARCHIVE (`tr8e3el.rar` → `tr8e3el/`), and the post-extraction re-scan read metadata from that meaningless name instead of the release folder one level up, which is the only place the author/title/year actually live. `normalize_meta` now climbs out of a book folder whose own name `parse_name` reads as nothing at all (no author, no year — the case a legitimately-named folder like `Author - Title (2001)` never hits), the same idea as the existing disc/section climb, stopping at the first ancestor that actually parses. Also: `strip_quality` only stripped audio format tags (mp3/m4b/…), so an ebook release's own format name survived into the title (`"The Rock Eaters EPUB"`); it now also strips epub/mobi/azw3/pdf. Regression test: `tests/test_organizer.py::SceneReleaseMetadataTests`.
 
 **Fixed 2026-09-14.** PR #17's `reconcile_downloads` only ever watches qBittorrent's `shelfmark-books` category, but `grab_release` still called `ProwlarrClient.grab()`, which POSTs to Prowlarr's OWN `/api/v1/search` and hands the release to whatever download client Prowlarr itself has configured — on the live system, one client fixed to category `prowlarr`. Every grabbed release landed in a category the reconciler never watches and sat there forever, making the whole automated pipeline inert. `grab_release` now adds the release to qBittorrent directly with `QBittorrentClient.add_urls()`, reading the SAME `QBITTORRENT_CATEGORY` setting the reconciler does so the two can never drift apart again. See the "Automatic download pipeline" section in README.md and `QBITTORRENT_PROWLARR_BASE_URL` in `.env.example` for the URL-rewrite this required.
@@ -256,7 +275,7 @@ Reference: <https://github.com/qbittorrent/qBittorrent/wiki/Web-API-Documentatio
 2. Shelfmark searches Prowlarr.
 3. The bot displays title, author, format, size, indexer, seeders, and quality.
 4. User selects a result and confirms.
-5. Shelfmark submits the selected release. **[x] implemented** — `grab_release` job via the `Grab` button on `/release-search` and `/ebook-request`. **Not through Prowlarr's own grab endpoint** (fixed 2026-09-14: that routed to Prowlarr's own configured download client, in a category the reconciler never watched, so nothing ever reached step 7) — the job adds the release directly to qBittorrent instead, in the reconciler's own configured category.
+5. Shelfmark submits the selected release. **[x] implemented** — `grab_release` job via the `Grab` button on `/request` (2026-09-16: unified from the earlier `/release-search` and `/ebook-request`, which had drifted into being the exact same call — see the Discord bot section below). **Not through Prowlarr's own grab endpoint** (fixed 2026-09-14: that routed to Prowlarr's own configured download client, in a category the reconciler never watched, so nothing ever reached step 7) — the job adds the release directly to qBittorrent instead, in the reconciler's own configured category.
 6. ~~The worker records the Prowlarr release ID and qBittorrent hash.~~ **Not needed as designed**: the `reconcile_downloads` reconciler (step 7) identifies completed torrents directly from qBittorrent's own listing by hash, rather than needing grab_release to hand one forward.
 7. The worker polls qBittorrent until files are complete and stable. **[x] implemented** — periodic `reconcile_downloads` job (not a per-torrent watcher; see the "Automatic download pipeline" section in README.md), checking qBittorrent's *state*, not just `progress == 1` (a recheck or an in-progress move both report 100% while unsafe to pull).
 8. Freddy pulls only the Shelfmark category over restricted SSH/rsync. **[x] implemented** — `transfer_completed`, now auto-enqueued by the reconciler for any newly-claimed torrent hash.
@@ -290,8 +309,9 @@ Implement:
 
 - [x] Discord application and bot registration. Connected as `Shelfmark#7251`.
 - [x] Guild-scoped slash commands during development, via `SHELFMARK_DISCORD_GUILD_ID` — guild sync is immediate, global sync can take an hour.
-- [~] Buttons, select menus, and modals for release and metadata selection. Buttons only (no select menus/modals yet), but now cover ebooks too: `/ebook-search` sends the on-server file straight to the requester's phone as an ephemeral attachment (path-traversal-safe opaque id, size checked against Discord's limit before any upload is attempted), and `/ebook-request` reuses the existing grab-button/job path against Prowlarr restricted to `PROWLARR_BOOK_CATEGORIES` (default 7000 — the one indexer here doesn't advertise 7020/EBook).
-- [x] Role/user allowlists for download, organize, metadata, and scan actions. **Fails closed** — an unset `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` refuses everyone rather than permitting everyone, which is what it did before. Applies to `/ebook-search` and `/ebook-request` the same as every other command.
+- [~] Buttons, select menus, and modals for release and metadata selection. Buttons only (no select menus/modals yet), but now cover ebooks too: `/library type:ebook` sends the on-server file straight to the requester's phone as an ephemeral attachment (path-traversal-safe opaque id, size checked against Discord's limit before any upload is attempted), and `/request type:ebook` reuses the existing grab-button/job path against Prowlarr restricted to `PROWLARR_BOOK_CATEGORIES` (default 7000 — the one indexer here doesn't advertise 7020/EBook). `/request type:audiobook` uses `PROWLARR_AUDIOBOOK_CATEGORIES` (default 3030,100064) instead — 7000 alone returns zero audiobooks, measured against the live indexer.
+- [x] Role/user allowlists for download, organize, metadata, and scan actions. **Fails closed** — an unset `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` refuses everyone rather than permitting everyone, which is what it did before. Applies to `/library` and `/request` the same as every other command.
+- [x] Unify the search/request commands around what the user wants, not where the data lives (2026-09-16). `/library-search`, `/ebook-search`, `/ebook-request`, and `/release-search` retired outright (no aliases — two users, instant guild sync) in favor of `/library type:<audiobook|ebook> query:<text>` and `/request type:<audiobook|ebook> query:<text>`, each with the type rendered as a Discord `app_commands.Choice` picker. `/release-search` and `/ebook-request` had converged to an identical call before the retirement (same endpoint, same `book_only=true`, same grab buttons); the only functional gap this closed was that audiobooks were previously unfindable through `/request` at all, since `book_only` only ever applied the ebook category bucket.
 - [ ] Per-user and per-guild rate limits. Not done. The role allow-list is the only throttle, so any permitted user can queue unlimited grabs.
 - [~] Audit records containing Discord user, guild, channel, and message IDs. Every command passes an actor string of `discord:<user>:<guild>:<channel>` which reaches the `audit_events` table; the message ID is not captured.
 - [x] Immediate interaction deferral, followed by persistent job notifications. Every command defers before any network call; the pipeline reports completion and failure through the Discord webhook.
@@ -490,7 +510,7 @@ Acceptance criteria:
 - [x] Create and configure the Discord application. Invited with permission integer `0` and no privileged intents — every reply is an ephemeral interaction response, which needs no channel permission.
 - [x] Register guild-scoped slash commands.
 - [x] Implement initial slash commands with immediate defer and persistent job IDs.
-- [x] Implement library search embeds. `/library-search` (Audiobookshelf), `/release-search` (Prowlarr), `/ebook-search` (on-server ebooks).
+- [x] Implement library search embeds. `/library type:audiobook` (Audiobookshelf), `/request` (Prowlarr), `/library type:ebook` (on-server ebooks) — unified 2026-09-16 from the earlier `/library-search`, `/release-search`, `/ebook-search` (see the Discord bot section above).
 - [~] Implement Prowlarr result pagination and selection. Selection works via grab buttons on the top five results; **there is no pagination** — result six onward is unreachable without refining the query.
 - [x] Implement confirmation buttons. Grab buttons on release search, Send buttons on ebook search.
 - [~] Implement download progress notifications. A Discord *webhook* posts a completion message and a chain-failure message from the worker (`SHELFMARK_DISCORD_WEBHOOK_URL`; see README's "Automatic download pipeline"). No in-progress/percentage updates, and it is a webhook post, not a bot-side embed tied to the original interaction.

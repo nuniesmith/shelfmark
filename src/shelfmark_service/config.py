@@ -77,8 +77,16 @@ class Settings:
     # The user's one configured indexer advertises the general Books buckets
     # (7000/7010/7030/7050) but neither 7020 (EBook specifically) nor 7060
     # (Audiobook) — filtering to 7020 alone would return zero results, so
-    # `/ebook-request` defaults to the bucket that indexer actually has.
+    # `/request type:ebook` defaults to the bucket that indexer actually has.
     prowlarr_book_categories: tuple[int, ...] = (7000,)
+    # Measured against the live indexer (2026-09-16): audiobooks live under
+    # 3030 (Audio/Audiobook, the standard Newznab bucket) AND 100064 (this
+    # indexer's own AudioBook-specific category) — neither is book_only's
+    # 7000, and a two-search sample of 103 results returned zero audiobooks
+    # under 7000 alone. 100064 is indexer-specific (a different indexer would
+    # use a different id there), so this has to stay configurable the same
+    # way prowlarr_book_categories is, not a hardcoded pair.
+    prowlarr_audiobook_categories: tuple[int, ...] = (3030, 100064)
     qbittorrent_url: str | None = None
     qbittorrent_username: str | None = None
     qbittorrent_password: str | None = None
@@ -188,6 +196,9 @@ class Settings:
             prowlarr_url=os.environ.get("PROWLARR_URL") or None,
             prowlarr_api_key=os.environ.get("PROWLARR_API_KEY") or None,
             prowlarr_book_categories=_int_tuple_from_env("PROWLARR_BOOK_CATEGORIES", (7000,)),
+            prowlarr_audiobook_categories=_int_tuple_from_env(
+                "PROWLARR_AUDIOBOOK_CATEGORIES", (3030, 100064)
+            ),
             qbittorrent_url=os.environ.get("QBITTORRENT_URL") or None,
             qbittorrent_username=os.environ.get("QBITTORRENT_USERNAME") or None,
             qbittorrent_password=os.environ.get("QBITTORRENT_PASSWORD") or None,
