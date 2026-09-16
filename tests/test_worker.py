@@ -1095,3 +1095,61 @@ class CheckLivenessCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrganizeLeavesNoEmptyDirsTests(unittest.TestCase):
+    """An automatic import must not leave the release's folder skeleton behind.
+
+    The CLI has always swept these (`remove_empty_dirs` in `run()`), but the
+    worker's organize path called `build_plan`/`apply_plan` directly and
+    skipped it. After one real download `/incoming` held seven empty
+    directories and no files, and they were never cleaned up — one tree per
+    book, forever. Harmless in itself, but it makes "is anything still being
+    imported?" impossible to answer by looking at the directory.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-sweep-")
+        self.root = Path(self.tmp.name)
+        self.incoming = self.root / "incoming"
+        self.library = self.root / "library"
+        self.library.mkdir(parents=True)
+        # The real shape: a release folder with a per-book folder inside it.
+        book = self.incoming / "Dune Saga - Frank Herbert Collection" / "Dune (1965)"
+        book.mkdir(parents=True)
+        (book / "Dune - Frank Herbert.epub").write_bytes(b"EPUB")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _run(self) -> None:
+        database = Database(self.root / "t.db")
+        database.initialize()
+        settings = Settings(
+            database_path=self.root / "t.db",
+            manifest_root=self.root / "manifests",
+            incoming_root=self.incoming,
+            ebook_root=self.library,
+        )
+        worker = Worker(database, settings)
+        database.enqueue(
+            "organize_apply",
+            {"source": str(self.incoming), "dest": str(self.library), "media": "ebook"},
+            actor="test",
+        )
+        worker.execute(database.claim_next("w"))
+
+    def test_the_release_skeleton_is_swept(self) -> None:
+        self._run()
+        left = [
+            str(p.relative_to(self.incoming))
+            for p in self.incoming.rglob("*")
+            if p.is_dir() and p.name != "trash"
+        ]
+        self.assertEqual(left, [], f"empty directories left in incoming: {left}")
+
+    def test_the_book_still_reaches_the_library(self) -> None:
+        """The sweep must not be achieved by simply not importing anything."""
+        self._run()
+        found = sorted(str(p.relative_to(self.library)) for p in self.library.rglob("*.epub"))
+        self.assertEqual(found, ["Frank Herbert/1965 - Dune/Dune.epub"])

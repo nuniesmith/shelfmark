@@ -429,7 +429,13 @@ class Worker:
             raise ShelfmarkError(ErrorCode.SOURCE_MISSING, f"source is not a directory: {source}")
         dest = _path(payload, "dest", source)
         trash = _path(payload, "trash", source / "trash")
-        from main import apply_extracts, apply_plan, build_plan
+        from main import (
+            apply_extracts,
+            apply_plan,
+            build_plan,
+            dirs_the_plan_empties,
+            remove_empty_dirs,
+        )
 
         options = {
             "source": source,
@@ -461,7 +467,20 @@ class Worker:
             plan = build_plan(**options)
             manifest.event("plan_recreated", summary=_plan_summary(plan))
         self._record_plan(manifest, plan)
-        apply_plan(plan, trash=trash, dry_run=False, copy=bool(payload.get("copy", False)))
+        copy = bool(payload.get("copy", False))
+        apply_plan(plan, trash=trash, dry_run=False, copy=copy)
+        # The CLI sweeps these (see main.py's run()); this path did not, so
+        # every automatic import left the release's folder skeleton behind
+        # forever — after one real download /incoming held seven empty
+        # directories and no files. Not harmful, but it accumulates one tree
+        # per book and makes "is anything still being imported?" unanswerable
+        # by looking.
+        #
+        # Skipped under --copy for the same reason the CLI skips it: nothing
+        # was taken out of those directories, so their emptiness is the
+        # operator's, not ours to tidy.
+        if not copy:
+            remove_empty_dirs(source, {source, dest, trash}, dirs_the_plan_empties(plan))
         return _plan_summary(plan) | {"applied": True}
 
     @staticmethod

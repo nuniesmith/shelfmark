@@ -275,6 +275,14 @@ Reference: <https://github.com/qbittorrent/qBittorrent/wiki/Web-API-Documentatio
 
 ## Download workflow
 
+- [x] Sweep the release's empty folder skeleton after an automatic import. The
+      CLI always did this (`remove_empty_dirs` in `run()`); the worker's
+      organize path did not, so every pipeline import left one empty directory
+      tree in the incoming root forever — seven of them after a single real
+      download.
+
+
+
 1. User invokes `/search-new`.
 2. Shelfmark searches Prowlarr.
 3. The bot displays title, author, format, size, indexer, seeders, and quality.
