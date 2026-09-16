@@ -814,13 +814,42 @@ def enrich_meta(meta: Meta, tracks: list[Path]) -> Meta:
     author = meta.author
     title = meta.title
     year = meta.year
+    # The folder already gave us a title we trust — meta_from_book_dir ran
+    # before this. The filename is only consulted to FILL a missing author,
+    # never to override one the folder already supplied.
+    folder_author_missing = author == "Unknown Author" or bool(INDEX_RE.match(author or ""))
 
     # Track filenames like "Walter Isaacson - Steve Jobs 01-24.mp3" → Author - Title
     for t in tracks[:5]:
         stem = humanize(t.stem)
         stem = re.sub(r"\s+\d{1,3}\s*[-–]\s*\d{1,3}\s*$", "", stem).strip()
         parts = [p.strip() for p in re.split(r"\s+-\s+", stem) if p.strip()]
-        if len(parts) >= 2 and looks_like_person(parts[0]):
+        if len(parts) < 2:
+            continue
+
+        # "Title - Author" ebook filenames (one file per book, no track
+        # number) that repeat the folder's own title verbatim. A real Dune
+        # Saga pack has the folder "Chapterhouse Dune (1985)" (title + year,
+        # no author) and the file "Chapterhouse Dune - Frank Herbert.epub"
+        # (title + author, no year) — meta_from_book_dir already trusts the
+        # folder's title, so once the filename's leading segment matches it,
+        # the shape is PROVEN Title - Author, never Author - Title, even
+        # though "Chapterhouse Dune" and "Dune Messiah" are themselves two
+        # capitalised words and looks_like_person reads them as a person's
+        # name. Without this check the generic branch below fired on exactly
+        # that shape: it took the TITLE for the author and the real author
+        # for the title, which is a worse failure than leaving the author
+        # blank because it is confidently wrong instead of merely
+        # incomplete. Gated on folder_author_missing so a book whose folder
+        # already names the author correctly is never second-guessed by a
+        # stray or mismatched filename.
+        if folder_author_missing and title_key(parts[0]) == title_key(title):
+            candidate_author = " - ".join(parts[1:]).strip()
+            if candidate_author and looks_like_person(candidate_author):
+                author = candidate_author
+                break
+
+        if looks_like_person(parts[0]):
             # Author - Title (track)
             rest = " - ".join(parts[1:])
             rest = re.sub(r"\s+\d{1,3}\s*$", "", rest).strip()
@@ -2905,6 +2934,42 @@ def self_test() -> int:
     opaque_meta = parse_name("tr8e3el")
     assert opaque_meta.author == "Unknown Author", opaque_meta
     assert opaque_meta.year is None, opaque_meta
+
+    # ── a multi-book collection: folder has title+year, filename has author ──
+    # The first real collection this pipeline delivered — a Frank Herbert
+    # Dune set — filed all six books wrong. Each per-book folder is
+    # "Title (Year)" with no author at all, and the author lives only in the
+    # sibling FILENAME ("Title - Frank Herbert.epub"). Two capitalised-word
+    # titles ("Chapterhouse Dune", "Dune Messiah") pass looks_like_person, so
+    # enrich_meta's "Author - Title" guess used to fire on the filename and
+    # SWAP it: author became the TITLE and the title became "Frank Herbert".
+    # The rest ("Dune", "Children of Dune") don't read as a person, so they
+    # were merely left under "Unknown Author" instead — wrong a different
+    # way. Full end-to-end coverage, all six books, is
+    # tests/test_organizer.py::MultiBookCollectionMetadataTests.
+    dune = tmp / "dune"
+    collection = dune / "Dune Saga - Frank Herbert Collection"
+    dune_books = {
+        "Dune (1965)": "Dune",
+        "Dune Messiah (1969)": "Dune Messiah",
+        "Children of Dune (1976)": "Children of Dune",
+        "Chapterhouse Dune (1985)": "Chapterhouse Dune",
+    }
+    for folder, dtitle in dune_books.items():
+        touch(collection / folder / f"{dtitle} - Frank Herbert.epub")
+    dune_plan = build_plan(
+        source=dune,
+        dest=tmp / "dune-out",
+        trash=dune / "trash",
+        folder_format="year-title",
+        keep_names=False,
+        include_non_cover_images=False,
+        media_mode="ebook",
+    )
+    assert len(dune_plan.books) == len(dune_books), [b.meta for b in dune_plan.books]
+    for b in dune_plan.books:
+        assert b.meta.author == "Frank Herbert", b.meta
+        assert b.meta.title != "Frank Herbert", b.meta  # the swap's fingerprint
 
     # ── a removed format token must not leave a dangling separator ─────────
     # A loose ebook file's own extension is not stripped by parse_name's

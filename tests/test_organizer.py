@@ -582,6 +582,87 @@ class SceneReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(meta.year, "1999")
 
 
+class MultiBookCollectionMetadataTests(unittest.TestCase):
+    """A multi-book collection where the per-book FOLDER carries title + year
+    and the FILENAME carries the author — a real Frank Herbert Dune pack:
+
+        Dune Saga - Frank Herbert Collection/
+            Chapterhouse Dune (1985)/Chapterhouse Dune - Frank Herbert.epub
+            Children of Dune (1976)/Children of Dune - Frank Herbert.epub
+            Dune (1965)/Dune - Frank Herbert.epub
+            Dune Messiah (1969)/Dune Messiah - Frank Herbert.epub
+            God Emperor of Dune (1981)/God Emperor of Dune - Frank Herbert.epub
+            Heretics of Dune (1984)/Heretics of Dune - Frank Herbert.epub
+
+    Each folder alone has no author (parse_name reads "Unknown Author" plus
+    the title), and each filename alone has both parts right ("Frank
+    Herbert" / the same title). Combining them used to produce a THIRD,
+    wrong answer that depended on whether the title happened to look like a
+    two-word person's name:
+
+      * "Chapterhouse Dune" and "Dune Messiah" (two capitalised words) pass
+        looks_like_person, so enrich_meta's "Author - Title" guess fired on
+        the filename and swapped it: author became the TITLE
+        ("Chapterhouse Dune") and the real author ("Frank Herbert") was
+        filed as the title. This is the worst outcome — confidently wrong,
+        not merely incomplete.
+      * "Children of Dune" and "Dune" do not look like a person (the first
+        has "of", a TITLE_STOP word; the second is a single token), so
+        nothing filled the author at all and the book shipped under
+        "Unknown Author" with the right title.
+
+    All six must land as author="Frank Herbert" with the folder's own title
+    and year untouched, regardless of which of the two failure shapes their
+    title would otherwise have hit.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-dune-")
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "incoming"
+        self.source.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_folder_title_plus_filename_author_never_swaps(self) -> None:
+        collection = self.source / "Dune Saga - Frank Herbert Collection"
+        books = {
+            "Dune (1965)": ("Dune", "1965"),
+            "Dune Messiah (1969)": ("Dune Messiah", "1969"),
+            "Children of Dune (1976)": ("Children of Dune", "1976"),
+            "God Emperor of Dune (1981)": ("God Emperor of Dune", "1981"),
+            "Heretics of Dune (1984)": ("Heretics of Dune", "1984"),
+            "Chapterhouse Dune (1985)": ("Chapterhouse Dune", "1985"),
+        }
+        for folder, (title, _year) in books.items():
+            path = collection / folder / f"{title} - Frank Herbert.epub"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"epub-bytes")
+
+        plan = build_plan(
+            source=self.source,
+            dest=self.root / "library",
+            trash=self.source / "trash",
+            folder_format="year-title",
+            keep_names=False,
+            include_non_cover_images=False,
+            media_mode="ebook",
+        )
+
+        self.assertEqual(len(plan.books), 6, [b.meta for b in plan.books])
+        got = {b.meta.title: (b.meta.author, b.meta.year) for b in plan.books}
+        for title, year in books.values():
+            self.assertIn(title, got)
+            self.assertEqual(got[title], ("Frank Herbert", year), title)
+        # The swap's fingerprint: the title must never end up as the
+        # author, however person-like a two-word title reads.
+        for b in plan.books:
+            self.assertNotEqual(b.meta.author, b.meta.title)
+        self.assertNotIn("Chapterhouse Dune", {b.meta.author for b in plan.books})
+        self.assertNotIn("Dune Messiah", {b.meta.author for b in plan.books})
+
+
 class AtomicWriteTests(unittest.TestCase):
     """A file in the library is complete or absent, never half-written.
 

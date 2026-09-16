@@ -549,12 +549,20 @@ in `db.py`.
    holding an obfuscated `tr8e3el.rar` extracts to a `tr8e3el/` folder with no
    author, title, or year in its name at all, so that name is skipped in
    favor of the release folder one level up
-7. Applies known title/author fixes (e.g. missing King years, Clark → Clarke)
-8. Builds `Author / Year - Title /` and renumbers audio tracks
-9. Preserves known Audiobookshelf/ebook metadata sidecars and leaves unknown files for review
-10. Moves recognized junk into `trash/` — including scene-release clutter like `.nfo` and
+7. Fills in a missing author from the FILENAME for a multi-book collection whose
+   per-book folder carries only title and year — `Chapterhouse Dune (1985)/
+   Chapterhouse Dune - Frank Herbert.epub` files as `Frank Herbert/1985 -
+   Chapterhouse Dune/`, not `Chapterhouse Dune/1985 - Frank Herbert/` (author
+   and title swapped) and not `Unknown Author/1985 - Chapterhouse Dune/`
+   (author dropped) — the two ways this broke on a real six-book Frank
+   Herbert Dune set. The filename is only ever used to fill an author the
+   folder didn't supply; the folder's own title and year always win
+8. Applies known title/author fixes (e.g. missing King years, Clark → Clarke)
+9. Builds `Author / Year - Title /` and renumbers audio tracks
+10. Preserves known Audiobookshelf/ebook metadata sidecars and leaves unknown files for review
+11. Moves recognized junk into `trash/` — including scene-release clutter like `.nfo` and
     `file_id.diz` (use `--trash-unknown` to opt into moving other files too)
-11. Refuses to merge an incoming book into a destination that already holds a *different*
+12. Refuses to merge an incoming book into a destination that already holds a *different*
     book under the same name — the whole incoming copy goes to quarantine instead (see below)
 
 ## Supported formats
