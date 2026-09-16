@@ -10,6 +10,7 @@ from src.shelfmark_service.discord_bot import (
     _job_status_message,
     _library_query,
     _max_attachment_bytes,
+    _needs_confirmation,
     _request_query,
     _too_large,
     blocking_problems,
@@ -187,6 +188,41 @@ class TooLargeTests(unittest.TestCase):
 
     def test_a_missing_size_is_not_treated_as_too_large(self) -> None:
         self.assertFalse(_too_large(None, 10_000_000))
+
+
+class NeedsConfirmationTests(unittest.TestCase):
+    """Whether a Grab press must stop for confirmation before queuing.
+
+    Deliberately the OPPOSITE of TooLargeTests' missing-size case below: a
+    grab has no second, real-bytes check afterward (unlike EbookView, which
+    re-checks the actual fetched size before sending) -- the job goes straight
+    to a remote worker and its real size is never seen again here. A missing
+    size is exactly what the mis-ranked, wrongly-categorized release that
+    motivated this guard can have (a real search for "the stand" surfaced a
+    26 GB "Westerns ... GraphicAudio Collection" ranked above the book
+    actually searched for), so it must not be waved through the way
+    `_too_large` waves it through for an attachment.
+    """
+
+    def test_a_release_under_the_threshold_needs_no_confirmation(self) -> None:
+        self.assertFalse(_needs_confirmation(2_813_000_000, 5_000_000_000))
+
+    def test_a_release_over_the_threshold_needs_confirmation(self) -> None:
+        # The 26 GB collection release that outranked an actual search for
+        # "the stand" by matching "Stand-Alone".
+        self.assertTrue(_needs_confirmation(26_736_000_000, 5_000_000_000))
+
+    def test_exactly_at_the_threshold_needs_no_confirmation(self) -> None:
+        self.assertFalse(_needs_confirmation(5_000_000_000, 5_000_000_000))
+
+    def test_a_missing_size_needs_confirmation(self) -> None:
+        """The opposite call from `_too_large`'s: there is no second,
+        real-bytes check downstream of a grab, so an unusable size must be
+        treated as the risky case, not waved through."""
+        self.assertTrue(_needs_confirmation(None, 5_000_000_000))
+
+    def test_a_non_numeric_size_needs_confirmation(self) -> None:
+        self.assertTrue(_needs_confirmation("unknown", 5_000_000_000))
 
 
 class EbookLabelTests(unittest.TestCase):
