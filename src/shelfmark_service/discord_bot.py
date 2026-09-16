@@ -474,7 +474,11 @@ def install_commands(
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            params = {"q": query, "limit": 50}
+            # Explicit even though the API now defaults to it: this is the
+            # command that returned Blu-rays, and the next person reading it
+            # should not have to go and check a route's default to know why
+            # it only finds books.
+            params = {"q": query, "limit": 50, "book_only": "true"}
             if type:
                 params["type"] = type
             payload = await api.get("/api/v1/releases/search", params=params, actor=_actor(interaction))
