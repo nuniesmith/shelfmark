@@ -4,14 +4,22 @@ import unittest
 from unittest import mock
 
 from src.shelfmark_service.discord_bot import (
+    _clamp_page,
     _ebook_label,
+    _has_next_page,
+    _has_previous_page,
     _human_size,
     _int_set,
     _job_status_message,
     _library_query,
     _max_attachment_bytes,
     _needs_confirmation,
+    _numbered_lines,
+    _page_count,
+    _page_position_text,
+    _page_slice,
     _request_query,
+    _resolve_page_item,
     _too_large,
     blocking_problems,
     is_permitted,
@@ -250,12 +258,17 @@ class LibraryQueryTests(unittest.TestCase):
     def test_audiobook_hits_audiobookshelf(self) -> None:
         endpoint, params = _library_query("audiobook", "dune")
         self.assertEqual(endpoint, "/api/v1/library/search")
-        self.assertEqual(params, {"q": "dune"})
+        # 25, not the API's own default of 12: enough for 5 full pages of
+        # 5 now that /library type:audiobook results are paged rather than
+        # cut off at the old, unpaged 10.
+        self.assertEqual(params, {"q": "dune", "limit": 25})
 
     def test_ebook_hits_the_on_disk_root(self) -> None:
         endpoint, params = _library_query("ebook", "dune")
         self.assertEqual(endpoint, "/api/v1/ebooks/search")
-        self.assertEqual(params, {"q": "dune", "limit": 10})
+        # 25 is api.ebook_search's own ceiling (`le=25`) -- raised from 10
+        # now that pagination makes a result past the old cutoff reachable.
+        self.assertEqual(params, {"q": "dune", "limit": 25})
 
 
 class RequestQueryTests(unittest.TestCase):
@@ -275,9 +288,149 @@ class RequestQueryTests(unittest.TestCase):
         self.assertEqual(params["media_type"], "audiobook")
         self.assertEqual(params["q"], "dune")
 
+    def test_fetch_limit_is_50_not_the_old_25(self) -> None:
+        """Raised so a mis-ranked real result landing past the old 25-item
+        fetch (as "the stand" landed at position 3 of the 5 that used to be
+        SHOWN) is at least fetched -- pagination is what then makes it
+        reachable, but only if it was fetched to begin with."""
+        _endpoint, params = _request_query("audiobook", "dune")
+        self.assertEqual(params["limit"], 50)
+
     def test_ebook_sends_the_ebook_media_type(self) -> None:
         _endpoint, params = _request_query("ebook", "dune")
         self.assertEqual(params["media_type"], "ebook")
+
+
+class PageCountTests(unittest.TestCase):
+    def test_an_exact_multiple_of_the_page_size_divides_evenly(self) -> None:
+        self.assertEqual(_page_count(25, page_size=5), 5)
+
+    def test_a_partial_last_page_rounds_up(self) -> None:
+        """23 items at 5 per page is 5 pages, not 4 -- the last one holds
+        only 3, but it still needs a page to be reachable on."""
+        self.assertEqual(_page_count(23, page_size=5), 5)
+
+    def test_zero_items_is_still_one_page_not_zero(self) -> None:
+        """A page number always has somewhere valid to land -- see the
+        function's docstring; this case is defensive, since the "no
+        results" message is sent before any paged view is built."""
+        self.assertEqual(_page_count(0, page_size=5), 1)
+
+
+class ClampPageTests(unittest.TestCase):
+    def test_a_negative_page_clamps_to_zero(self) -> None:
+        self.assertEqual(_clamp_page(-1, total=23, page_size=5), 0)
+
+    def test_a_page_past_the_end_clamps_to_the_last_page(self) -> None:
+        # 23 items -> 5 pages -> last valid 0-indexed page is 4.
+        self.assertEqual(_clamp_page(99, total=23, page_size=5), 4)
+
+    def test_an_in_range_page_is_left_alone(self) -> None:
+        self.assertEqual(_clamp_page(2, total=23, page_size=5), 2)
+
+
+class PageSliceTests(unittest.TestCase):
+    def test_the_first_page_is_the_first_five_items(self) -> None:
+        items = list(range(23))
+        self.assertEqual(_page_slice(items, page=0, page_size=5), [0, 1, 2, 3, 4])
+
+    def test_the_second_page_is_items_five_through_nine(self) -> None:
+        """This is the exact slice a page-2 embed must list as "6.", "7.",
+        etc -- see NumberedLinesTests and ResolvePageItemTests below for the
+        button side of the same requirement."""
+        items = list(range(23))
+        self.assertEqual(_page_slice(items, page=1, page_size=5), [5, 6, 7, 8, 9])
+
+    def test_a_partial_last_page_returns_only_the_remainder(self) -> None:
+        items = list(range(23))
+        self.assertEqual(_page_slice(items, page=4, page_size=5), [20, 21, 22])
+
+
+class ResolvePageItemTests(unittest.TestCase):
+    """`_resolve_page_item` is the ONE function every Grab/Send button
+    callback resolves its target through instead of indexing its stored
+    list directly -- see its docstring for the exact failure mode: a button
+    relabelled "Grab 6" on page 2 that still silently points at item 0
+    because the index it acts on was fixed when the view was first built
+    and never recomputed against the current page.
+    """
+
+    def test_page_twos_first_slot_resolves_to_the_sixth_item_not_the_first(self) -> None:
+        # Distinct dict markers rather than ints, so a wrong answer names
+        # WHICH item came back instead of just a wrong number -- matching
+        # how a real release/book list is shaped.
+        items = [{"title": f"item-{i}"} for i in range(12)]
+        # Page 2 is page=1 (0-indexed); its local slot 0 is displayed as
+        # "6." in the embed and labelled "Grab 6" -- it must resolve to
+        # items[5], the sixth item, not items[0].
+        self.assertIs(_resolve_page_item(items, page=1, local_index=0), items[5])
+
+    def test_page_ones_first_slot_still_resolves_to_the_first_item(self) -> None:
+        items = [{"title": f"item-{i}"} for i in range(12)]
+        self.assertIs(_resolve_page_item(items, page=0, local_index=0), items[0])
+
+    def test_page_twos_last_slot_resolves_to_the_tenth_item(self) -> None:
+        items = [{"title": f"item-{i}"} for i in range(12)]
+        self.assertIs(_resolve_page_item(items, page=1, local_index=4), items[9])
+
+    def test_a_slot_past_a_partial_last_pages_remainder_resolves_to_none(self) -> None:
+        # 7 items -> page 1 (the second page) holds only items[5] and
+        # items[6] -- slots 2, 3, 4 have nothing, so their buttons must be
+        # disabled rather than resolve to whatever used to occupy them on
+        # a fuller page.
+        items = [{"title": f"item-{i}"} for i in range(7)]
+        self.assertIsNone(_resolve_page_item(items, page=1, local_index=2))
+        self.assertIs(_resolve_page_item(items, page=1, local_index=1), items[6])
+
+
+class HasPreviousNextPageTests(unittest.TestCase):
+    def test_page_zero_has_no_previous(self) -> None:
+        self.assertFalse(_has_previous_page(0))
+
+    def test_page_one_has_a_previous(self) -> None:
+        self.assertTrue(_has_previous_page(1))
+
+    def test_the_last_page_has_no_next(self) -> None:
+        # 23 items, 5 per page -> last 0-indexed page is 4.
+        self.assertFalse(_has_next_page(4, total=23, page_size=5))
+
+    def test_an_earlier_page_has_a_next(self) -> None:
+        self.assertTrue(_has_next_page(0, total=23, page_size=5))
+
+
+class PagePositionTextTests(unittest.TestCase):
+    """"6-10 of 25" -- the position text a page turn must always show, so
+    paging never happens blind."""
+
+    def test_the_first_page_reads_one_through_five(self) -> None:
+        self.assertEqual(_page_position_text(0, total=25, page_size=5), "1-5 of 25")
+
+    def test_the_second_page_reads_six_through_ten(self) -> None:
+        self.assertEqual(_page_position_text(1, total=25, page_size=5), "6-10 of 25")
+
+    def test_a_partial_last_page_reads_only_its_remainder(self) -> None:
+        """23 items must read "21-23 of 23", not "21-25 of 23" -- the end
+        of the range is clamped to the actual total."""
+        self.assertEqual(_page_position_text(4, total=23, page_size=5), "21-23 of 23")
+
+    def test_no_results_reads_zero_of_zero(self) -> None:
+        self.assertEqual(_page_position_text(0, total=0, page_size=5), "0 of 0")
+
+
+class NumberedLinesTests(unittest.TestCase):
+    def test_numbering_starts_at_the_given_start_not_always_one(self) -> None:
+        """Page 2's embed must read "6. ...", "7. ...", to agree with the
+        "Grab 6"/"Grab 7" buttons beside it (see ResolvePageItemTests) --
+        restarting the count at 1 every page would make the embed and the
+        buttons disagree about which item is which."""
+        items = [{"title": "Sixth"}, {"title": "Seventh"}]
+        rendered = _numbered_lines(items, start=6, label_fn=lambda item: item["title"])
+        self.assertEqual(rendered, "6. Sixth\n7. Seventh")
+
+    def test_the_first_pages_numbering_still_starts_at_one(self) -> None:
+        items = [{"title": "First"}]
+        rendered = _numbered_lines(items, start=1, label_fn=lambda item: item["title"])
+        self.assertEqual(rendered, "1. First")
 
 
 if __name__ == "__main__":

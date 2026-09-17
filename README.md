@@ -153,6 +153,54 @@ this bot and `SHELFMARK_DISCORD_GUILD_ID` making new commands appear
 instantly, a transition alias would only be permanent upkeep for a switch one
 Discord message covers.
 
+**Paging through results (2026-09-16).** All three result lists — `/request`
+and both `/library` types — used to show five results and stop, with no way
+to reach a sixth. That is a real problem, not a hypothetical one: Prowlarr
+ranks on text match, not on what was actually asked for, and a real
+`/request type:audiobook query:"the stand"` search put two *Creativity, Inc*
+results and a 26 GB Westerns collection ahead of the Stephen King audiobook
+actually searched for, which landed at position 3 — comfortably inside five
+that time, but nothing stops the same ranking noise from landing a real
+result at position 8 or 15 on a different query. The primary user is
+non-technical, so "guess a narrower query" is the wrong answer.
+
+- Previous/Next buttons page five results at a time, with the current
+  position shown in the embed footer (e.g. "6-10 of 25"). Paging is
+  **client-side** over whatever was already fetched in the one search
+  behind the message — a page turn never re-queries Prowlarr, Audiobookshelf,
+  or the ebook root, since a fresh search can take seconds and re-running one
+  on every Next press would make paging feel broken.
+- Fetch limits were raised so more of what a page turn can reach is actually
+  fetched to begin with: `/request` 25→50 (`api.release_search`'s ceiling is
+  200), `/library type:ebook` 10→25 (`api.ebook_search`'s own ceiling), and
+  `/library type:audiobook` from an implicit 12 to an explicit 25. All three
+  now page out to 5 full pages (`/request` gets 10).
+  Previous is disabled on the first page and Next on the last, rather than
+  erroring — pressing either never reaches a callback once Discord has
+  greyed it out.
+- **The Grab/Send buttons resolve against the current page, not a frozen
+  index.** A view built once from the first five results, with buttons
+  merely relabelled on a page turn, would keep grabbing items 0-4 forever no
+  matter which page was showing — the button would read "Grab 6" while
+  silently still queuing item 1, with nothing to tell the user until the
+  wrong book arrived. Every Grab/Send callback instead recomputes its target
+  from the CURRENT page each time it is pressed (`page * page_size +
+  local_index`, evaluated fresh, not captured when the view was built).
+- The role allow-list guard is re-checked on every Previous/Next press, the
+  same way `_ConfirmGrabView`'s confirm button re-checks it (see "Confirming
+  a large grab" below) — paging is the first control in this bot that
+  invites sitting on a view and actively using it for its whole 900-second
+  lifetime rather than pressing once and being done, so a role revoked
+  partway through a paging session takes effect on the very next press.
+- A view that times out (900s, unchanged) edits the message to say "This
+  search has expired" and removes its buttons, rather than leaving a dead
+  message where a press reaches a bot with no handler left for it (Discord's
+  own answer to that is a bare "This interaction failed", with nothing to
+  explain why). That edit rides the same ~15-minute interaction webhook
+  token the timeout itself is keyed to the age of, so it is best-effort: if
+  Discord's clock expires the token a beat before the edit runs, the edit
+  itself fails and is swallowed rather than crashing the bot.
+
 **Both types search only their own categories, on purpose.** Prowlarr indexes
 everything, so an unfiltered search for "dune" returns
 `Dune Part Two 2024 BluRay 1080p` (category 2050) and a Car SOS episode about
@@ -187,12 +235,12 @@ reader app just to browse files isn't wanted, so Shelfmark indexes
 `SHELFMARK_EBOOKS_ROOT` itself:
 
 - `/library type:ebook query:<text>` walks the ebooks root, matching on
-  author, title, and filename, and shows up to 5 results with a **Send**
-  button per result. Pressing one fetches the file and attaches it to an
-  ephemeral reply — open it from Discord on a phone and it lands in
-  whichever app is registered for that format. When a book has more than one
-  file (an epub next to a pdf, say), the better format wins automatically,
-  in `EBOOK_PREF` order.
+  author, title, and filename, fetches up to 25 matches, and pages through
+  them 5 at a time with a **Send** button per result on the current page.
+  Pressing one fetches the file and attaches it to an ephemeral reply — open
+  it from Discord on a phone and it lands in whichever app is registered for
+  that format. When a book has more than one file (an epub next to a pdf,
+  say), the better format wins automatically, in `EBOOK_PREF` order.
 - `/request type:ebook query:<text>` searches Prowlarr restricted to
   `PROWLARR_BOOK_CATEGORIES` and offers a grab button.
 - Discord refuses attachments over 10 MB on an unboosted server. The size is

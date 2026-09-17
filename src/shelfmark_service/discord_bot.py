@@ -103,6 +103,106 @@ def _human_size(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
+# `/request` and `/library` used to show five results and stop -- a real
+# `/request type:audiobook query:"the stand"` search put two *Creativity,
+# Inc* results and a 26 GB Westerns collection ahead of the Stephen King
+# audiobook actually searched for, which landed at position 3. That time it
+# was still inside the top five; nothing stops the same ranking noise from
+# landing a real result at position 8 or 15 on a different query, and the
+# non-technical primary user has no good way to "guess a narrower query"
+# their way to it. The fix is paging through results ALREADY fetched, five
+# at a time, rather than re-querying per page turn (a Prowlarr search takes
+# seconds; re-running it on every Next press would make paging feel
+# broken) or asking for a better query. `_PAGE_SIZE` is 5 because that is
+# also Discord's own per-row button cap, which is what makes five the
+# natural width for a page of action buttons, not just a display choice.
+_PAGE_SIZE = 5
+
+
+def _page_count(total: int, page_size: int = _PAGE_SIZE) -> int:
+    """How many pages `total` items make, always at least 1.
+
+    A `total` of 0 still returns 1 rather than 0, so a page number always
+    has somewhere valid to land -- callers that reach this with zero items
+    are being defensive, since the "no results" message is sent before any
+    paged view is ever built.
+    """
+    if total <= 0:
+        return 1
+    return -(-total // page_size)  # ceiling division without importing math
+
+
+def _clamp_page(page: int, total: int, page_size: int = _PAGE_SIZE) -> int:
+    """Keep a page number inside [0, last page] rather than erroring.
+
+    Covers a stale Previous/Next press racing a result count that changed
+    underneath it, and a target page computed one step past either end.
+    """
+    last_page = _page_count(total, page_size) - 1
+    return max(0, min(page, last_page))
+
+
+def _page_slice(items: Sequence[Any], page: int, page_size: int = _PAGE_SIZE) -> list[Any]:
+    """The items shown on `page` (0-indexed) -- what the embed text and the
+    action buttons are both built from for that page."""
+    page = _clamp_page(page, len(items), page_size)
+    start = page * page_size
+    return list(items[start : start + page_size])
+
+
+def _resolve_page_item(
+    items: Sequence[Any], page: int, local_index: int, page_size: int = _PAGE_SIZE
+) -> Any | None:
+    """The item a page's Nth action button must act on.
+
+    THE bug this whole function exists to prevent: page 2's local button 0
+    (labelled "Grab 6") must resolve to `items[5]`, not `items[0]`. A view
+    built once from `releases[:5]`, with buttons bound to that fixed slice
+    and only relabelled on a page turn, keeps grabbing items 0-4 forever no
+    matter which page is showing -- and there is no user-visible sign of
+    it: the button reads "Grab 6", a job queues, and the wrong book arrives
+    with nothing to explain why. Recomputing `page * page_size +
+    local_index` HERE, against `self.page` read fresh at the moment of the
+    press rather than an index captured when the button was constructed, is
+    what keeps that from happening. Every Grab/Send callback in this module
+    goes through this function instead of indexing its stored list itself.
+    """
+    absolute_index = page * page_size + local_index
+    if 0 <= absolute_index < len(items):
+        return items[absolute_index]
+    return None
+
+
+def _has_previous_page(page: int) -> bool:
+    return page > 0
+
+
+def _has_next_page(page: int, total: int, page_size: int = _PAGE_SIZE) -> bool:
+    return (page + 1) < _page_count(total, page_size)
+
+
+def _page_position_text(page: int, total: int, page_size: int = _PAGE_SIZE) -> str:
+    """'6-10 of 25' -- so paging never happens blind."""
+    if total <= 0:
+        return "0 of 0"
+    page = _clamp_page(page, total, page_size)
+    start = page * page_size + 1
+    end = min(start + page_size - 1, total)
+    return f"{start}-{end} of {total}"
+
+
+def _numbered_lines(
+    items: Sequence[dict[str, Any]], start: int, label_fn: Callable[[dict[str, Any]], str]
+) -> str:
+    """One numbered line per item, counting up from `start` instead of
+    always restarting at 1 -- page 2 must read "6. ...", "7. ...", to agree
+    with the "Grab 6"/"Grab 7" buttons beside it (see `_resolve_page_item`).
+    Resetting the count on every page would make the embed's numbers and
+    the buttons' numbers disagree with each other.
+    """
+    return "\n".join(f"{start + offset}. {label_fn(item)}" for offset, item in enumerate(items))
+
+
 def _idle(reasons: Sequence[str]) -> None:
     """Stay up doing nothing, rather than exiting.
 
@@ -274,8 +374,15 @@ def _library_label(item: dict[str, Any]) -> str:
 # is_permitted and _job_status_message are split out above).
 def _library_query(kind: str, query: str) -> tuple[str, dict[str, Any]]:
     if kind == "ebook":
-        return "/api/v1/ebooks/search", {"q": query, "limit": 10}
-    return "/api/v1/library/search", {"q": query}
+        # Raised from 10 to 25 -- api.ebook_search's own ceiling (`le=25`)
+        # -- now that pagination makes a result past the old cutoff
+        # reachable instead of never being fetched at all.
+        return "/api/v1/ebooks/search", {"q": query, "limit": 25}
+    # Explicit 25 rather than leaving this on api.library_search's own
+    # default of 12: that would strand a couple of fetched-but-unseen
+    # results on a half-full last page instead of giving the same 5 full
+    # pages of headroom /library type:ebook now gets.
+    return "/api/v1/library/search", {"q": query, "limit": 25}
 
 
 # `/request`'s two type choices hit the SAME Prowlarr endpoint — unlike
@@ -287,7 +394,15 @@ def _library_query(kind: str, query: str) -> tuple[str, dict[str, Any]]:
 # left was cosmetic (embed title, an unused limit), which is why they were
 # collapsed into one command with a type choice instead of kept apart.
 def _request_query(kind: str, query: str) -> tuple[str, dict[str, Any]]:
-    return "/api/v1/releases/search", {"q": query, "media_type": kind, "limit": 25}
+    # Raised from 25 to 50: Prowlarr ranks on text match, not on what was
+    # actually asked for, and a mis-ranked real result can land past
+    # position 25 on a noisy query the same way it landed at position 3 of
+    # the 5 that used to be shown for "the stand" (see module docstring).
+    # Paging is client-side over ONE search response, so a higher limit is
+    # an extra cost paid once at search time, not per page turn -- 50
+    # stays well under api.release_search's own `le=200` ceiling while
+    # doubling the pageable headroom from 5 pages to 10.
+    return "/api/v1/releases/search", {"q": query, "media_type": kind, "limit": 50}
 
 
 async def _queue_grab(api: ShelfmarkApi, release: dict[str, Any], interaction: discord.Interaction) -> None:
@@ -359,7 +474,141 @@ class _ConfirmGrabView(discord.ui.View):
         await interaction.response.edit_message(content="Cancelled -- nothing was queued.", view=None)
 
 
-class ReleaseView(discord.ui.View):
+class _PagedView(discord.ui.View):
+    """Previous/Next paging chrome shared by every search-results view.
+
+    Holds ONLY the page arithmetic and message chrome (nav buttons, the
+    embed, the on-timeout message) -- a view with nothing to click but
+    Previous and Next (`/library type:audiobook`, which offers no action
+    button at all: an Audiobookshelf catalog entry isn't a file this server
+    can hand over) is a complete, usable instance of this class on its own.
+    `ReleaseView` and `EbookView` below subclass it to add their own row of
+    action buttons. Kept as one class specifically so the guard re-check and
+    the on-timeout message are written ONCE, rather than three times with
+    room for one copy to drift from the others.
+
+    Discord allows 5 components per row and 5 rows; an action row of up to
+    5 buttons (row 0) plus this class's Previous/Next (row 1) is 2 rows and
+    at most 5 components in any one row, comfortably inside both limits.
+    """
+
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        title: str,
+        label_fn: Callable[[dict[str, Any]], str],
+        guard: Callable[[discord.Interaction], Awaitable[bool]],
+    ) -> None:
+        super().__init__(timeout=900)
+        self.items = items
+        self.title = title
+        self.label_fn = label_fn
+        self.guard = guard
+        self.page = 0
+        # Set by the command handler right after sending -- see
+        # `on_timeout` for why the edit it enables can still fail anyway.
+        self.message: discord.Message | None = None
+        self.previous_button = discord.ui.Button(
+            label="Previous",
+            style=discord.ButtonStyle.secondary,
+            custom_id="shelfmark:page:previous",
+            row=1,
+        )
+        self.previous_button.callback = self._go_previous  # type: ignore[method-assign]
+        self.next_button = discord.ui.Button(
+            label="Next",
+            style=discord.ButtonStyle.secondary,
+            custom_id="shelfmark:page:next",
+            row=1,
+        )
+        self.next_button.callback = self._go_next  # type: ignore[method-assign]
+        # Added here, in the BASE __init__, not left for a subclass to wire
+        # up -- a plain `_PagedView` (the audiobook library listing, which
+        # subclasses nothing) must have working Previous/Next on its own.
+        # discord.py lays out rows from each button's explicit `row`, not
+        # add order, so it does not matter that a subclass's own row-0
+        # action buttons are added to `self` after this runs.
+        self.add_item(self.previous_button)
+        self.add_item(self.next_button)
+        self._sync_nav_buttons()
+
+    def _sync_nav_buttons(self) -> None:
+        # Disable rather than error: pressing a Previous/Next that
+        # shouldn't exist (first/last page) never reaches the callback at
+        # all once Discord greys it out.
+        self.previous_button.disabled = not _has_previous_page(self.page)
+        self.next_button.disabled = not _has_next_page(self.page, len(self.items))
+
+    def _sync_action_buttons(self) -> None:
+        """Hook for a subclass's per-item buttons; a plain `_PagedView`
+        (the audiobook library listing) has none, so this is a no-op."""
+
+    def render_embed(self) -> discord.Embed:
+        page_items = _page_slice(self.items, self.page)
+        embed = discord.Embed(title=self.title)
+        start = _clamp_page(self.page, len(self.items)) * _PAGE_SIZE + 1
+        embed.description = _numbered_lines(page_items, start, self.label_fn) or "(no results)"
+        embed.set_footer(text=_page_position_text(self.page, len(self.items)))
+        return embed
+
+    async def _go_previous(self, interaction: discord.Interaction) -> None:
+        await self._turn_page(interaction, self.page - 1)
+
+    async def _go_next(self, interaction: discord.Interaction) -> None:
+        await self._turn_page(interaction, self.page + 1)
+
+    async def _turn_page(self, interaction: discord.Interaction, target_page: int) -> None:
+        if interaction.response.is_done():
+            return
+        # Re-checked on EVERY page turn, not assumed from whichever command
+        # opened this view. Paging is the first control in this file that
+        # invites sitting on a view and actively using it for its whole
+        # 900-second lifetime rather than pressing once and being done --
+        # someone whose role is revoked partway through a paging session
+        # must be stopped on the very next Previous/Next, not just at the
+        # /request or /library press that started it. Same reasoning as the
+        # re-check in `_ConfirmGrabView.confirm`.
+        if not await self.guard(interaction):
+            return
+        self.page = _clamp_page(target_page, len(self.items))
+        self._sync_nav_buttons()
+        self._sync_action_buttons()
+        await interaction.response.edit_message(embed=self.render_embed(), view=self)
+
+    async def on_timeout(self) -> None:
+        """Say something instead of leaving a dead message.
+
+        discord.py stops listening for this view's components after 900s,
+        but Discord does not grey out the buttons on its own -- a press
+        after that reaches a bot with no handler left registered for it,
+        and the client shows a bare "This interaction failed" with nothing
+        to explain why. Editing the message to drop the controls and say
+        what happened turns a dead end into a comprehensible one.
+        """
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content="This search has expired. Run the command again to search once more.",
+                view=None,
+            )
+        except discord.HTTPException:
+            # This edit rides the same interaction webhook token that is
+            # already ~15 minutes old by the time this timeout fires -- if
+            # Discord's clock expires that token a beat before this runs,
+            # the edit itself 401s. Best-effort: the user still gets
+            # nothing, but the bot must not crash over a message that is
+            # about to look stale to them either way.
+            pass
+
+
+class ReleaseView(_PagedView):
+    """Grab buttons, five per page, over EVERYTHING `/request` fetched --
+    not just the first five. See module-level `_resolve_page_item` for the
+    bug this is built around: an action button must resolve against the
+    CURRENT page, not an index frozen when the view was first built.
+    """
+
     def __init__(
         self,
         api: ShelfmarkApi,
@@ -367,27 +616,54 @@ class ReleaseView(discord.ui.View):
         actor: str,
         large_release_threshold_bytes: int,
         guard: Callable[[discord.Interaction], Awaitable[bool]],
+        title: str,
     ):
-        super().__init__(timeout=900)
+        super().__init__(releases, title, _release_label, guard)
         self.api = api
         self.releases = releases
         self.actor = actor
         self.large_release_threshold_bytes = large_release_threshold_bytes
-        self.guard = guard
-        for index, release in enumerate(releases[:5]):
+        self._action_buttons: list[discord.ui.Button] = []
+        for local_index in range(_PAGE_SIZE):
             button = discord.ui.Button(
-                label=f"Grab {index + 1}",
                 style=discord.ButtonStyle.primary,
-                custom_id=f"shelfmark:grab:{index}",
+                custom_id=f"shelfmark:grab:{local_index}",
+                row=0,
             )
-            button.callback = self._callback(index)  # type: ignore[method-assign]
+            button.callback = self._make_callback(local_index)  # type: ignore[method-assign]
+            self._action_buttons.append(button)
             self.add_item(button)
+        self._sync_action_buttons()
 
-    def _callback(self, index: int):
+    def _sync_action_buttons(self) -> None:
+        for local_index, button in enumerate(self._action_buttons):
+            release = _resolve_page_item(self.releases, self.page, local_index)
+            if release is None:
+                # A partial last page (e.g. 23 results -> the 5th page has
+                # 3, not 5) -- disable rather than leave a button that
+                # would resolve to nothing.
+                button.label = "—"
+                button.disabled = True
+            else:
+                absolute_number = self.page * _PAGE_SIZE + local_index + 1
+                button.label = f"Grab {absolute_number}"
+                button.disabled = False
+
+    def _make_callback(self, local_index: int):
         async def callback(interaction: discord.Interaction) -> None:
             if interaction.response.is_done():
                 return
-            release = self.releases[index]
+            release = _resolve_page_item(self.releases, self.page, local_index)
+            if release is None:
+                # Unreachable via a normal press -- the slot's button is
+                # disabled whenever this would be true (`_sync_action_
+                # buttons`) -- but fail loudly rather than let a stale
+                # client-side button state reach `_queue_grab` with
+                # nothing to grab.
+                await interaction.response.send_message(
+                    "That slot is empty on this page.", ephemeral=True
+                )
+                return
             size = release.get("size")
             if _needs_confirmation(size, self.large_release_threshold_bytes):
                 # Stop here instead of queuing: a large or unusably-sized
@@ -412,8 +688,9 @@ class ReleaseView(discord.ui.View):
         return callback
 
 
-class EbookView(discord.ui.View):
-    """Buttons that fetch an on-server ebook and attach it to the reply.
+class EbookView(_PagedView):
+    """Buttons that fetch an on-server ebook and attach it to the reply,
+    five per page over EVERYTHING `/library type:ebook` fetched.
 
     Follows ReleaseView's defer/act/followup shape, but the action is a
     binary file fetch rather than a job enqueue. The size guard below runs
@@ -429,27 +706,50 @@ class EbookView(discord.ui.View):
         books: list[dict[str, Any]],
         actor: str,
         max_attachment_bytes: int,
+        guard: Callable[[discord.Interaction], Awaitable[bool]],
+        title: str,
     ):
-        super().__init__(timeout=900)
+        super().__init__(books, title, _ebook_label, guard)
         self.api = api
         self.books = books
         self.actor = actor
         self.max_attachment_bytes = max_attachment_bytes
-        for index, book in enumerate(books[:5]):
+        self._action_buttons: list[discord.ui.Button] = []
+        for local_index in range(_PAGE_SIZE):
             button = discord.ui.Button(
-                label=f"Send {index + 1}",
                 style=discord.ButtonStyle.primary,
-                custom_id=f"shelfmark:ebook-send:{index}",
+                custom_id=f"shelfmark:ebook-send:{local_index}",
+                row=0,
             )
-            button.callback = self._callback(index)  # type: ignore[method-assign]
+            button.callback = self._make_callback(local_index)  # type: ignore[method-assign]
+            self._action_buttons.append(button)
             self.add_item(button)
+        self._sync_action_buttons()
 
-    def _callback(self, index: int):
+    def _sync_action_buttons(self) -> None:
+        for local_index, button in enumerate(self._action_buttons):
+            book = _resolve_page_item(self.books, self.page, local_index)
+            if book is None:
+                button.label = "—"
+                button.disabled = True
+            else:
+                absolute_number = self.page * _PAGE_SIZE + local_index + 1
+                button.label = f"Send {absolute_number}"
+                button.disabled = False
+
+    def _make_callback(self, local_index: int):
         async def callback(interaction: discord.Interaction) -> None:
             if interaction.response.is_done():
                 return
             await interaction.response.defer(ephemeral=True, thinking=True)
-            book = self.books[index]
+            book = _resolve_page_item(self.books, self.page, local_index)
+            if book is None:
+                # Unreachable via a normal press -- see ReleaseView's
+                # identical guard above.
+                await interaction.followup.send(
+                    "That slot is empty on this page.", ephemeral=True
+                )
+                return
             title = str(book.get("title") or "That book")
             size = book.get("size")
             if _too_large(size, self.max_attachment_bytes):
@@ -582,7 +882,10 @@ def install_commands(
             service = "Ebook search" if kind == "ebook" else "Audiobookshelf search"
             await interaction.followup.send(f"{service} is unavailable.", ephemeral=True)
             return
-        results = _result_list(payload)[: 5 if kind == "ebook" else 10]
+        # The full fetch, not a client-side [:5]/[:10] slice -- these are
+        # now paged five at a time rather than truncated, so everything
+        # `_library_query` asked the backend for stays reachable.
+        results = _result_list(payload)
         if not results:
             message = (
                 "No ebooks on the server matched that search."
@@ -591,20 +894,18 @@ def install_commands(
             )
             await interaction.followup.send(message, ephemeral=True)
             return
-        label = _ebook_label if kind == "ebook" else _library_label
-        embed = discord.Embed(title=f"{type.name} library results for {query}")
-        embed.description = "\n".join(f"{index + 1}. {label(item)}" for index, item in enumerate(results))
+        title = f"{type.name} library results for {query}"
         if kind == "ebook":
             # Only ebooks get the Send-to-phone button: an audiobook result
             # is an Audiobookshelf catalog entry, not a file this server can
             # hand over as a Discord attachment.
-            await interaction.followup.send(
-                embed=embed,
-                view=EbookView(api, results, _actor(interaction), max_attachment_bytes),
-                ephemeral=True,
+            view: _PagedView = EbookView(
+                api, results, _actor(interaction), max_attachment_bytes, guard, title
             )
         else:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            view = _PagedView(results, title, _library_label, guard)
+        sent = await interaction.followup.send(embed=view.render_embed(), view=view, ephemeral=True)
+        view.message = sent
 
     @bot.tree.command(name="request", description="Search Prowlarr for a new audiobook or ebook to download")
     @app_commands.describe(type="Audiobook or ebook", query="Title, author, ISBN, or other search text")
@@ -617,21 +918,22 @@ def install_commands(
         endpoint, params = _request_query(kind, query)
         try:
             payload = await api.get(endpoint, params=params, actor=_actor(interaction))
-            results = _result_list(payload)[:5]
+            # The full fetch (up to `_request_query`'s limit=50), not a
+            # client-side [:5] slice -- these are now paged five at a time.
+            results = _result_list(payload)
             if not results:
                 await interaction.followup.send(
                     f"No matching {kind}s were found to download.", ephemeral=True
                 )
                 return
-            embed = discord.Embed(title=f"{type.name} downloads for {query}")
-            embed.description = "\n".join(f"{index + 1}. {_release_label(item)}" for index, item in enumerate(results))
-            await interaction.followup.send(
-                embed=embed,
-                view=ReleaseView(
-                    api, results, _actor(interaction), large_release_threshold_bytes, guard
-                ),
-                ephemeral=True,
+            title = f"{type.name} downloads for {query}"
+            view = ReleaseView(
+                api, results, _actor(interaction), large_release_threshold_bytes, guard, title
             )
+            sent = await interaction.followup.send(
+                embed=view.render_embed(), view=view, ephemeral=True
+            )
+            view.message = sent
         except ServiceError:
             await interaction.followup.send("Prowlarr search is unavailable.", ephemeral=True)
 
