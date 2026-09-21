@@ -3,11 +3,15 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import discord
+from discord.ext import commands
+
 from src.shelfmark_service.clients import ServiceError
 from src.shelfmark_service.discord_bot import (
     _LISTING_PAGE_SIZE,
     _PAGE_SIZE,
     EbookView,
+    ShelfmarkApi,
     _PagedView,
     _clamp_page,
     _ebook_label,
@@ -29,6 +33,7 @@ from src.shelfmark_service.discord_bot import (
     _resolve_page_item,
     _too_large,
     blocking_problems,
+    install_commands,
     is_permitted,
 )
 
@@ -502,6 +507,47 @@ class RateLimitMessageTests(unittest.TestCase):
         )
         message = _rate_limit_message("grabs", exc)
         self.assertEqual(message, "You have run too many grabs. Try again in 5 seconds.")
+
+
+class CommandRegistrationTests(unittest.IsolatedAsyncioTestCase):
+    """Build the real command tree. Discord rejects a command whose required
+    options do not all precede its optional ones, and that rejection happens
+    at guild sync — the bot comes up fine and the command is simply not
+    there. Making `/library`'s query optional put it one parameter away from
+    exactly that, so the shape Discord will receive is asserted here rather
+    than discovered in the client."""
+
+    def _tree(self):
+        bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+        install_commands(bot, ShelfmarkApi("http://api.invalid", "token"), {1})
+        return bot.tree
+
+    async def test_library_takes_an_optional_query(self) -> None:
+        tree = self._tree()
+        options = tree.get_command("library").to_dict(tree)["options"]
+        self.assertEqual(
+            [(o["name"], o.get("required", False)) for o in options],
+            [("type", True), ("query", False)],
+        )
+
+    async def test_request_still_requires_a_query(self) -> None:
+        """Nothing to browse at an indexer -- an empty Prowlarr search is
+        not a listing, it is a mistake."""
+        tree = self._tree()
+        options = tree.get_command("request").to_dict(tree)["options"]
+        self.assertEqual(
+            [(o["name"], o.get("required", False)) for o in options],
+            [("type", True), ("query", True)],
+        )
+
+    async def test_every_command_serializes(self) -> None:
+        tree = self._tree()
+        names = set()
+        for command in tree.get_commands():
+            command.to_dict(tree)  # raises if Discord would refuse it
+            names.add(command.name)
+        self.assertIn("library", names)
+        self.assertIn("request", names)
 
 
 class PagedViewPageSizeTests(unittest.IsolatedAsyncioTestCase):
