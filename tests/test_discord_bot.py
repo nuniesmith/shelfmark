@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+from src.shelfmark_service.clients import ServiceError
 from src.shelfmark_service.discord_bot import (
     _clamp_page,
     _ebook_label,
@@ -18,6 +19,8 @@ from src.shelfmark_service.discord_bot import (
     _page_count,
     _page_position_text,
     _page_slice,
+    _rate_limit_message,
+    _rate_limit_wait_text,
     _request_query,
     _resolve_page_item,
     _too_large,
@@ -431,6 +434,62 @@ class NumberedLinesTests(unittest.TestCase):
         items = [{"title": "First"}]
         rendered = _numbered_lines(items, start=1, label_fn=lambda item: item["title"])
         self.assertEqual(rendered, "1. First")
+
+
+class RateLimitWaitTextTests(unittest.TestCase):
+    """`_rate_limit_wait_text` reads the exact JSON shape
+    `api._rate_limited_error` produces (see api.py) -- these bodies are the
+    contract between the two modules, so they're spelled out literally here
+    rather than built through a fake HTTP round trip."""
+
+    def test_a_short_wait_is_reported_in_seconds(self) -> None:
+        body = '{"detail": {"retry_after_seconds": 42, "message": "..."}}'
+        self.assertEqual(_rate_limit_wait_text(body), "Try again in 42 seconds.")
+
+    def test_a_single_second_is_not_pluralized(self) -> None:
+        body = '{"detail": {"retry_after_seconds": 1, "message": "..."}}'
+        self.assertEqual(_rate_limit_wait_text(body), "Try again in 1 second.")
+
+    def test_a_minute_or_more_is_reported_in_minutes_not_seconds(self) -> None:
+        body = '{"detail": {"retry_after_seconds": 125, "message": "..."}}'
+        self.assertEqual(_rate_limit_wait_text(body), "Try again in 2 minutes.")
+
+    def test_exactly_one_minute_is_not_pluralized(self) -> None:
+        body = '{"detail": {"retry_after_seconds": 60, "message": "..."}}'
+        self.assertEqual(_rate_limit_wait_text(body), "Try again in 1 minute.")
+
+    def test_malformed_json_falls_back_to_a_generic_message(self) -> None:
+        """A malformed or unexpected body must not raise a SECOND exception
+        from inside code that is already handling one -- this is called
+        from an `except ServiceError` block."""
+        self.assertEqual(_rate_limit_wait_text("not json"), "Try again in a minute.")
+
+    def test_a_body_with_no_retry_after_falls_back_to_a_generic_message(self) -> None:
+        self.assertEqual(_rate_limit_wait_text('{"detail": "no retry_after here"}'), "Try again in a minute.")
+
+
+class RateLimitMessageTests(unittest.TestCase):
+    """`_rate_limit_message` -- the full sentence a Discord follow-up sends
+    for a 429. `kind` distinguishes "you have run too many searches" from
+    "...too many grabs" so every command names what it was doing."""
+
+    def test_names_the_kind_and_includes_the_wait_time(self) -> None:
+        exc = ServiceError(
+            "shelfmark-api",
+            '{"detail": {"retry_after_seconds": 90, "message": "..."}}',
+            status=429,
+        )
+        message = _rate_limit_message("searches", exc)
+        self.assertEqual(message, "You have run too many searches. Try again in 2 minutes.")
+
+    def test_a_different_kind_reads_correctly_too(self) -> None:
+        exc = ServiceError(
+            "shelfmark-api",
+            '{"detail": {"retry_after_seconds": 5, "message": "..."}}',
+            status=429,
+        )
+        message = _rate_limit_message("grabs", exc)
+        self.assertEqual(message, "You have run too many grabs. Try again in 5 seconds.")
 
 
 if __name__ == "__main__":

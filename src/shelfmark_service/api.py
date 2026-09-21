@@ -8,10 +8,13 @@ has been staged on Freddy.
 from __future__ import annotations
 
 import secrets
+import threading
+import time
 import urllib.parse
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
@@ -95,6 +98,245 @@ def _actor(request: Request) -> str:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
     actor = request.headers.get("x-shelfmark-actor", "bearer").strip()
     return actor[:200] or "bearer"
+
+
+# `_actor` falls back to exactly these two literal strings when no Discord
+# identity is attached to the call: "local" when SHELFMARK_API_TOKEN isn't
+# set at all (the API is meant to be bound to Freddy's private network, i.e.
+# the operator only), "bearer" when a valid bearer token was presented but
+# the caller didn't set X-Shelfmark-Actor (a manual curl, a monitoring
+# script). Both are exempted from rate limiting entirely rather than "very
+# generously limited": the tracker-account risk this feature exists for is a
+# permitted DISCORD USER's runaway loop (the bot always sends a real
+# `discord:<user>:<guild>:<channel>` actor), not the operator's own terminal.
+# Deliberately an exact-match set, not "anything not discord:-prefixed" --
+# X-Shelfmark-Actor is caller-supplied once the bearer token checks out (the
+# same trust already extended to it for audit-log attribution before this
+# change), so only the two sentinel values `_actor()` itself produces are
+# exempt, not any custom label a bearer-token holder chooses to send.
+_RATE_LIMIT_EXEMPT_ACTORS = frozenset({"local", "bearer"})
+
+
+@dataclass
+class _RateLimitBucket:
+    """One actor's token-bucket state for one tier (read or action).
+
+    Plain data with no lock of its own -- RateLimiter below holds ONE lock
+    for the whole table rather than one per bucket. Buckets are cheap,
+    short-lived dict entries and the traffic here (two trusted Discord
+    users) never makes per-bucket locking worth the extra complexity.
+    """
+
+    tokens: float
+    updated_at: float
+
+
+def _consume_token(
+    bucket: _RateLimitBucket, now: float, capacity: float, refill_per_second: float
+) -> float | None:
+    """Try to take one token from `bucket`, refilling it for elapsed time first.
+
+    A continuously-refilling bucket, not a fixed calendar window, so a burst
+    landing on a window boundary can't get double budget -- 10 requests at
+    0:59.9 plus 10 more at 0:60.1 would be 20 in a fraction of a second under
+    a fixed-window design; a bucket refilling every tick never allows that.
+
+    Split out as its own function, and left to mutate the bucket it's
+    handed rather than reach into a dict/lock itself, so the decision can be
+    tested directly against explicit `now` values -- no sleeping, no
+    FastAPI object graph -- the same reason `is_permitted` and `_too_large`
+    live in discord_bot.py as plain functions. `RateLimiter.check` below is
+    the only caller in production; tests call this directly too (see
+    tests/test_api.py's `ConsumeTokenTests`).
+
+    Returns None when the request is allowed (a token was spent), or the
+    number of seconds until the next token becomes available otherwise --
+    exactly the number a 429's "try again in Ns" message needs.
+    """
+    elapsed = max(0.0, now - bucket.updated_at)
+    bucket.tokens = min(capacity, bucket.tokens + elapsed * refill_per_second)
+    bucket.updated_at = now
+    if bucket.tokens >= 1.0:
+        bucket.tokens -= 1.0
+        return None
+    if refill_per_second <= 0:
+        # Only reachable if a caller builds a Settings with a non-positive
+        # window directly (from_env's _float_from_env floors it at 0.1) --
+        # treat "never refills" as "wait forever" rather than divide by zero.
+        return float("inf")
+    return (1.0 - bucket.tokens) / refill_per_second
+
+
+# A ceiling on how many (tier, actor) buckets are tracked at once. Two
+# Discord users across a handful of channels need under ten; the headroom is
+# for the operator's own scripts and anything else that sets an actor label.
+_MAX_TRACKED_ACTORS = 512
+_IDLE_EVICTION_SECONDS = 3600.0
+
+
+class RateLimiter:
+    """Per-actor, per-tier token buckets, held in this process's memory.
+
+    In-memory and per-process is safe here ONLY because shelfmark-api runs
+    as a single process: `main()` below calls `uvicorn.run(...)` with no
+    `workers=` argument (uvicorn defaults to 1), and docker-compose.yml runs
+    exactly one `shelfmark-api` container from a plain `command:
+    ["shelfmark-api"]` -- nothing forks multiple copies of this table. If
+    that ever changes (more uvicorn workers, multiple replicas behind a
+    proxy), each process would keep its own counts and this would silently
+    allow N times the configured limit -- move the state to something
+    shared (Redis, or the sqlite database already used elsewhere) before
+    doing either.
+
+    Mirrors clients.CircuitBreaker's shape on purpose (injectable clock,
+    one lock guarding a small dict, a `check`/`before_call`-style method) --
+    the same trade-offs applied there (module-scoped shared state, a clock
+    tests can control instead of sleeping) apply to this table too.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        max_actors: int = _MAX_TRACKED_ACTORS,
+        idle_eviction_seconds: float = _IDLE_EVICTION_SECONDS,
+    ):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._max_actors = max_actors
+        self._idle_eviction_seconds = idle_eviction_seconds
+        self._buckets: dict[tuple[str, str], _RateLimitBucket] = {}
+
+    def _evict_idle(self, now: float) -> None:
+        """Drop buckets nobody has touched in an hour. Caller holds the lock.
+
+        Keying on the actor string makes this table grow with DISTINCT
+        callers, and the actor is caller-supplied: `_actor` returns whatever
+        X-Shelfmark-Actor says once the bearer token checks out, so a client
+        sending a new label per request would otherwise grow this dict
+        without bound for the life of the container.
+
+        Evicting an idle bucket is free rather than a trade-off, which is
+        why an hour is the threshold and not a tuned number: both windows
+        are measured in SECONDS, so a bucket untouched for an hour has long
+        since refilled to capacity, and a full bucket is indistinguishable
+        from the fresh one `check` would create in its place. Nobody gains
+        or loses budget.
+        """
+        cutoff = now - self._idle_eviction_seconds
+        for key in [key for key, b in self._buckets.items() if b.updated_at < cutoff]:
+            del self._buckets[key]
+        # If every tracked actor is genuinely recent, evict the stalest one
+        # anyway so the table is bounded by a number rather than by a rate.
+        # Dropping a bucket only ever GIVES its actor budget back, so the
+        # worst case of getting this wrong is one caller being treated
+        # generously -- never a real user refused to save memory.
+        while len(self._buckets) >= self._max_actors:
+            stalest = min(self._buckets, key=lambda k: self._buckets[k].updated_at)
+            del self._buckets[stalest]
+
+    def check(
+        self, tier: str, actor: str, *, capacity: float, refill_per_second: float
+    ) -> float | None:
+        """Returns None if `actor` may proceed under `tier`'s budget, else the
+        number of seconds until it may retry."""
+        now = self._clock()
+        key = (tier, actor)
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                if len(self._buckets) >= self._max_actors:
+                    self._evict_idle(now)
+                # A brand new actor starts with a FULL bucket, not an empty
+                # one -- the first search or grab of a session must never be
+                # the one that gets refused.
+                bucket = _RateLimitBucket(tokens=capacity, updated_at=now)
+                self._buckets[key] = bucket
+            return _consume_token(bucket, now, capacity, refill_per_second)
+
+
+# Module-scoped, like clients._BREAKER_REGISTRY, so every request in this
+# one process shares the same actor -> bucket table for the life of the
+# container.
+_rate_limiter = RateLimiter()
+
+
+def _rate_limited_error(retry_after_seconds: float, tier: str) -> HTTPException:
+    """Build the 429 for a rate-limited request.
+
+    Includes BOTH a machine-readable `retry_after_seconds` in the JSON body
+    (discord_bot.py reads this to build "try again in N minutes" -- a raw
+    status code or a bare body means nothing to someone tapping a button on
+    their phone) and a standard `Retry-After` header (for any other client
+    that knows to look for it, e.g. curl or a future non-Discord caller).
+    Unlike `_upstream_error`, this body is entirely ours to construct -- there
+    is no upstream response to accidentally leak here -- so it can say
+    exactly what happened.
+    """
+    retry_after = max(1, int(retry_after_seconds + 0.999))  # round UP; never advertise 0s
+    kind = "searches" if tier == "read" else "actions"
+    plural = "s" if retry_after != 1 else ""
+    message = f"Too many {kind} from this user. Try again in {retry_after} second{plural}."
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={"error": "rate_limited", "retry_after_seconds": retry_after, "message": message},
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+def _enforce_rate_limit(tier: str, actor: str) -> None:
+    """Raise 429 if `actor` has exhausted `tier`'s budget this window.
+
+    THE reason this exists, not a generic anti-abuse measure: every
+    `/api/v1/releases/search` call is a LIVE search against IPTorrents
+    through Prowlarr -- the one indexer configured here -- and every
+    `/api/v1/releases/grab` hands qBittorrent a URL that fetches the
+    .torrent through Prowlarr's own proxy, another real hit on that same
+    private-tracker account. A slip, a stuck retry loop, or someone holding
+    down a Discord button hammers a tracker account that can be rate-limited
+    or flagged for abuse by IPTorrents itself -- and losing that account is
+    not something a redeploy fixes. This function is the ONE place that risk
+    is capped, reached from every route that can get to Prowlarr or enqueue
+    work toward it (see `_read_actor`/`_action_actor` below), regardless of
+    which Discord command -- or bug in the bot -- got here.
+    """
+    if actor in _RATE_LIMIT_EXEMPT_ACTORS:
+        return
+    if tier == "read":
+        capacity = settings.rate_limit_read_max_requests
+        window = settings.rate_limit_read_window_seconds
+    else:
+        capacity = settings.rate_limit_action_max_requests
+        window = settings.rate_limit_action_window_seconds
+    refill_per_second = capacity / window if window > 0 else float("inf")
+    retry_after = _rate_limiter.check(tier, actor, capacity=capacity, refill_per_second=refill_per_second)
+    if retry_after is not None:
+        raise _rate_limited_error(retry_after, tier)
+
+
+def _read_actor(actor: str = Depends(_actor)) -> str:
+    """Actor dependency for every GET route except /healthz and /readyz.
+
+    A generous budget whose only job is stopping a runaway loop -- see
+    Settings.rate_limit_read_max_requests for the numbers and why they were
+    chosen. Deliberately never used by healthz/readyz: neither route takes
+    this (or any actor) dependency at all, so a monitoring probe (Uptime
+    Kuma polls /readyz every 60s) can never be rate-limited by construction,
+    not by a case in this function remembering to skip it.
+    """
+    _enforce_rate_limit("read", actor)
+    return actor
+
+
+def _action_actor(actor: str = Depends(_actor)) -> str:
+    """Actor dependency for every mutating route -- grabs, transfer pulls,
+    job creation/cancellation, metadata updates/matches, library scans.
+
+    A much tighter budget than `_read_actor`'s -- see
+    Settings.rate_limit_action_max_requests for the numbers and why.
+    """
+    _enforce_rate_limit("action", actor)
+    return actor
 
 
 def _abs_client() -> AudiobookshelfClient:
@@ -224,7 +466,7 @@ def readyz() -> dict[str, Any]:
 def library_search(
     q: str = Query(min_length=1, max_length=200),
     limit: int = Query(default=12, ge=1, le=100),
-    _actor: str = Depends(_actor),
+    _actor: str = Depends(_read_actor),
 ) -> dict[str, Any]:
     client = _abs_client()
     try:
@@ -236,7 +478,7 @@ def library_search(
 
 
 @app.get("/api/v1/items/{item_id}")
-def library_item(item_id: str, _actor: str = Depends(_actor)) -> Any:
+def library_item(item_id: str, _actor: str = Depends(_read_actor)) -> Any:
     try:
         return _abs_client().get_item(item_id, expanded=True)
     except ServiceError as exc:
@@ -245,7 +487,7 @@ def library_item(item_id: str, _actor: str = Depends(_actor)) -> Any:
 
 @app.patch("/api/v1/items/{item_id}/media", status_code=status.HTTP_202_ACCEPTED)
 def update_metadata(
-    item_id: str, request: MetadataUpdateRequest, actor: str = Depends(_actor)
+    item_id: str, request: MetadataUpdateRequest, actor: str = Depends(_action_actor)
 ) -> dict[str, Any]:
     if not settings.audiobookshelf_url or not settings.audiobookshelf_token:
         raise HTTPException(status_code=503, detail="Audiobookshelf integration is not configured")
@@ -260,7 +502,7 @@ def update_metadata(
 
 @app.post("/api/v1/items/{item_id}/match", status_code=status.HTTP_202_ACCEPTED)
 def match_metadata(
-    item_id: str, request: MetadataMatchRequest, actor: str = Depends(_actor)
+    item_id: str, request: MetadataMatchRequest, actor: str = Depends(_action_actor)
 ) -> dict[str, Any]:
     if not settings.audiobookshelf_url or not settings.audiobookshelf_token:
         raise HTTPException(status_code=503, detail="Audiobookshelf integration is not configured")
@@ -271,7 +513,7 @@ def match_metadata(
 
 @app.post("/api/v1/libraries/{library_id}/scan", status_code=status.HTTP_202_ACCEPTED)
 def scan_library(
-    library_id: str, request: LibraryScanRequest, actor: str = Depends(_actor)
+    library_id: str, request: LibraryScanRequest, actor: str = Depends(_action_actor)
 ) -> dict[str, Any]:
     if not settings.audiobookshelf_url or not settings.audiobookshelf_token:
         raise HTTPException(status_code=503, detail="Audiobookshelf integration is not configured")
@@ -328,7 +570,7 @@ def release_search(
     ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    _actor: str = Depends(_actor),
+    _actor: str = Depends(_read_actor),
 ) -> dict[str, Any]:
     # `/request` sends media_type rather than a hardcoded category id: the one
     # indexer configured here advertises 7000/7010/7030/7050 for books and
@@ -356,7 +598,7 @@ def release_search(
 def ebook_search(
     q: str = Query(min_length=1, max_length=200),
     limit: int = Query(default=10, ge=1, le=25),
-    _actor: str = Depends(_actor),
+    _actor: str = Depends(_read_actor),
 ) -> dict[str, Any]:
     root = _ebook_root()
     return {
@@ -375,7 +617,7 @@ def ebook_search(
 
 
 @app.get("/api/v1/ebooks/{ebook_id}/download")
-def ebook_download(ebook_id: str, actor: str = Depends(_actor)) -> FileResponse:
+def ebook_download(ebook_id: str, actor: str = Depends(_read_actor)) -> FileResponse:
     root = _ebook_root()
     try:
         path = resolve_ebook(root, ebook_id)
@@ -398,7 +640,7 @@ def ebook_download(ebook_id: str, actor: str = Depends(_actor)) -> FileResponse:
 @app.get("/api/v1/downloads")
 def downloads(
     category: str = Query(default="shelfmark-books", min_length=1, max_length=100),
-    _actor: str = Depends(_actor),
+    _actor: str = Depends(_read_actor),
 ) -> dict[str, Any]:
     client = _qbittorrent_client()
     try:
@@ -409,14 +651,14 @@ def downloads(
 
 
 @app.post("/api/v1/releases/grab", status_code=status.HTTP_202_ACCEPTED)
-def grab_release(request: ReleaseGrabRequest, actor: str = Depends(_actor)) -> dict[str, Any]:
+def grab_release(request: ReleaseGrabRequest, actor: str = Depends(_action_actor)) -> dict[str, Any]:
     if not settings.prowlarr_url or not settings.prowlarr_api_key:
         raise HTTPException(status_code=503, detail="Prowlarr integration is not configured")
     return _job_response(database.enqueue("grab_release", {"release": request.release}, actor=actor))
 
 
 @app.post("/api/v1/transfers/pull", status_code=status.HTTP_202_ACCEPTED)
-def pull_transfer(request: TransferRequest, actor: str = Depends(_actor)) -> dict[str, Any]:
+def pull_transfer(request: TransferRequest, actor: str = Depends(_action_actor)) -> dict[str, Any]:
     if not settings.sullivan_host or not settings.sullivan_user:
         raise HTTPException(status_code=503, detail="Sullivan transfer is not configured")
     payload = {"remote_path": request.remote_path}
@@ -427,7 +669,7 @@ def pull_transfer(request: TransferRequest, actor: str = Depends(_actor)) -> dic
 
 @app.get("/api/v1/jobs")
 def list_jobs(
-    _actor: str = Depends(_actor),
+    _actor: str = Depends(_read_actor),
     job_status: Literal["queued", "running", "succeeded", "failed", "cancelled"] | None = Query(
         default=None, alias="status"
     ),
@@ -457,12 +699,12 @@ def list_jobs(
 
 
 @app.post("/api/v1/jobs", status_code=status.HTTP_202_ACCEPTED)
-def create_job(request: JobRequest, actor: str = Depends(_actor)) -> dict[str, Any]:
+def create_job(request: JobRequest, actor: str = Depends(_action_actor)) -> dict[str, Any]:
     return _job_response(database.enqueue(request.kind, request.payload, actor=actor))
 
 
 @app.get("/api/v1/jobs/{job_id}")
-def get_job(job_id: str, _actor: str = Depends(_actor)) -> dict[str, Any]:
+def get_job(job_id: str, _actor: str = Depends(_read_actor)) -> dict[str, Any]:
     job = database.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
@@ -470,7 +712,7 @@ def get_job(job_id: str, _actor: str = Depends(_actor)) -> dict[str, Any]:
 
 
 @app.post("/api/v1/jobs/{job_id}/cancel")
-def cancel_job(job_id: str, actor: str = Depends(_actor)) -> dict[str, Any]:
+def cancel_job(job_id: str, actor: str = Depends(_action_actor)) -> dict[str, Any]:
     job = database.cancel(job_id, actor=actor)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
