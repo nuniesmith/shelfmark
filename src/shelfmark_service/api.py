@@ -464,17 +464,44 @@ def readyz() -> dict[str, Any]:
 
 @app.get("/api/v1/library/search")
 def library_search(
-    q: str = Query(min_length=1, max_length=200),
-    limit: int = Query(default=12, ge=1, le=100),
+    q: str = Query(default="", max_length=200),
+    limit: int = Query(default=25, ge=1, le=100),
     _actor: str = Depends(_read_actor),
 ) -> dict[str, Any]:
+    """Audiobooks already on the server. An empty `q` lists the library.
+
+    `results` is a FLAT LIST of library items, always. It used to be
+    whatever Audiobookshelf returned, which for a search is an object
+    (`{"book": [...], "authors": [...], "series": [...]}`) — and the bot's
+    `_result_list` looks for a list under "results" and then for a top-level
+    "book", so it found neither and every `/library type:audiobook` search
+    answered "No matching library items found." for a library of 190 books.
+    The unwrapping belongs here, where there is one shape to produce, rather
+    than in a caller that has to guess which of two Audiobookshelf endpoints
+    its payload came from.
+    """
     client = _abs_client()
+    library_id = settings.audiobookshelf_library_id or ""
     try:
-        return {
-            "results": client.search(settings.audiobookshelf_library_id or "", q, limit)
-        }
+        if q:
+            payload = client.search(library_id, q, limit)
+            entries = payload.get("book", []) if isinstance(payload, dict) else []
+        else:
+            # Author order, matching how the library reads on disk
+            # (`/audiobooks/<author>/<year> - <title>/`), so browsing it in
+            # Discord and browsing it in a file manager agree.
+            payload = client.list_items(
+                library_id, limit=limit, sort="media.metadata.authorName"
+            )
+            entries = payload.get("results", []) if isinstance(payload, dict) else []
     except ServiceError as exc:
         raise _upstream_error(exc) from exc
+    return {
+        "results": [
+            entry.get("libraryItem", entry) if isinstance(entry, dict) else entry
+            for entry in entries
+        ]
+    }
 
 
 @app.get("/api/v1/items/{item_id}")
@@ -596,10 +623,19 @@ def release_search(
 
 @app.get("/api/v1/ebooks/search")
 def ebook_search(
-    q: str = Query(min_length=1, max_length=200),
-    limit: int = Query(default=10, ge=1, le=25),
+    q: str = Query(default="", max_length=200),
+    # Ceiling raised from 25 so an empty `q` can return a whole shelf, not
+    # an arbitrary first slice of one.
+    limit: int = Query(default=10, ge=1, le=200),
     _actor: str = Depends(_read_actor),
 ) -> dict[str, Any]:
+    """Ebooks on the server. An empty `q` lists them all, author order.
+
+    `list_ebooks` already treats an empty needle as "match everything" —
+    this route simply stopped rejecting it, so someone who does not already
+    know what is on the shelf can look instead of having to guess a word
+    that happens to be in a title.
+    """
     root = _ebook_root()
     return {
         "results": [
