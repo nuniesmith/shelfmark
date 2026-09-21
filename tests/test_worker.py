@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import urllib.error
 from unittest import mock
 
 # worker.execute()'s organize_preview/organize_apply branch does
@@ -1256,3 +1257,88 @@ class TorrentMetaTests(unittest.TestCase):
 
         with self.assertRaises(InvalidTorrent):
             parse(self._bencode({b"announce": b"http://x/"}))
+
+
+class SilentGrabDiagnosisTests(WorkerTestCase):
+    """Why a grab added nothing. The three reasons need different responses
+    from a person, so lumping them together is the defect this exists to
+    prevent — not a nicety."""
+
+    RELEASE = {
+        "guid": "abc",
+        "title": "Some Release",
+        "downloadUrl": "http://sullivan:9696/1/download?apikey=k&link=x",
+    }
+
+    def _diagnose(self, *, raises=None, body=None):
+        worker = self.make_worker(qbittorrent_url="http://q", qbittorrent_api_key="k")
+        client = mock.Mock()
+        client.torrents.return_value = []
+        ctx = mock.MagicMock()
+        ctx.__enter__.return_value.read.return_value = body or b""
+        patched = mock.patch(
+            "src.shelfmark_service.worker.urllib.request.urlopen",
+            side_effect=raises if raises else None,
+            return_value=None if raises else ctx,
+        )
+        with patched:
+            return worker._explain_silent_grab(dict(self.RELEASE), client, "Ok.")
+
+    @staticmethod
+    def _http_error(code: int):
+        return urllib.error.HTTPError("http://x", code, "boom", {}, None)
+
+    def test_a_500_is_the_indexer_not_an_expired_link(self) -> None:
+        """Measured against the live Prowlarr: a corrupted link parameter
+        comes back as HTTP 500, NOT a 404. So a 500 cannot be told apart
+        from the indexer having a bad day, and calling it an expired link
+        would be a guess dressed as a diagnosis."""
+        result = self._diagnose(raises=self._http_error(500))
+        self.assertEqual(result["state"], "link_error")
+        self.assertEqual(result["http_status"], 500)
+
+    def test_a_429_is_also_the_indexer(self) -> None:
+        self.assertEqual(self._diagnose(raises=self._http_error(429))["state"], "link_error")
+
+    def test_a_404_really_is_a_dead_link(self) -> None:
+        result = self._diagnose(raises=self._http_error(404))
+        self.assertEqual(result["state"], "bad_link")
+
+    def test_html_with_a_success_status_is_a_dead_link(self) -> None:
+        """Trackers answer an expired link with a page and HTTP 200."""
+        result = self._diagnose(body=b"<html>gone</html>")
+        self.assertEqual(result["state"], "bad_link")
+
+    def test_a_torrent_already_in_the_client_is_a_duplicate(self) -> None:
+        raw = TorrentMetaTests()._torrent(name=b"Dune Saga")
+        from src.shelfmark_service.torrentmeta import parse
+
+        infohash, _ = parse(raw)
+        worker = self.make_worker(qbittorrent_url="http://q", qbittorrent_api_key="k")
+        client = mock.Mock()
+        client.torrents.return_value = [
+            {"hash": infohash.upper(), "name": "Dune Saga", "category": "shelfmark-books"}
+        ]
+        ctx = mock.MagicMock()
+        ctx.__enter__.return_value.read.return_value = raw
+        with mock.patch(
+            "src.shelfmark_service.worker.urllib.request.urlopen", return_value=ctx
+        ):
+            result = worker._explain_silent_grab(dict(self.RELEASE), client, "Ok.")
+        self.assertEqual(result["state"], "duplicate")
+        self.assertEqual(result["name"], "Dune Saga")
+        self.assertEqual(result["category"], "shelfmark-books")
+
+    def test_a_torrent_nowhere_in_the_client_was_rejected(self) -> None:
+        raw = TorrentMetaTests()._torrent(name=b"Nobody Has This")
+        worker = self.make_worker(qbittorrent_url="http://q", qbittorrent_api_key="k")
+        client = mock.Mock()
+        client.torrents.return_value = [{"hash": "ff" * 20, "name": "Unrelated"}]
+        ctx = mock.MagicMock()
+        ctx.__enter__.return_value.read.return_value = raw
+        with mock.patch(
+            "src.shelfmark_service.worker.urllib.request.urlopen", return_value=ctx
+        ):
+            result = worker._explain_silent_grab(dict(self.RELEASE), client, "Ok.")
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["name"], "Nobody Has This")

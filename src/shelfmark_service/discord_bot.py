@@ -569,6 +569,14 @@ def _grab_outcome_message(payload: dict[str, Any], job_id: str) -> str:
             f"The download link for **{name}** did not return a torrent — it has "
             "probably expired. Run the search again to get a fresh one."
         )
+    if state == "link_error":
+        status = payload.get("http_status")
+        detail = f"HTTP {status}" if status else "an error"
+        return (
+            f"The indexer returned {detail} fetching **{name}**, so nothing is "
+            "downloading. That is the indexer, not the release — try again in a "
+            "moment."
+        )
     if state == "added":
         return (
             f"Downloading **{name}**. `/downloads` for progress; it will appear "

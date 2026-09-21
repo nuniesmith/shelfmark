@@ -773,3 +773,28 @@ class GrabOutcomeMessageTests(unittest.TestCase):
         msg = _grab_outcome_message({}, "job-9")
         self.assertIn("job-9", msg)
         self.assertIn("could not be determined", msg)
+
+
+class GrabLinkErrorMessageTests(unittest.TestCase):
+    """A 500 from the indexer is NOT "your link expired". Measured against
+    the live Prowlarr: a corrupted link parameter comes back as HTTP 500,
+    which is indistinguishable from the indexer having a bad day — so the
+    message reports the status rather than guessing a cause."""
+
+    def test_it_names_the_status_and_blames_the_indexer(self) -> None:
+        msg = _grab_outcome_message(
+            {"state": "link_error", "name": "Some Book", "http_status": 500}, "j"
+        )
+        self.assertIn("HTTP 500", msg)
+        self.assertIn("indexer, not the release", msg)
+        self.assertNotIn("expired", msg)
+
+    def test_it_still_reads_without_a_status(self) -> None:
+        msg = _grab_outcome_message({"state": "link_error", "name": "X"}, "j")
+        self.assertIn("nothing is", msg.lower())
+
+    def test_it_is_distinct_from_an_expired_link(self) -> None:
+        self.assertNotEqual(
+            _grab_outcome_message({"state": "link_error", "name": "X"}, "j"),
+            _grab_outcome_message({"state": "bad_link", "name": "X"}, "j"),
+        )

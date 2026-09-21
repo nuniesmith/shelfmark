@@ -8,6 +8,7 @@ import posixpath
 import signal
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -577,10 +578,32 @@ class Worker:
                 raw = response.read()
             infohash, name = torrentmeta.parse(raw)
         except torrentmeta.InvalidTorrent as exc:
-            # The link gave us something that is not a torrent -- an expired
-            # link or a tracker error page, both of which arrive as HTTP 200.
+            # 200 OK, but the body is not a torrent -- an expired link or a
+            # tracker error page, both of which arrive with a success status.
             logger.info("grab: download link is not a torrent (%s)", exc)
             result["state"] = "bad_link"
+            return result
+        except urllib.error.HTTPError as exc:
+            # A dead link answers with a status, not a page. Measured
+            # against the live indexer: a corrupted `link=` parameter comes
+            # back as an HTTP error, which the broad handler below turned
+            # into "the reason could not be determined" -- true, but useless
+            # to someone deciding what to do next.
+            #
+            # 429 and 5xx are the exception: those say the indexer is busy
+            # or unwell, NOT that this release's link is stale, and telling
+            # someone to search again would send them to re-run the thing
+            # that is rate-limiting them.
+            # 429 and 5xx do NOT mean this release's link is stale -- they
+            # mean the indexer is busy or unwell, and measured against the
+            # live one, a corrupted link parameter comes back as a 500, not
+            # a 404. So a 500 genuinely cannot be told apart from Prowlarr
+            # having a bad day. Rather than guess, report the status: that
+            # is honest AND actionable, where "the reason could not be
+            # determined" is neither.
+            logger.info("grab: download link returned HTTP %s", exc.code)
+            result["state"] = "link_error" if (exc.code == 429 or exc.code >= 500) else "bad_link"
+            result["http_status"] = exc.code
             return result
         except Exception as exc:  # noqa: BLE001 - diagnosis must not fail the job
             logger.info("grab: could not inspect the torrent (%s)", exc)

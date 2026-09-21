@@ -21,7 +21,9 @@ Docker is not installed in the review environment.
 
 `upstream` in the job result carried no signal at all — measured byte-identical (`{"added_torrent_ids": [], "failure_count": 0, "pending_count": 1, "success_count": 0}`) across grabs that downloaded and grabs that did nothing. `grab_release` now snapshots the category either side of the add and classifies the outcome: **added** (a new hash appeared), **duplicate**, **rejected**, or **bad_link** (an expired link returns an HTML page with HTTP 200). Telling duplicate from rejected requires the infohash, so `torrentmeta.py` computes it — only on the unusual path, so a normal grab pays nothing.
 
-`_queue_grab` now waits for the job (about a second) instead of replying with a UUID, because the id comes back before any work happens. Four distinct sentences, with a test asserting they do not read alike.
+`_queue_grab` now waits for the job (about a second) instead of replying with a UUID, because the id comes back before any work happens. Five distinct sentences, with a test asserting they do not read alike.
+
+**Running it against the live indexer changed the design.** A corrupted download link comes back as **HTTP 500**, not a 404 — indistinguishable from Prowlarr simply having a bad day. Reporting that as "the link expired, search again" would be a guess dressed as a diagnosis, so 429/5xx became their own `link_error` state that names the status and blames the indexer rather than the release. A unit test alone would never have surfaced it: I had assumed a dead link 404s.
 
 Verified end to end: the new parser reproduces `b02e34adeb789a258f5807e28567feb60be0cf2b` for the real torrent, matching what qBittorrent independently reports.
 
