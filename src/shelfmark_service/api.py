@@ -560,19 +560,43 @@ def match_metadata(
     return _job_response(database.enqueue("metadata_match", payload, actor=actor))
 
 
+def _queue_library_scan(library_id: str, force: bool, actor: str) -> dict[str, Any]:
+    if not settings.audiobookshelf_url or not settings.audiobookshelf_token:
+        raise HTTPException(status_code=503, detail="Audiobookshelf integration is not configured")
+    if not library_id:
+        raise HTTPException(status_code=503, detail="No Audiobookshelf library is configured")
+    return _job_response(
+        database.enqueue(
+            "library_scan",
+            {"library_id": library_id, "force": force},
+            actor=actor,
+        )
+    )
+
+
+@app.post("/api/v1/libraries/scan", status_code=status.HTTP_202_ACCEPTED)
+def scan_default_library(
+    request: LibraryScanRequest, actor: str = Depends(_action_actor)
+) -> dict[str, Any]:
+    """Scan the library this deployment is configured for.
+
+    Exists so `/scan` in Discord needs no argument. There is exactly one
+    Audiobookshelf library here and the API already knows its id, so making
+    a human paste a UUID to name the only possible target was friction with
+    nothing on the other side of it. Declared ABOVE the `{library_id}` route
+    on purpose: FastAPI matches in definition order, and the path parameter
+    would otherwise swallow the literal "scan".
+    """
+    return _queue_library_scan(settings.audiobookshelf_library_id or "", request.force, actor)
+
+
 @app.post("/api/v1/libraries/{library_id}/scan", status_code=status.HTTP_202_ACCEPTED)
 def scan_library(
     library_id: str, request: LibraryScanRequest, actor: str = Depends(_action_actor)
 ) -> dict[str, Any]:
-    if not settings.audiobookshelf_url or not settings.audiobookshelf_token:
-        raise HTTPException(status_code=503, detail="Audiobookshelf integration is not configured")
-    return _job_response(
-        database.enqueue(
-            "library_scan",
-            {"library_id": library_id, "force": request.force},
-            actor=actor,
-        )
-    )
+    """Scan a library by id. Kept for anything that needs to name a
+    different one than the configured default."""
+    return _queue_library_scan(library_id, request.force, actor)
 
 
 @app.get("/api/v1/releases/search")

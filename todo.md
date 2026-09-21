@@ -17,6 +17,19 @@ Docker is not installed in the review environment.
 
 ## Current progress
 
+**Changed 2026-09-21. The Discord command set is six commands, and every one of them is usable from Discord.** Four of the eight demanded an identifier the bot gave you no way to obtain, which is not a rough edge — it is the difference between a command existing and a command working.
+
+| command | before | now |
+|---|---|---|
+| `/job` | required a job UUID that only ever appeared in an ephemeral reply | id optional; no id lists recent jobs |
+| `/scan` | required the UUID of the **only** library, whose id the API already holds | no library argument at all |
+| `/metadata-match` | required an Audiobookshelf item UUID nothing ever displays | **removed** — never run once in the life of the bot |
+| `/organize-preview` | took a free-text absolute path into the worker's filesystem | **removed** — a debugging tool, better done on the host where there is a shell |
+
+Both removals keep their API routes, so nothing is lost operationally. `POST /api/v1/libraries/scan` is new: it scans the configured library, declared above the `{library_id}` route because FastAPI matches in definition order and the path parameter would otherwise swallow the literal `scan`. The old by-id route stays.
+
+`CommandRegistrationTests` now pins the exact command set and asserts no remaining id-shaped argument is required, so the defect cannot creep back a command at a time. The rate-limit partition test caught the new route on its first run — its hardcoded route count failed rather than letting an unlimited mutating route ship.
+
 **Added 2026-09-21. `/cancel`.** The database, worker and API had supported cancellation all along (`cancel_requested`, `JobCancelled`, `POST /api/v1/jobs/{id}/cancel`); nothing exposed it, so a mis-pressed Grab had to be undone in qBittorrent by hand. `job_id` is optional — with none, `/cancel` lists what is queued or running with Cancel buttons, because the id only ever appears in an ephemeral reply that the person needing it has probably dismissed.
 
 **It also caught the `_result_list` seam bug a second time.** `GET /api/v1/jobs` returns `{"jobs": [...]}` and `"jobs"` was not among the keys `_result_list` unwraps — the identical omission that made `/library type:audiobook` answer "nothing found" for every query for weeks. `/cancel` would have reported "nothing is queued or running" forever, with both halves looking correct in isolation. Found before shipping by testing across the seam rather than each side; `CancellableTests.test_the_bot_can_read_the_real_jobs_payload` now pins it.
@@ -541,7 +554,7 @@ Acceptance criteria:
 - [~] Implement download progress notifications. A Discord *webhook* posts a completion message and a chain-failure message from the worker (`SHELFMARK_DISCORD_WEBHOOK_URL`; see README's "Automatic download pipeline"). No in-progress/percentage updates, and it is a webhook post, not a bot-side embed tied to the original interaction.
 - [x] Implement cancellation (2026-09-21). `/cancel` with an **optional** job id: given one it cancels directly, given none it lists what is queued or running with Cancel buttons. Optional because the id only ever appears in an ephemeral reply, and the case this exists for — a mis-pressed Grab on a 26 GB release — has a useful window of seconds, not however long it takes to find a UUID. Terminal jobs are filtered out of the picker rather than offered and refused: `Database.cancel` does not reject a finished job, it records the request and returns the row untouched, so that button would look like it worked. The reply distinguishes all three real outcomes — `queued`→cancelled outright, `running`→only `cancel_requested` set and still finishing, already-terminal→nothing happened.
 - [~] Implement organization preview and approval. `/organize-preview` queues a preview job, but there is no approval step — the automatic pipeline applies without one. Note the preview takes an arbitrary absolute path, which is why the role allow-list failing closed matters.
-- [ ] Implement metadata candidate comparison and approval. `/metadata-match` queues a match against Audiobookshelf, but nothing compares candidates or asks for approval.
+- [~] Implement metadata candidate comparison and approval. **`/metadata-match` was removed from Discord 2026-09-21** — it required an Audiobookshelf item UUID no command ever displayed, and had never been run once. `PATCH /api/v1/items/{id}/media` and `POST /api/v1/items/{id}/match` remain on the API. If this comes back it needs the pick-from-search shape `/cancel` and `/library` now use, not a UUID argument.
 - [~] Implement scan and stable-link commands. `/scan` exists and the pipeline triggers scans itself; stable links do not exist.
 - [x] Add role/user permissions and rate limits. Permissions are done and **fail closed** — an unset `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` refuses everyone rather than permitting everyone, which is what it used to do. Rate limits shipped 2026-09-21 at the API, per-actor, two tiers — see the Discord section above.
 - [ ] Test bot behavior after worker restarts and after the interaction token expires. Not tested. The 15-minute interaction token is the known limit: a grab whose download outlives it cannot be answered on the original interaction, which is why completion goes out through the webhook instead.
