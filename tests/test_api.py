@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import inspect
+import json
 import tempfile
 import unittest
+from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -10,7 +13,7 @@ from fastapi import HTTPException
 
 from src.shelfmark_service.api import _job_response
 from src.shelfmark_service.config import Settings
-from src.shelfmark_service.db import Database, Job
+from src.shelfmark_service.db import Database, Job, utc_now
 
 
 def _job(**overrides: object) -> Job:
@@ -723,6 +726,133 @@ class LibrarySearchShapeTests(unittest.TestCase):
     def test_a_search_payload_missing_its_book_key_is_not_an_error(self) -> None:
         self.client.search.return_value = {"authors": [], "series": []}
         self.assertEqual(api_module.library_search(q="x", limit=25, _actor="local")["results"], [])
+
+
+class SearchAuditTests(unittest.TestCase):
+    """Searches used to leave no trace at all. The live audit table held 282
+    rows and every one was a job, so "has she managed to use the bot?" was
+    only answerable if she got as far as grabbing something, and "how hard
+    are we leaning on the indexer?" was not answerable at all."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self._tmp.name) / "audit.db")
+        self.db.initialize()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _rows(self) -> list[tuple]:
+        with closing(self.db.connect()) as conn:
+            return [
+                (r["actor"], r["action"], r["target_type"], r["details_json"])
+                for r in conn.execute(
+                    "SELECT actor, action, target_type, details_json FROM audit_events"
+                )
+            ]
+
+    def test_a_search_is_recorded_with_who_what_and_how_many(self) -> None:
+        self.db.record_search(
+            actor="discord:1:2:3", kind="audiobook", query="dune", results=7
+        )
+        actor, action, target_type, details = self._rows()[0]
+        self.assertEqual(actor, "discord:1:2:3")
+        self.assertEqual(action, "search.audiobook")
+        self.assertEqual(target_type, "search")
+        self.assertEqual(json.loads(details), {"query": "dune", "results": 7})
+
+    def test_a_search_that_found_nothing_is_still_recorded(self) -> None:
+        """The zero-result searches are the interesting ones — they are what
+        "she could not find her book" looks like in the log."""
+        self.db.record_search(actor="a", kind="ebook", query="nope", results=0)
+        self.assertEqual(json.loads(self._rows()[0][3])["results"], 0)
+
+    def test_an_overlong_query_is_truncated_not_dropped(self) -> None:
+        self.db.record_search(actor="a", kind="ebook", query="x" * 5000, results=0)
+        self.assertEqual(len(json.loads(self._rows()[0][3])["query"]), 200)
+
+    def test_search_rows_are_not_attached_to_any_job(self) -> None:
+        """`_delete_jobs_batch` prunes `audit_events` by `target_type='job'`
+        joined to a job id. A search row carries neither, which is why it
+        needs its own retention tier — and why writing it as a job row would
+        have made it vanish with an unrelated job's cleanup."""
+        self.db.record_search(actor="a", kind="ebook", query="q", results=1)
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                "SELECT target_type, target_id FROM audit_events"
+            ).fetchone()
+        self.assertEqual(row["target_type"], "search")
+        self.assertIsNone(row["target_id"])
+
+
+class SearchRetentionTests(unittest.TestCase):
+    """Search rows are the only `audit_events` rows with no job behind them,
+    so without a tier of their own they are the one table here that grows
+    forever."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self._tmp.name) / "audit.db")
+        self.db.initialize()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _age_all_searches(self, days: float) -> None:
+        stamp = (
+            datetime.fromisoformat(utc_now()) - timedelta(days=days)
+        ).isoformat(timespec="seconds")
+        with closing(self.db.connect()) as conn:
+            conn.execute(
+                "UPDATE audit_events SET created_at = ? WHERE target_type = 'search'",
+                (stamp,),
+            )
+            conn.commit()
+
+    def _count(self) -> int:
+        with closing(self.db.connect()) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM audit_events WHERE target_type = 'search'"
+            ).fetchone()["n"]
+
+    def test_an_old_search_is_swept(self) -> None:
+        self.db.record_search(actor="a", kind="ebook", query="q", results=1)
+        self._age_all_searches(200)
+        report = self.db.sweep_job_retention()
+        self.assertEqual(report["searches"], 1)
+        self.assertEqual(self._count(), 0)
+
+    def test_a_recent_search_survives(self) -> None:
+        self.db.record_search(actor="a", kind="ebook", query="q", results=1)
+        self.assertEqual(self.db.sweep_job_retention()["searches"], 0)
+        self.assertEqual(self._count(), 1)
+
+    def test_sweeping_searches_does_not_touch_job_audit_rows(self) -> None:
+        """Ages EVERY audit row, not just the searches.
+
+        Aging only the search rows cannot tell a correctly filtered sweep
+        from one that deletes any old row it finds — the job row is young
+        either way. It has to be old and still survive. An unfiltered sweep
+        would strip a live job's audit trail out from under it: a FAILED job
+        is kept 180 days but its audit rows would go at 90, leaving a job
+        nothing can explain.
+        """
+        job = self.db.enqueue("grab_release", {}, actor="a")
+        self.db.record_search(actor="a", kind="ebook", query="q", results=1)
+        stamp = (
+            datetime.fromisoformat(utc_now()) - timedelta(days=200)
+        ).isoformat(timespec="seconds")
+        with closing(self.db.connect()) as conn:
+            conn.execute("UPDATE audit_events SET created_at = ?", (stamp,))
+            conn.commit()
+
+        self.db.sweep_job_retention()
+
+        with closing(self.db.connect()) as conn:
+            remaining = conn.execute(
+                "SELECT target_type, target_id FROM audit_events"
+            ).fetchall()
+        self.assertEqual(
+            [(r["target_type"], r["target_id"]) for r in remaining],
+            [("job", job.id)],
+            "the search sweep must filter on target_type, not just on age",
+        )
 
 
 class BrowseLimitFitsEveryRouteTests(unittest.TestCase):
