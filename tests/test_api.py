@@ -648,5 +648,116 @@ class RateLimitWiringTests(unittest.TestCase):
         self.assertEqual(dict(inspect.signature(api_module.readyz).parameters), {})
 
 
+# One real Audiobookshelf `/api/libraries/{id}/search` response, trimmed:
+# an OBJECT whose book entries are each wrapped in a `libraryItem`, with
+# five sibling keys that are not results at all.
+ABS_SEARCH_PAYLOAD = {
+    "book": [
+        {"libraryItem": {"id": "item-1", "media": {"metadata": {"title": "Dune"}}}},
+        {"libraryItem": {"id": "item-2", "media": {"metadata": {"title": "Dune Messiah"}}}},
+    ],
+    "narrators": [],
+    "tags": [],
+    "genres": [],
+    "series": [],
+    "authors": [],
+}
+
+# ...and one `/api/libraries/{id}/items` response: a DIFFERENT shape, whose
+# items are bare, not wrapped.
+ABS_ITEMS_PAYLOAD = {
+    "results": [
+        {"id": "item-1", "media": {"metadata": {"title": "Dune"}}},
+        {"id": "item-2", "media": {"metadata": {"title": "Revelation Space"}}},
+    ],
+    "total": 190,
+    "page": 0,
+}
+
+
+class LibrarySearchShapeTests(unittest.TestCase):
+    """`/library type:audiobook` answered "No matching library items found."
+    for a library of 190 books, for every query, since the day it shipped.
+
+    The route returned Audiobookshelf's own payload untouched, so the bot
+    received `{"results": {"book": [...], "authors": [...]}}` — and
+    `_result_list` looks for a LIST under "results" and then for a
+    top-level "book", so it found neither and returned nothing. Nothing
+    errored anywhere; it just always said there was nothing there.
+    """
+
+    def setUp(self) -> None:
+        self.client = mock.Mock()
+        self.client.search.return_value = ABS_SEARCH_PAYLOAD
+        self.client.list_items.return_value = ABS_ITEMS_PAYLOAD
+        patcher = mock.patch.object(api_module, "_abs_client", return_value=self.client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_search_returns_a_flat_list_of_library_items(self) -> None:
+        payload = api_module.library_search(q="dune", limit=25, _actor="local")
+        self.assertEqual([item["id"] for item in payload["results"]], ["item-1", "item-2"])
+
+    def test_the_bot_can_actually_read_what_this_route_returns(self) -> None:
+        """The bug lived in the SEAM, not in either side: the route was
+        reasonable JSON and `_result_list` was a reasonable unwrapper, and
+        together they produced nothing. Asserting the route's shape alone
+        would not have caught it, so this crosses the boundary on purpose."""
+        from src.shelfmark_service.discord_bot import _result_list
+
+        payload = api_module.library_search(q="dune", limit=25, _actor="local")
+        self.assertEqual(len(_result_list(payload)), 2)
+
+    def test_an_empty_query_lists_the_library_instead_of_searching(self) -> None:
+        payload = api_module.library_search(q="", limit=25, _actor="local")
+        self.client.search.assert_not_called()
+        self.client.list_items.assert_called_once()
+        self.assertEqual([item["id"] for item in payload["results"]], ["item-1", "item-2"])
+
+    def test_browsing_is_ordered_the_way_the_library_reads_on_disk(self) -> None:
+        api_module.library_search(q="", limit=25, _actor="local")
+        self.assertEqual(
+            self.client.list_items.call_args.kwargs["sort"], "media.metadata.authorName"
+        )
+
+    def test_a_search_payload_missing_its_book_key_is_not_an_error(self) -> None:
+        self.client.search.return_value = {"authors": [], "series": []}
+        self.assertEqual(api_module.library_search(q="x", limit=25, _actor="local")["results"], [])
+
+
+class EbookBrowseTests(unittest.TestCase):
+    """`/library type:ebook` with no query has to list the shelf. The route
+    used to declare `q` with `min_length=1`, so the only way to find out what
+    was on the server was to already know a word that appears in a title."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        for author, year, title in (
+            ("Frank Herbert", 1965, "Dune"),
+            ("Frank Herbert", 1969, "Dune Messiah"),
+            ("Ursula K Le Guin", 1968, "A Wizard of Earthsea"),
+        ):
+            book = root / author / f"{year} - {title}"
+            book.mkdir(parents=True)
+            (book / f"{title}.epub").write_bytes(b"epub")
+        self.addCleanup(self._tmp.cleanup)
+        patcher = mock.patch.object(api_module, "_ebook_root", return_value=root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_an_empty_query_returns_every_book(self) -> None:
+        results = api_module.ebook_search(q="", limit=50, _actor="local")["results"]
+        self.assertEqual(len(results), 3)
+
+    def test_a_query_still_narrows(self) -> None:
+        results = api_module.ebook_search(q="earthsea", limit=50, _actor="local")["results"]
+        self.assertEqual([book["author"] for book in results], ["Ursula K Le Guin"])
+
+    def test_the_limit_still_applies_to_a_browse(self) -> None:
+        results = api_module.ebook_search(q="", limit=2, _actor="local")["results"]
+        self.assertEqual(len(results), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

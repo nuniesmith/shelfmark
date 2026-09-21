@@ -5,6 +5,10 @@ from unittest import mock
 
 from src.shelfmark_service.clients import ServiceError
 from src.shelfmark_service.discord_bot import (
+    _LISTING_PAGE_SIZE,
+    _PAGE_SIZE,
+    EbookView,
+    _PagedView,
     _clamp_page,
     _ebook_label,
     _has_next_page,
@@ -269,9 +273,17 @@ class LibraryQueryTests(unittest.TestCase):
     def test_ebook_hits_the_on_disk_root(self) -> None:
         endpoint, params = _library_query("ebook", "dune")
         self.assertEqual(endpoint, "/api/v1/ebooks/search")
-        # 25 is api.ebook_search's own ceiling (`le=25`) -- raised from 10
-        # now that pagination makes a result past the old cutoff reachable.
         self.assertEqual(params, {"q": "dune", "limit": 25})
+
+    def test_an_empty_query_browses_and_asks_for_much_more(self) -> None:
+        """No query means "show me the shelf", which has nothing to narrow
+        it -- asking for a search-sized 25 would silently cut a 190-book
+        library off at 25 with no sign that it had."""
+        for kind in ("audiobook", "ebook"):
+            with self.subTest(kind=kind):
+                _, params = _library_query(kind, "")
+                self.assertEqual(params["q"], "")
+                self.assertGreater(params["limit"], 25)
 
 
 class RequestQueryTests(unittest.TestCase):
@@ -490,6 +502,67 @@ class RateLimitMessageTests(unittest.TestCase):
         )
         message = _rate_limit_message("grabs", exc)
         self.assertEqual(message, "You have run too many grabs. Try again in 5 seconds.")
+
+
+class PagedViewPageSizeTests(unittest.IsolatedAsyncioTestCase):
+    """A view's page size used to be the module constant everywhere, so the
+    audiobook listing — which has no buttons at all — was stuck at the five
+    that exists because Discord allows five components per row. Browsing 190
+    books that way is 38 presses of Next.
+
+    Async because `discord.ui.View.__init__` creates a future and needs a
+    running loop; there is nothing asynchronous about what is asserted.
+    """
+
+    @staticmethod
+    def _label(item: dict) -> str:
+        return str(item["title"])
+
+    def _listing(self, count: int) -> _PagedView:
+        """Exactly what `/library type:audiobook` builds — no page size is
+        passed, because the view's own class decides it."""
+        items = [{"title": f"Book {index}"} for index in range(count)]
+        return _PagedView(items, "Audiobooks", self._label, None)
+
+    def _ebook_view(self, count: int) -> EbookView:
+        books = [{"id": str(i), "title": f"Book {i}", "size": 1000} for i in range(count)]
+        return EbookView(mock.Mock(), books, "discord:1:2:3", 10_000_000, None, "Ebooks")
+
+    async def test_a_listing_page_holds_more_than_a_button_row(self) -> None:
+        embed = self._listing(23).render_embed()
+        self.assertEqual(len(embed.description.splitlines()), _LISTING_PAGE_SIZE)
+        self.assertEqual(embed.footer.text, f"1-{_LISTING_PAGE_SIZE} of 23")
+
+    async def test_later_pages_are_numbered_against_the_same_page_size(self) -> None:
+        """The embed's numbers have to agree with the page size used to slice
+        it — off by one page size and page 3 reads "11." beside book 20."""
+        view = self._listing(23)
+        view.page = 2
+        embed = view.render_embed()
+        self.assertEqual(embed.description.splitlines()[0], "21. Book 20")
+        self.assertEqual(embed.footer.text, "21-23 of 23")
+
+    async def test_the_next_button_is_dead_on_the_last_page(self) -> None:
+        """Paging arithmetic and nav-button state must use ONE page size: at
+        the old five, a 23-item listing would still offer Next on page 3."""
+        view = self._listing(23)
+        view.page = 2
+        view._sync_nav_buttons()
+        self.assertTrue(view.next_button.disabled)
+        self.assertFalse(view.previous_button.disabled)
+
+    async def test_a_view_whose_lines_carry_buttons_stays_at_five(self) -> None:
+        """`EbookView` is bound by Discord's five-components-per-row limit
+        and must not inherit the listing's wider page — a sixth Send button
+        on one row is rejected by Discord, not merely ugly."""
+        view = self._ebook_view(23)
+        self.assertEqual(len(view.render_embed().description.splitlines()), _PAGE_SIZE)
+        send_buttons = [
+            item
+            for item in view.children
+            if getattr(item, "custom_id", "").startswith("shelfmark:ebook-send:")
+        ]
+        self.assertEqual(len(send_buttons), _PAGE_SIZE)
 
 
 if __name__ == "__main__":

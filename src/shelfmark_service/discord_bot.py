@@ -166,6 +166,13 @@ def _rate_limit_message(kind: str, exc: ServiceError) -> str:
 # natural width for a page of action buttons, not just a display choice.
 _PAGE_SIZE = 5
 
+# A page of a view that has NO per-item buttons -- the audiobook listing --
+# is bound by how much an embed can readably hold, not by Discord's
+# five-buttons-per-row limit. Ten `_library_label` lines is roughly a
+# third of the embed description cap, and turns a 190-book library from 38
+# page presses into 19.
+_LISTING_PAGE_SIZE = 10
+
 
 def _page_count(total: int, page_size: int = _PAGE_SIZE) -> int:
     """How many pages `total` items make, always at least 1.
@@ -420,17 +427,33 @@ def _library_label(item: dict[str, Any]) -> str:
 # — pulled into a plain function so the type->backend choice is asserted
 # directly, without a Discord interaction object graph (the same reason
 # is_permitted and _job_status_message are split out above).
+# How many results to fetch when BROWSING (no query) rather than
+# searching. Higher than the search limit because a browse has nothing to
+# narrow it: the whole point is seeing the shelf. Both endpoints cap at
+# 200/100 respectively, so this asks for as much as either will give.
+_BROWSE_LIMIT = 100
+
+
 def _library_query(kind: str, query: str) -> tuple[str, dict[str, Any]]:
+    """Endpoint and params for `/library`. An empty `query` means BROWSE.
+
+    Browsing is the case this command was missing: `query` used to be
+    required, so someone who did not already know what was on the server
+    had to guess a word from a title to find out. Both backends treat an
+    empty `q` as "everything", so the only difference here is how much to
+    ask for.
+    """
+    limit = _BROWSE_LIMIT if not query else 25
     if kind == "ebook":
-        # Raised from 10 to 25 -- api.ebook_search's own ceiling (`le=25`)
-        # -- now that pagination makes a result past the old cutoff
+        # Raised from 10 to 25 -- api.ebook_search's own ceiling at the
+        # time -- once pagination made a result past the old cutoff
         # reachable instead of never being fetched at all.
-        return "/api/v1/ebooks/search", {"q": query, "limit": 25}
+        return "/api/v1/ebooks/search", {"q": query, "limit": limit}
     # Explicit 25 rather than leaving this on api.library_search's own
-    # default of 12: that would strand a couple of fetched-but-unseen
-    # results on a half-full last page instead of giving the same 5 full
+    # default: a smaller number would strand a couple of fetched-but-unseen
+    # results on a half-full last page instead of giving the same full
     # pages of headroom /library type:ebook now gets.
-    return "/api/v1/library/search", {"q": query, "limit": 25}
+    return "/api/v1/library/search", {"q": query, "limit": limit}
 
 
 # `/request`'s two type choices hit the SAME Prowlarr endpoint — unlike
@@ -543,6 +566,15 @@ class _PagedView(discord.ui.View):
     at most 5 components in any one row, comfortably inside both limits.
     """
 
+    # How many items one page holds. A CLASS attribute, not a constructor
+    # argument, because it is a property of what the view contains rather
+    # than a choice the calling command should be making: this base class
+    # is a plain listing with nothing to click but Previous/Next, so it is
+    # bound by how much an embed readably holds, while `ReleaseView` and
+    # `EbookView` below override it back to `_PAGE_SIZE` because every one
+    # of their lines carries a button and Discord allows five per row.
+    page_size: int = _LISTING_PAGE_SIZE
+
     def __init__(
         self,
         items: list[dict[str, Any]],
@@ -588,18 +620,18 @@ class _PagedView(discord.ui.View):
         # shouldn't exist (first/last page) never reaches the callback at
         # all once Discord greys it out.
         self.previous_button.disabled = not _has_previous_page(self.page)
-        self.next_button.disabled = not _has_next_page(self.page, len(self.items))
+        self.next_button.disabled = not _has_next_page(self.page, len(self.items), self.page_size)
 
     def _sync_action_buttons(self) -> None:
         """Hook for a subclass's per-item buttons; a plain `_PagedView`
         (the audiobook library listing) has none, so this is a no-op."""
 
     def render_embed(self) -> discord.Embed:
-        page_items = _page_slice(self.items, self.page)
+        page_items = _page_slice(self.items, self.page, self.page_size)
         embed = discord.Embed(title=self.title)
-        start = _clamp_page(self.page, len(self.items)) * _PAGE_SIZE + 1
+        start = _clamp_page(self.page, len(self.items), self.page_size) * self.page_size + 1
         embed.description = _numbered_lines(page_items, start, self.label_fn) or "(no results)"
-        embed.set_footer(text=_page_position_text(self.page, len(self.items)))
+        embed.set_footer(text=_page_position_text(self.page, len(self.items), self.page_size))
         return embed
 
     async def _go_previous(self, interaction: discord.Interaction) -> None:
@@ -621,7 +653,7 @@ class _PagedView(discord.ui.View):
         # re-check in `_ConfirmGrabView.confirm`.
         if not await self.guard(interaction):
             return
-        self.page = _clamp_page(target_page, len(self.items))
+        self.page = _clamp_page(target_page, len(self.items), self.page_size)
         self._sync_nav_buttons()
         self._sync_action_buttons()
         await interaction.response.edit_message(embed=self.render_embed(), view=self)
@@ -660,6 +692,10 @@ class ReleaseView(_PagedView):
     CURRENT page, not an index frozen when the view was first built.
     """
 
+    # Overrides the base listing width: each line here carries its own
+    # button, and Discord allows five components per row.
+    page_size: int = _PAGE_SIZE
+
     def __init__(
         self,
         api: ShelfmarkApi,
@@ -675,7 +711,7 @@ class ReleaseView(_PagedView):
         self.actor = actor
         self.large_release_threshold_bytes = large_release_threshold_bytes
         self._action_buttons: list[discord.ui.Button] = []
-        for local_index in range(_PAGE_SIZE):
+        for local_index in range(self.page_size):
             button = discord.ui.Button(
                 style=discord.ButtonStyle.primary,
                 custom_id=f"shelfmark:grab:{local_index}",
@@ -696,7 +732,7 @@ class ReleaseView(_PagedView):
                 button.label = "—"
                 button.disabled = True
             else:
-                absolute_number = self.page * _PAGE_SIZE + local_index + 1
+                absolute_number = self.page * self.page_size + local_index + 1
                 button.label = f"Grab {absolute_number}"
                 button.disabled = False
 
@@ -751,6 +787,10 @@ class EbookView(_PagedView):
     on a phone and does not say what to do about it.
     """
 
+    # Overrides the base listing width: each line here carries its own
+    # button, and Discord allows five components per row.
+    page_size: int = _PAGE_SIZE
+
     def __init__(
         self,
         api: ShelfmarkApi,
@@ -766,7 +806,7 @@ class EbookView(_PagedView):
         self.actor = actor
         self.max_attachment_bytes = max_attachment_bytes
         self._action_buttons: list[discord.ui.Button] = []
-        for local_index in range(_PAGE_SIZE):
+        for local_index in range(self.page_size):
             button = discord.ui.Button(
                 style=discord.ButtonStyle.primary,
                 custom_id=f"shelfmark:ebook-send:{local_index}",
@@ -784,7 +824,7 @@ class EbookView(_PagedView):
                 button.label = "—"
                 button.disabled = True
             else:
-                absolute_number = self.page * _PAGE_SIZE + local_index + 1
+                absolute_number = self.page * self.page_size + local_index + 1
                 button.label = f"Send {absolute_number}"
                 button.disabled = False
 
@@ -919,14 +959,24 @@ def install_commands(
         app_commands.Choice(name="Ebook", value="ebook"),
     ]
 
-    @bot.tree.command(name="library", description="Search books already on the server")
-    @app_commands.describe(type="Audiobook or ebook", query="Title, author, or series to search for")
+    @bot.tree.command(name="library", description="Browse or search books already on the server")
+    @app_commands.describe(
+        type="Audiobook or ebook",
+        query="Title, author, or series — leave empty to list everything",
+    )
     @app_commands.choices(type=_TYPE_CHOICES)
-    async def library(interaction: discord.Interaction, type: app_commands.Choice[str], query: str) -> None:
+    async def library(
+        interaction: discord.Interaction, type: app_commands.Choice[str], query: str = ""
+    ) -> None:
+        # `query` is optional so the shelf can be BROWSED. It used to be
+        # required, which quietly assumed the person already knew what was
+        # on the server -- the opposite of true for the reader this command
+        # exists for, who wants to see what there is and pick one.
         if not await guard(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         kind = type.value
+        query = query.strip()
         endpoint, params = _library_query(kind, query)
         try:
             payload = await api.get(endpoint, params=params, actor=_actor(interaction))
@@ -946,14 +996,28 @@ def install_commands(
         # `_library_query` asked the backend for stays reachable.
         results = _result_list(payload)
         if not results:
-            message = (
-                "No ebooks on the server matched that search."
-                if kind == "ebook"
-                else "No matching library items found."
-            )
+            if not query:
+                # Not "nothing matched" — nothing was asked for. An empty
+                # shelf and a failed search need different sentences or the
+                # reader goes looking for a better search term that does
+                # not exist.
+                message = (
+                    "There are no ebooks on the server yet."
+                    if kind == "ebook"
+                    else "There are no audiobooks in the library yet."
+                )
+            else:
+                message = (
+                    "No ebooks on the server matched that search."
+                    if kind == "ebook"
+                    else "No matching library items found."
+                )
             await interaction.followup.send(message, ephemeral=True)
             return
-        title = f"{type.name} library results for {query}"
+        title = (
+            f"{type.name}s on the server" if not query
+            else f"{type.name} library results for {query}"
+        )
         if kind == "ebook":
             # Only ebooks get the Send-to-phone button: an audiobook result
             # is an Audiobookshelf catalog entry, not a file this server can
@@ -962,6 +1026,9 @@ def install_commands(
                 api, results, _actor(interaction), max_attachment_bytes, guard, title
             )
         else:
+            # No per-item buttons here, so nothing binds this to Discord's
+            # five-per-row cap — and browsing 190 audiobooks five at a time
+            # would be 38 presses.
             view = _PagedView(results, title, _library_label, guard)
         sent = await interaction.followup.send(embed=view.render_embed(), view=view, ephemeral=True)
         view.message = sent
