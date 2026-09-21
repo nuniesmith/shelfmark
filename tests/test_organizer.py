@@ -1004,5 +1004,194 @@ class WholeDirectoryStagingTests(unittest.TestCase):
         self.assertFalse(dest_dir.exists())
 
 
+class TagPartNumberTests(unittest.TestCase):
+    """`tag_part_number` — which half of a book a file says it is."""
+
+    def _part(self, **tags: str) -> int | None:
+        with mock.patch.object(main_module, "tags_from_audio", return_value=tags):
+            return main_module.tag_part_number(Path("anything.m4b"))
+
+    def test_the_real_graphicaudio_album_tag(self) -> None:
+        """The tag that would have prevented the Fourth Wing mis-order. The
+        leading "1" belongs to the SERIES, not the part — reading it would
+        put both files at part 1 and change nothing."""
+        self.assertEqual(self._part(album="The Empyrean 1: Fourth Wing 2 of 2"), 2)
+        self.assertEqual(self._part(album="The Empyrean 1: Fourth Wing 1 of 2"), 1)
+
+    def test_a_series_number_earlier_in_the_string_does_not_win(self) -> None:
+        """"Book 1" is the volume's place in the SERIES; "2 of 2" is which
+        half of that volume this file holds. Taking whichever marker appears
+        first would file the second half as part one — the exact inversion
+        this is here to prevent."""
+        self.assertEqual(self._part(album="The Empyrean Book 1: Fourth Wing 2 of 2"), 2)
+
+    def test_a_part_or_disc_label_without_a_total(self) -> None:
+        self.assertEqual(self._part(album="Hyperion, Part 3"), 3)
+        self.assertEqual(self._part(album="The Stand Disc 12"), 12)
+
+    def test_the_title_tag_is_consulted_when_the_album_says_nothing(self) -> None:
+        self.assertEqual(self._part(album="Dune", title="Dune 2 of 4"), 2)
+
+    def test_a_book_with_no_part_marker_at_all(self) -> None:
+        self.assertIsNone(self._part(album="Dune", title="Chapter One"))
+
+    def test_an_of_with_no_number_after_it_is_not_a_part(self) -> None:
+        """"Tales of Earthsea" must not read as part 1 of something."""
+        self.assertIsNone(self._part(album="Tales of Earthsea"))
+
+
+class OrderTracksTests(unittest.TestCase):
+    """`order_tracks` — the ordering the Fourth Wing import got wrong.
+
+    Two files of one book arrived with unrelated names (`EMPYREAN0102.m4b`,
+    the second half, and `Fourth_Wing__The_Empyrean_1__by_Rebecca_Yarros.mp4`,
+    the first). "E" sorts before "F", so the library got the book back to
+    front — and because everything downstream reads the first track, the
+    title and author came from the wrong file too.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-test-")
+        self.source = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _files(self, *names: str) -> list[Path]:
+        paths = []
+        for name in names:
+            path = self.source / name
+            path.write_bytes(b"")
+            paths.append(path)
+        return paths
+
+    @staticmethod
+    def _tagger(by_name: dict[str, dict[str, str]]):
+        return lambda path: by_name.get(path.name, {})
+
+    def test_the_fourth_wing_release_is_put_back_in_playing_order(self) -> None:
+        second, first = self._files(
+            "EMPYREAN0102.m4b", "Fourth_Wing__The_Empyrean_1__by_Rebecca_Yarros.mp4"
+        )
+        tags = self._tagger(
+            {
+                "EMPYREAN0102.m4b": {"album": "The Empyrean 1: Fourth Wing 2 of 2"},
+                "Fourth_Wing__The_Empyrean_1__by_Rebecca_Yarros.mp4": {
+                    "album": "The Empyrean 1: Fourth Wing 1 of 2"
+                },
+            }
+        )
+        with mock.patch.object(main_module, "tags_from_audio", side_effect=tags):
+            ordered = main_module.order_tracks([second, first], self.source)
+        self.assertEqual(ordered, [first, second])
+
+    def test_a_consistently_numbered_book_is_never_reopened(self) -> None:
+        """Files from one rip share a name with only the number moving. Their
+        own numbering is the better signal, and reading tags for every book
+        in a library-sized run would be a real cost — so the tags are not
+        even opened here, let alone allowed to override."""
+        tracks = self._files("Dune - Part 01.mp3", "Dune - Part 02.mp3", "Dune - Part 03.mp3")
+        tags = mock.Mock(side_effect=AssertionError("tags must not be read"))
+        with mock.patch.object(main_module, "tags_from_audio", tags):
+            ordered = main_module.order_tracks(list(reversed(tracks)), self.source)
+        self.assertEqual(ordered, tracks)
+        tags.assert_not_called()
+
+    def test_a_leading_index_in_the_filename_still_wins(self) -> None:
+        """`track_sort_key` already orders these; tags must not second-guess
+        a book whose own filenames put themselves in order."""
+        one, two = self._files("1 - Opening.mp3", "2 - The Long Walk.mp3")
+        tags = self._tagger(
+            {
+                "1 - Opening.mp3": {"album": "Whatever 2 of 2"},
+                "2 - The Long Walk.mp3": {"album": "Whatever 1 of 2"},
+            }
+        )
+        with mock.patch.object(main_module, "tags_from_audio", side_effect=tags):
+            ordered = main_module.order_tracks([two, one], self.source)
+        self.assertEqual(ordered, [one, two])
+
+    def test_one_file_without_a_part_tag_leaves_the_order_alone(self) -> None:
+        """A partial answer is a guess, and a confidently wrong order is
+        worse than the alphabetical one the caller already had."""
+        a, b = self._files("aaa.m4b", "zzz.mp4")
+        tags = self._tagger({"zzz.mp4": {"album": "Something 1 of 2"}})
+        with mock.patch.object(main_module, "tags_from_audio", side_effect=tags):
+            ordered = main_module.order_tracks([b, a], self.source)
+        self.assertEqual(ordered, [a, b])
+
+    def test_two_files_claiming_the_same_part_leave_the_order_alone(self) -> None:
+        """Three files, two of which both say "part 2". Sorting on the part
+        anyway would move the third ahead of one of them and leave the pair
+        in an order nothing chose — so the whole answer is discarded, not
+        patched up."""
+        a, b, c = self._files("aaa.m4b", "mmm.mp4", "zzz.m4b")
+        tags = self._tagger(
+            {
+                "aaa.m4b": {"album": "Thing 2 of 3"},
+                "mmm.mp4": {"album": "Thing 1 of 3"},
+                "zzz.m4b": {"album": "Thing 2 of 3"},
+            }
+        )
+        with mock.patch.object(main_module, "tags_from_audio", side_effect=tags):
+            ordered = main_module.order_tracks([c, a, b], self.source)
+        self.assertEqual(ordered, [a, b, c])
+
+    def test_a_dump_of_many_unrelated_files_is_not_probed(self) -> None:
+        tracks = self._files(*[f"{chr(ord('a') + i)}-loose-file.mp3" for i in range(25)])
+        tags = mock.Mock(side_effect=AssertionError("tags must not be read"))
+        with mock.patch.object(main_module, "tags_from_audio", tags):
+            ordered = main_module.order_tracks(list(reversed(tracks)), self.source)
+        self.assertEqual(ordered, tracks)
+
+
+class FourthWingPlanTests(unittest.TestCase):
+    """The same defect through `build_plan`, where it actually bit: the
+    destination numbers, not just the sort order."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-test-")
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "incoming"
+        self.dest = self.root / "library"
+        (self.source / "Fourth GA").mkdir(parents=True)
+        self.dest.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_part_one_is_numbered_01_even_though_it_sorts_second(self) -> None:
+        book = self.source / "Fourth GA"
+        second = book / "EMPYREAN0102.m4b"
+        first = book / "Fourth_Wing__The_Empyrean_1__by_Rebecca_Yarros.mp4"
+        for path in (second, first):
+            path.write_bytes(b"\0" * 32)
+        tags = {
+            "EMPYREAN0102.m4b": {
+                "album": "The Empyrean 1: Fourth Wing 2 of 2",
+                "artist": "Graphic Audio LLC.",
+                "date": "2024",
+            },
+            "Fourth_Wing__The_Empyrean_1__by_Rebecca_Yarros.mp4": {
+                "album": "The Empyrean 1: Fourth Wing 1 of 2",
+                "artist": "Graphic Audio LLC.",
+                "date": "2023",
+            },
+        }
+        with mock.patch.object(
+            main_module, "tags_from_audio", side_effect=lambda path: tags.get(path.name, {})
+        ):
+            plan = build_plan(
+                source=self.source,
+                dest=self.dest,
+                trash=self.root / "trash",
+                folder_format="year-title",
+                keep_names=False,
+                include_non_cover_images=False,
+                media_mode="audio",
+            )
+
+        tracks = [op for book_plan in plan.books for op in book_plan.tracks if op.kind == "track"]
+        by_destination = {op.dest.name: op.src.name for op in tracks}
+        self.assertEqual(by_destination["01.mp4"], first.name)
+        self.assertEqual(by_destination["02.m4b"], second.name)
+
+
 if __name__ == "__main__":
     unittest.main()

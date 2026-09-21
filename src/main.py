@@ -799,13 +799,95 @@ def tags_from_audio(path: Path) -> dict[str, str]:
     artist = first("albumartist", "artist", "composer")
     album = first("album")
     date = first("date", "year")
+    title = first("title")
     if artist:
         out["artist"] = artist
     if album:
         out["album"] = album
     if date:
         out["date"] = date
+    if title:
+        # Only `order_tracks` reads this, to find a "1 of 2" marker some
+        # releases put in the per-file title rather than the album.
+        # enrich_meta deliberately ignores it: a track title is the name of
+        # a CHAPTER far more often than of the book.
+        out["title"] = title
     return out
+
+
+# "2 of 2", "Part 1", "Disc 3" — a part marker inside a file's own tags. The
+# "N of M" form is tried first because the other one matches inside it
+# ("...Fourth Wing 2 of 2" would otherwise yield nothing, and a stray
+# "The Empyrean 1:" earlier in the same string must not win).
+PART_OF_RE = re.compile(r"\b(\d{1,3})\s*(?:of|/)\s*\d{1,3}\b", re.I)
+PART_LABEL_RE = re.compile(
+    r"\b(?:part|pt|disc|disk|cd|vol|volume|book)[\s._-]*(\d{1,3})\b", re.I
+)
+
+# Ceiling on how many files are worth opening to recover an order. Real
+# multi-part releases are two to six files; past this the folder is a dump,
+# not a book, and filename order is as good a guess as any.
+PART_PROBE_MAX_TRACKS = 24
+
+
+def tag_part_number(path: Path) -> int | None:
+    """Which part of the book this file is, according to its own tags."""
+    tags = tags_from_audio(path)
+    for text in (tags.get("album"), tags.get("title")):
+        if not text:
+            continue
+        match = PART_OF_RE.search(text) or PART_LABEL_RE.search(text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def name_skeleton(path: Path) -> str:
+    """A filename with every run of digits collapsed, so files from one rip
+    ("Dune - Part 01", "Dune - Part 02") reduce to the same string and files
+    from different sources do not."""
+    return re.sub(r"\d+", "#", path.stem.casefold())
+
+
+def order_tracks(paths, source: Path) -> list[Path]:
+    """Put a book's audio files in playing order.
+
+    Filenames decide it whenever they can — that is what `track_sort_key`
+    does, and for a book ripped in one go every file shares a name with only
+    the number moving, so sorting them is unambiguous.
+
+    The case this exists for is the one where they cannot. A GraphicAudio
+    release of *Fourth Wing* arrived as `EMPYREAN0102.m4b` — the SECOND
+    half — beside `Fourth_Wing__The_Empyrean_1__by_Rebecca_Yarros.mp4`, the
+    first. Nothing in either name says which half it is, "E" sorts before
+    "F", and the book went into the library back to front. That was not a
+    cosmetic defect: everything downstream reads the first track, so the
+    title came from the wrong file's album tag ("...2 of 2"), the author
+    from its artist tag, and Audiobookshelf built a chapter list that played
+    the ending first. Someone listened to half of it that way.
+
+    The tags knew all along — "The Empyrean 1: Fourth Wing 1 of 2" and
+    "2 of 2". They are consulted only once the filenames have failed to
+    agree on a pattern, so a normally-numbered book never pays for the reads
+    and never has its own ordering second-guessed.
+    """
+    ordered = sorted(set(paths), key=lambda path: track_sort_key(path, source))
+    if not 2 <= len(ordered) <= PART_PROBE_MAX_TRACKS:
+        return ordered
+    if any(track_sort_key(path, source)[:2] != (0, 0) for path in ordered):
+        # A disc folder or a leading index already put these in order.
+        return ordered
+    if len({name_skeleton(path) for path in ordered}) == 1:
+        # One naming pattern with only the number moving — a real series,
+        # and the numbers in it are a better signal than any tag.
+        return ordered
+    parts = [tag_part_number(path) for path in ordered]
+    if any(part is None for part in parts) or len(set(parts)) != len(parts):
+        # Every file must name a part, and no two may claim the same one.
+        # Anything less is a guess, and a confident wrong order is worse
+        # than the alphabetical one the caller already has.
+        return ordered
+    return [path for _, path in sorted(zip(parts, ordered), key=lambda pair: pair[0])]
 
 
 def enrich_meta(meta: Meta, tracks: list[Path]) -> Meta:
@@ -1702,7 +1784,7 @@ def merge_duplicate_books(books: list[BookPlan], source: Path, keep_names: bool)
                 for src in srcs
             ]
         elif media_kind(book) == "audio":
-            srcs = sorted(set(srcs), key=lambda path: track_sort_key(path, source))
+            srcs = order_tracks(srcs, source)
             width = pad_width(len(srcs))
             new_tracks = [
                 FileOp(src, book.dest_dir / track_filename(i, src, width, keep_names), "track")
@@ -1711,9 +1793,8 @@ def merge_duplicate_books(books: list[BookPlan], source: Path, keep_names: bool)
         else:
             # Defensive handling for a manually constructed mixed plan. Keep
             # ebook files as ebooks and renumber only audio tracks.
-            audio_srcs = sorted(
-                [op.src for op in book.tracks if op.kind == "track"],
-                key=lambda path: track_sort_key(path, source),
+            audio_srcs = order_tracks(
+                [op.src for op in book.tracks if op.kind == "track"], source
             )
             ebook_srcs = sorted(
                 [op.src for op in book.tracks if op.kind == "ebook"],
@@ -1840,7 +1921,7 @@ def build_plan(
     if do_audio:
         groups = group_audio(audio, source)
         for book_dir, tracks in sorted(groups.items(), key=lambda kv: str(kv[0]).casefold()):
-            tracks = sorted(tracks, key=lambda p: track_sort_key(p, source))
+            tracks = order_tracks(tracks, source)
             if not tracks:
                 continue
             # In auto mode, skip folders that are primarily ebooks
