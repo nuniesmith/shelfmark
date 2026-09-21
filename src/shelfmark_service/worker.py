@@ -8,7 +8,9 @@ import posixpath
 import signal
 import sys
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ from .config import Settings
 from .db import Database, Job
 from .errors import ErrorCode, ShelfmarkError
 from .manifest import JsonlManifest, sha256_file
+from . import torrentmeta
 from .transfer import RsyncTransfer, TransferError, wait_until_stable
 
 logger = logging.getLogger("shelfmark.worker")
@@ -47,6 +50,15 @@ def _upstream_failure(exc: ServiceError) -> ShelfmarkError:
         f"{exc.service} request failed",
         details={"service": exc.service, "status": exc.status},
     )
+
+
+def _as_list(payload: Any) -> list[dict[str, Any]]:
+    """qBittorrent's torrent list, defensively. A non-list means we cannot
+    tell what is in the client, and treating that as "nothing" would read as
+    "every torrent is new"."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
 
 
 def _release_download_source(release: dict[str, Any], qbittorrent_prowlarr_base_url: str) -> str:
@@ -409,12 +421,41 @@ class Worker:
                 breaker_failure_threshold=self.settings.circuit_breaker_failure_threshold,
                 breaker_cooldown_seconds=self.settings.circuit_breaker_cooldown_seconds,
             )
+            category = self.settings.qbittorrent_category
             try:
                 client.login()
-                upstream = client.add_urls([add_url], category=self.settings.qbittorrent_category)
+                # Snapshot BEFORE the add. qBittorrent answers "Ok." whether
+                # it queued the torrent, silently ignored a duplicate, or
+                # could not fetch the URL at all, so its response carries no
+                # signal -- measured: the reply is byte-identical on a grab
+                # that downloads and one that does nothing.
+                before = {
+                    str(t.get("hash", "")).lower()
+                    for t in _as_list(client.torrents(category=category))
+                }
+                upstream = client.add_urls([add_url], category=category)
+                after = {
+                    str(t.get("hash", "")).lower()
+                    for t in _as_list(client.torrents(category=category))
+                }
             except ServiceError as exc:
                 raise _upstream_failure(exc) from exc
-            return {"release": release, "upstream": upstream, "submitted": True}
+
+            added = after - before
+            if added:
+                return {
+                    "release": release,
+                    "upstream": upstream,
+                    "submitted": True,
+                    "state": "added",
+                    "name": release.get("title"),
+                }
+
+            # Nothing new appeared. Work out WHY rather than reporting
+            # success: the two reasons need opposite responses from a
+            # person, and telling them apart needs the infohash, which is
+            # the only identity qBittorrent dedupes on.
+            return self._explain_silent_grab(release, client, upstream)
         if job.kind == "reconcile_downloads":
             return self._reconcile_downloads(job)
         if job.kind not in {"organize_preview", "organize_apply"}:
@@ -509,6 +550,83 @@ class Worker:
                 destination=str(operation.dest),
                 kind=operation.kind,
             )
+
+
+    def _explain_silent_grab(
+        self, release: dict[str, Any], client: QBittorrentClient, upstream: Any
+    ) -> dict[str, Any]:
+        """Say why a grab added nothing: already there, or refused.
+
+        Reached only on the unusual path, so the extra fetch costs nothing
+        in the normal case. We pull the .torrent from the ORIGINAL
+        `downloadUrl` rather than the rewritten one -- the rewrite points at
+        `prowlarr:9696`, a Docker name that resolves inside qBittorrent's
+        container on Sullivan and nowhere else.
+        """
+        result: dict[str, Any] = {
+            "release": release,
+            "upstream": upstream,
+            "submitted": True,
+            "name": release.get("title"),
+        }
+        source = release.get("downloadUrl")
+        if not isinstance(source, str) or not source.lower().startswith(("http://", "https://")):
+            result["state"] = "unknown"
+            return result
+        try:
+            with urllib.request.urlopen(source, timeout=self.settings.http_timeout) as response:
+                raw = response.read()
+            infohash, name = torrentmeta.parse(raw)
+        except torrentmeta.InvalidTorrent as exc:
+            # 200 OK, but the body is not a torrent -- an expired link or a
+            # tracker error page, both of which arrive with a success status.
+            logger.info("grab: download link is not a torrent (%s)", exc)
+            result["state"] = "bad_link"
+            return result
+        except urllib.error.HTTPError as exc:
+            # A dead link answers with a status, not a page. Measured
+            # against the live indexer: a corrupted `link=` parameter comes
+            # back as an HTTP error, which the broad handler below turned
+            # into "the reason could not be determined" -- true, but useless
+            # to someone deciding what to do next.
+            #
+            # 429 and 5xx are the exception: those say the indexer is busy
+            # or unwell, NOT that this release's link is stale, and telling
+            # someone to search again would send them to re-run the thing
+            # that is rate-limiting them.
+            # 429 and 5xx do NOT mean this release's link is stale -- they
+            # mean the indexer is busy or unwell, and measured against the
+            # live one, a corrupted link parameter comes back as a 500, not
+            # a 404. So a 500 genuinely cannot be told apart from Prowlarr
+            # having a bad day. Rather than guess, report the status: that
+            # is honest AND actionable, where "the reason could not be
+            # determined" is neither.
+            logger.info("grab: download link returned HTTP %s", exc.code)
+            result["state"] = "link_error" if (exc.code == 429 or exc.code >= 500) else "bad_link"
+            result["http_status"] = exc.code
+            return result
+        except Exception as exc:  # noqa: BLE001 - diagnosis must not fail the job
+            logger.info("grab: could not inspect the torrent (%s)", exc)
+            result["state"] = "unknown"
+            return result
+
+        result["infohash"] = infohash
+        try:
+            existing = [
+                t
+                for t in _as_list(client.torrents())
+                if str(t.get("hash", "")).lower() == infohash.lower()
+            ]
+        except ServiceError:
+            existing = []
+        if existing:
+            result["state"] = "duplicate"
+            result["name"] = existing[0].get("name") or name
+            result["category"] = existing[0].get("category")
+            return result
+        result["state"] = "rejected"
+        result["name"] = name or release.get("title")
+        return result
 
     def _reconcile_downloads(self, job: Job) -> dict[str, Any]:
         """Ask qBittorrent what has finished and start the pipeline for anything new.

@@ -17,6 +17,16 @@ Docker is not installed in the review environment.
 
 ## Current progress
 
+**Fixed 2026-09-21. A grab said "Queued release &lt;uuid&gt;" whether the book was downloading, already on the shelf, or refused outright.** Reported as "trying to download an ebook with discord but i don't think its working" — and nothing was broken. The release *"Frank Herbert - [Dune 01-06] (epub)"* is, by infohash, the same torrent as *"Dune Saga - Frank Herbert Collection"* already grabbed five days earlier; qBittorrent deduplicates on infohash, silently no-ops, and returns the same `Ok.` it returns for a real add. Every layer behaved correctly and the six Dune books were already in `/ebooks/Frank Herbert/`. The only defect was that nothing said so, which is indistinguishable from a broken pipeline.
+
+`upstream` in the job result carried no signal at all — measured byte-identical (`{"added_torrent_ids": [], "failure_count": 0, "pending_count": 1, "success_count": 0}`) across grabs that downloaded and grabs that did nothing. `grab_release` now snapshots the category either side of the add and classifies the outcome: **added** (a new hash appeared), **duplicate**, **rejected**, or **bad_link** (an expired link returns an HTML page with HTTP 200). Telling duplicate from rejected requires the infohash, so `torrentmeta.py` computes it — only on the unusual path, so a normal grab pays nothing.
+
+`_queue_grab` now waits for the job (about a second) instead of replying with a UUID, because the id comes back before any work happens. Five distinct sentences, with a test asserting they do not read alike.
+
+**Running it against the live indexer changed the design.** A corrupted download link comes back as **HTTP 500**, not a 404 — indistinguishable from Prowlarr simply having a bad day. Reporting that as "the link expired, search again" would be a guess dressed as a diagnosis, so 429/5xx became their own `link_error` state that names the status and blames the indexer rather than the release. A unit test alone would never have surfaced it: I had assumed a dead link 404s.
+
+Verified end to end: the new parser reproduces `b02e34adeb789a258f5807e28567feb60be0cf2b` for the real torrent, matching what qBittorrent independently reports.
+
 **Changed 2026-09-21. The Discord command set is six commands, and every one of them is usable from Discord.** Four of the eight demanded an identifier the bot gave you no way to obtain, which is not a rough edge — it is the difference between a command existing and a command working.
 
 | command | before | now |

@@ -23,6 +23,7 @@ from src.shelfmark_service.discord_bot import (
     _has_previous_page,
     _human_size,
     _int_set,
+    _grab_outcome_message,
     _job_status_message,
     _library_query,
     _max_attachment_bytes,
@@ -729,3 +730,71 @@ class PagedViewPageSizeTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GrabOutcomeMessageTests(unittest.TestCase):
+    """"Queued release <uuid>" was said in every case — downloading, already
+    on the shelf, and refused. A real report of "I don't think it's working"
+    turned out to be a DUPLICATE: the book had been grabbed five days
+    earlier and was already in the library, and nothing anywhere said so."""
+
+    def test_a_duplicate_says_you_already_have_it(self) -> None:
+        msg = _grab_outcome_message(
+            {"state": "duplicate", "name": "Dune Saga - Frank Herbert Collection"}, "job-1"
+        )
+        self.assertIn("already on the server", msg)
+        self.assertIn("Dune Saga", msg)
+        self.assertNotIn("Queued", msg)
+
+    def test_a_real_download_says_it_is_downloading(self) -> None:
+        msg = _grab_outcome_message({"state": "added", "name": "A New Book"}, "job-1")
+        self.assertIn("Downloading", msg)
+        self.assertIn("A New Book", msg)
+
+    def test_a_refusal_says_nothing_is_downloading(self) -> None:
+        msg = _grab_outcome_message({"state": "rejected", "name": "Some Release"}, "job-1")
+        self.assertIn("Nothing is downloading", msg)
+
+    def test_a_dead_link_says_so_and_what_to_do(self) -> None:
+        msg = _grab_outcome_message({"state": "bad_link", "name": "Stale Release"}, "job-1")
+        self.assertIn("expired", msg)
+        self.assertIn("search again", msg)
+
+    def test_the_three_outcomes_do_not_read_alike(self) -> None:
+        """The whole defect was three different things rendering the same."""
+        msgs = {
+            state: _grab_outcome_message({"state": state, "name": "X"}, "j")
+            for state in ("added", "duplicate", "rejected", "bad_link")
+        }
+        self.assertEqual(len(set(msgs.values())), 4, msgs)
+
+    def test_an_old_job_without_a_state_still_answers(self) -> None:
+        """Jobs queued before this existed have no `state` in their result."""
+        msg = _grab_outcome_message({}, "job-9")
+        self.assertIn("job-9", msg)
+        self.assertIn("could not be determined", msg)
+
+
+class GrabLinkErrorMessageTests(unittest.TestCase):
+    """A 500 from the indexer is NOT "your link expired". Measured against
+    the live Prowlarr: a corrupted link parameter comes back as HTTP 500,
+    which is indistinguishable from the indexer having a bad day — so the
+    message reports the status rather than guessing a cause."""
+
+    def test_it_names_the_status_and_blames_the_indexer(self) -> None:
+        msg = _grab_outcome_message(
+            {"state": "link_error", "name": "Some Book", "http_status": 500}, "j"
+        )
+        self.assertIn("HTTP 500", msg)
+        self.assertIn("indexer, not the release", msg)
+        self.assertNotIn("expired", msg)
+
+    def test_it_still_reads_without_a_status(self) -> None:
+        msg = _grab_outcome_message({"state": "link_error", "name": "X"}, "j")
+        self.assertIn("nothing is", msg.lower())
+
+    def test_it_is_distinct_from_an_expired_link(self) -> None:
+        self.assertNotEqual(
+            _grab_outcome_message({"state": "link_error", "name": "X"}, "j"),
+            _grab_outcome_message({"state": "bad_link", "name": "X"}, "j"),
+        )
