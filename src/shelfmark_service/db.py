@@ -57,6 +57,13 @@ PIPELINE_RETENTION_SECONDS = 90.0 * 24.0 * 60.0 * 60.0
 # they are far rarer than successes, so the extra retention costs almost
 # nothing in row count.
 PIPELINE_FAILED_RETENTION_SECONDS = 180.0 * 24.0 * 60.0 * 60.0
+# A SEARCH audit row. These are the only `audit_events` rows with no job
+# behind them, so nothing in `_delete_jobs_batch` can ever reach them -- they
+# need a retention tier of their own or they are the one table in this
+# database that grows without bound. Ninety days matches the pipeline window:
+# long enough to answer "has she been able to use this?" and "how hard are we
+# hitting the indexer?", short enough to bound itself unattended.
+SEARCH_RETENTION_SECONDS = 90.0 * 24.0 * 60.0 * 60.0
 # Rows deleted per DELETE statement (and per matching audit_events delete).
 # `Worker.run_once` claims and heartbeats jobs on this same SQLite database
 # from the SAME single-threaded loop the retention sweep runs in (see
@@ -281,6 +288,43 @@ class Database:
                 json.dumps(details or {}, sort_keys=True),
             ),
         )
+
+    def record_search(
+        self,
+        *,
+        actor: str,
+        kind: str,
+        query: str,
+        results: int,
+    ) -> None:
+        """Record that someone searched, and what came back.
+
+        Searches were the one thing this system did that left NO trace. The
+        audit table held 282 rows on the live database and every one of them
+        was a job -- so "has she managed to use the bot?" could only be
+        answered if she had gone as far as grabbing something, and "how hard
+        are we leaning on the indexer?" could not be answered at all. The
+        rate limiter caps that usage without ever showing it.
+
+        Deliberately best-effort at the call sites in api.py: a search that
+        succeeded must not be turned into a 500 because writing its audit row
+        failed. The row is the record of an action, not part of it.
+
+        `query` is the caller's own text and is truncated rather than
+        rejected -- a 200-character search is a strange search, not an
+        attack, and dropping the row entirely would lose the fact that it
+        happened.
+        """
+        with closing(self.connect()) as conn:
+            self._audit(
+                conn,
+                actor=actor,
+                action=f"search.{kind}",
+                target_type="search",
+                target_id=None,
+                details={"query": query[:200], "results": results},
+            )
+            conn.commit()
 
     def enqueue(self, kind: str, payload: dict[str, Any], actor: str = "system") -> Job:
         if not kind.strip():
@@ -745,12 +789,15 @@ class Database:
     def _delete_jobs_batch(conn: sqlite3.Connection, job_ids: list[str]) -> None:
         """Delete these job rows and every `audit_events` row that describes them, atomically.
 
-        Every `_audit()` call site in this module (`enqueue`,
+        Every `_audit()` call site that describes a JOB (`enqueue`,
         `claim_torrent_import`, `complete`, `fail`, `cancel`,
         `cancel_running`, `requeue_stale`) writes `target_type='job'`,
-        `target_id=<job id>` -- there is no other `target_type` anywhere in
-        this codebase, so joining on that pair is not a guess at an implied
-        schema, it is the one relationship that has ever existed. Deleting
+        `target_id=<job id>`, so joining on that pair is not a guess at an
+        implied schema. `record_search` is the one writer that does NOT --
+        it writes `target_type='search'` with no job behind it, which is
+        exactly why the filter below is on the pair and not on job id
+        alone, and why searches need their own retention tier
+        (`_sweep_searches`) rather than riding along here. Deleting
         both tables' rows inside one `BEGIN IMMEDIATE` transaction is what
         "in lockstep" means in practice: a crash between the two statements
         must never leave an audit row pointing at a job that no longer
@@ -860,6 +907,33 @@ class Database:
             total += len(batch)
         return total
 
+    @staticmethod
+    def _sweep_searches(conn: sqlite3.Connection, cutoff: str, batch_size: int) -> int:
+        """Delete search audit rows past their window.
+
+        Its own method, and its own tier, because no job deletion can ever
+        reach these: `_delete_jobs_batch` filters on `target_type = 'job'`.
+        Batched like every other tier so one sweep cannot hold the write
+        lock against the worker's claim/heartbeat loop.
+        """
+        removed = 0
+        while True:
+            cur = conn.execute(
+                """
+                DELETE FROM audit_events
+                WHERE id IN (
+                    SELECT id FROM audit_events
+                    WHERE target_type = 'search' AND created_at < ?
+                    LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            )
+            conn.commit()
+            if not cur.rowcount:
+                return removed
+            removed += cur.rowcount
+
     def sweep_job_retention(
         self,
         *,
@@ -867,6 +941,7 @@ class Database:
         reconcile_claimed_or_failed_retention_seconds: float = RECONCILE_CLAIMED_OR_FAILED_RETENTION_SECONDS,
         pipeline_retention_seconds: float = PIPELINE_RETENTION_SECONDS,
         pipeline_failed_retention_seconds: float = PIPELINE_FAILED_RETENTION_SECONDS,
+        search_retention_seconds: float = SEARCH_RETENTION_SECONDS,
         batch_size: int = RETENTION_BATCH_SIZE,
         scan_limit: int = RECONCILE_EMPTY_SCAN_LIMIT,
     ) -> dict[str, int]:
@@ -899,6 +974,7 @@ class Database:
             "reconcile_claimed_or_failed": 0,
             "pipeline": 0,
             "pipeline_failed": 0,
+            "searches": 0,
         }
         with closing(self.connect()) as conn:
             deleted["reconcile_empty"] = self._sweep_empty_reconciles(
@@ -930,5 +1006,8 @@ class Database:
                 "AND COALESCE(finished_at, created_at) < ?",
                 (cutoff(pipeline_failed_retention_seconds),),
                 batch_size,
+            )
+            deleted["searches"] = self._sweep_searches(
+                conn, cutoff(search_retention_seconds), batch_size
             )
         return deleted

@@ -7,6 +7,7 @@ has been staged on Freddy.
 
 from __future__ import annotations
 
+import logging
 import secrets
 import threading
 import time
@@ -84,6 +85,9 @@ def _job_response(job: Job) -> dict[str, Any]:
         "result": job.result,
         "cancel_requested": job.cancel_requested,
     }
+
+
+logger = logging.getLogger("shelfmark.api")
 
 
 def _actor(request: Request) -> str:
@@ -339,6 +343,21 @@ def _action_actor(actor: str = Depends(_actor)) -> str:
     return actor
 
 
+def _record_search(actor: str, kind: str, query: str, results: int) -> None:
+    """Log a search, and never let logging it break the search.
+
+    Every route below has already done the expensive, user-visible part by
+    the time this runs -- the Prowlarr call, the Audiobookshelf call, the
+    directory walk. Turning a successful answer into a 500 because a SQLite
+    write failed would trade the thing the user asked for against a record
+    of having asked, which is the wrong way round.
+    """
+    try:
+        database.record_search(actor=actor, kind=kind, query=query, results=results)
+    except Exception as exc:  # noqa: BLE001 - deliberately swallowing
+        logger.warning("could not record %s search by %s: %s", kind, actor, exc)
+
+
 def _abs_client() -> AudiobookshelfClient:
     if not all(
         (
@@ -499,12 +518,12 @@ def library_search(
             entries = payload.get("results", []) if isinstance(payload, dict) else []
     except ServiceError as exc:
         raise _upstream_error(exc) from exc
-    return {
-        "results": [
-            entry.get("libraryItem", entry) if isinstance(entry, dict) else entry
-            for entry in entries
-        ]
-    }
+    results = [
+        entry.get("libraryItem", entry) if isinstance(entry, dict) else entry
+        for entry in entries
+    ]
+    _record_search(_actor, "audiobook", q, len(results))
+    return {"results": results}
 
 
 @app.get("/api/v1/items/{item_id}")
@@ -615,13 +634,32 @@ def release_search(
         elif book_only:
             categories = list(settings.prowlarr_book_categories)
     try:
-        return {
-            "results": _prowlarr_client().search(
-                q, search_type=search_type, categories=categories, limit=limit, offset=offset
-            )
-        }
+        results = _prowlarr_client().search(
+            q, search_type=search_type, categories=categories, limit=limit, offset=offset
+        )
     except ServiceError as exc:
         raise _upstream_error(exc) from exc
+    # The costly one: every call here is a live query against the private
+    # tracker. `media_type` is in the action so the log says which bucket was
+    # asked for, not just that something was.
+    # Mirrors the category branch above, deliberately spelled out: written
+    # as `media_type or "book" if book_only else "any"` Python binds it as
+    # `(media_type or "book") if book_only else "any"`, which labels an
+    # explicit media_type as "any" whenever book_only is false -- the exact
+    # precedence that media_type is supposed to win.
+    if media_type:
+        scope = media_type
+    elif book_only:
+        scope = "book"
+    else:
+        scope = "any"
+    _record_search(
+        _actor,
+        f"release.{scope}",
+        q,
+        len(results) if isinstance(results, list) else 0,
+    )
+    return {"results": results}
 
 
 @app.get("/api/v1/ebooks/search")
@@ -642,19 +680,19 @@ def ebook_search(
     that happens to be in a title.
     """
     root = _ebook_root()
-    return {
-        "results": [
-            {
-                "id": book.id,
-                "title": book.title,
-                "author": book.author,
-                "relpath": book.relpath,
-                "size": book.size,
-                "ext": book.ext,
-            }
-            for book in list_ebooks(root, q, limit)
-        ]
-    }
+    results = [
+        {
+            "id": book.id,
+            "title": book.title,
+            "author": book.author,
+            "relpath": book.relpath,
+            "size": book.size,
+            "ext": book.ext,
+        }
+        for book in list_ebooks(root, q, limit)
+    ]
+    _record_search(_actor, "ebook", q, len(results))
+    return {"results": results}
 
 
 @app.get("/api/v1/ebooks/{ebook_id}/download")
