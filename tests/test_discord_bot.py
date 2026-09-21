@@ -8,11 +8,15 @@ from discord.ext import commands
 
 from src.shelfmark_service.clients import ServiceError
 from src.shelfmark_service.discord_bot import (
+    _result_list,
     _LISTING_PAGE_SIZE,
     _PAGE_SIZE,
+    CancelView,
     EbookView,
     ShelfmarkApi,
     _PagedView,
+    _cancel_outcome_message,
+    _cancellable,
     _clamp_page,
     _ebook_label,
     _has_next_page,
@@ -509,6 +513,71 @@ class RateLimitMessageTests(unittest.TestCase):
         self.assertEqual(message, "You have run too many grabs. Try again in 5 seconds.")
 
 
+class CancellableTests(unittest.TestCase):
+    """`Database.cancel` does NOT refuse a finished job — it records the
+    request and hands back the row untouched. So a Cancel button offered
+    beside a succeeded job would appear to work and change nothing; they
+    have to be filtered out before they are ever shown."""
+
+    JOBS = [
+        {"id": "a", "kind": "grab_release", "status": "queued"},
+        {"id": "b", "kind": "organize_apply", "status": "running"},
+        {"id": "c", "kind": "grab_release", "status": "succeeded"},
+        {"id": "d", "kind": "library_scan", "status": "failed"},
+        {"id": "e", "kind": "grab_release", "status": "cancelled"},
+    ]
+
+    def test_only_queued_and_running_are_offered(self) -> None:
+        self.assertEqual([j["id"] for j in _cancellable(self.JOBS)], ["a", "b"])
+
+    def test_order_is_preserved(self) -> None:
+        """The API returns newest first; re-sorting would put the job someone
+        just queued somewhere other than the top of the list."""
+        reversed_jobs = list(reversed(self.JOBS))
+        self.assertEqual([j["id"] for j in _cancellable(reversed_jobs)], ["b", "a"])
+
+    def test_junk_entries_do_not_crash_the_picker(self) -> None:
+        self.assertEqual(_cancellable(["nope", None, {}, {"status": "queued"}]),
+                         [{"status": "queued"}])
+
+    def test_the_bot_can_read_the_real_jobs_payload(self) -> None:
+        """Crosses the API/bot seam deliberately. `_result_list` looks for a
+        list under a fixed set of keys, and "jobs" was not one of them — the
+        same omission that made /library type:audiobook report nothing found
+        for every query for weeks. Asserting `_cancellable` alone would pass
+        against a hand-built list and still ship a dead command."""
+        payload = {"jobs": self.JOBS}
+        self.assertEqual([j["id"] for j in _cancellable(_result_list(payload))], ["a", "b"])
+
+
+class CancelOutcomeMessageTests(unittest.TestCase):
+    """One 200 response covers three different outcomes, and calling them
+    all "cancelled" would be wrong twice."""
+
+    def test_a_queued_job_is_stopped_outright(self) -> None:
+        msg = _cancel_outcome_message({"id": "abc123", "status": "cancelled"}, "abc123")
+        self.assertIn("Cancelled", msg)
+        self.assertIn("had not started", msg)
+
+    def test_a_running_job_is_only_asked_to_stop(self) -> None:
+        """It is still running when we reply. Saying "cancelled" sends people
+        looking for why the download is still moving."""
+        msg = _cancel_outcome_message({"id": "abc123", "status": "running"}, "abc123")
+        self.assertNotIn("Cancelled", msg)
+        self.assertIn("still finishing", msg)
+
+    def test_an_already_finished_job_says_so(self) -> None:
+        for status in ("succeeded", "failed"):
+            with self.subTest(status=status):
+                msg = _cancel_outcome_message({"id": "x", "status": status}, "x")
+                self.assertIn("nothing to cancel", msg)
+                self.assertIn(status, msg)
+
+    def test_an_unexpected_status_is_reported_rather_than_guessed(self) -> None:
+        msg = _cancel_outcome_message({"id": "x", "status": "weird"}, "x")
+        self.assertIn("weird", msg)
+
+
 class CommandRegistrationTests(unittest.IsolatedAsyncioTestCase):
     """Build the real command tree. Discord rejects a command whose required
     options do not all precede its optional ones, and that rejection happens
@@ -540,6 +609,17 @@ class CommandRegistrationTests(unittest.IsolatedAsyncioTestCase):
             [("type", True), ("query", True)],
         )
 
+    async def test_cancel_takes_an_optional_job_id(self) -> None:
+        """Optional so the picker is reachable. The id only ever appears in
+        an ephemeral reply, and the case this exists for is a mis-pressed
+        Grab where the useful window is seconds."""
+        tree = self._tree()
+        options = tree.get_command("cancel").to_dict(tree)["options"]
+        self.assertEqual(
+            [(o["name"], o.get("required", False)) for o in options],
+            [("job_id", False)],
+        )
+
     async def test_every_command_serializes(self) -> None:
         tree = self._tree()
         names = set()
@@ -548,6 +628,7 @@ class CommandRegistrationTests(unittest.IsolatedAsyncioTestCase):
             names.add(command.name)
         self.assertIn("library", names)
         self.assertIn("request", names)
+        self.assertIn("cancel", names)
 
 
 class PagedViewPageSizeTests(unittest.IsolatedAsyncioTestCase):
