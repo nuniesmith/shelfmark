@@ -725,6 +725,46 @@ class LibrarySearchShapeTests(unittest.TestCase):
         self.assertEqual(api_module.library_search(q="x", limit=25, _actor="local")["results"], [])
 
 
+class BrowseLimitFitsEveryRouteTests(unittest.TestCase):
+    """The bot asks for `_BROWSE_LIMIT` results on a browse. A route whose
+    own ceiling sits below that does not trim the request — FastAPI rejects
+    it with a 422, and the command dies outright. The two numbers live in
+    different files and moved independently once already: raising the
+    browse limit to 500 left the ebook route capped at 200.
+    """
+
+    @staticmethod
+    def _ceiling(route) -> int:
+        """The `le=` a route declares on its `limit`, read off the real
+        route object rather than restated here — restating it is what let
+        the two numbers drift in the first place. FastAPI keeps the bound
+        in `Query.metadata` as an annotated-types `Le`, not as an
+        attribute."""
+        for parameter in inspect.signature(route).parameters.values():
+            if parameter.name != "limit":
+                continue
+            for constraint in parameter.default.metadata:
+                if hasattr(constraint, "le"):
+                    return constraint.le
+            raise AssertionError(f"{route.__name__}'s limit declares no upper bound")
+        raise AssertionError(f"{route.__name__} has no limit parameter")
+
+    def test_every_browsed_route_accepts_the_browse_limit(self) -> None:
+        from src.shelfmark_service.discord_bot import _BROWSE_LIMIT
+
+        for route in (api_module.library_search, api_module.ebook_search):
+            with self.subTest(route=route.__name__):
+                self.assertGreaterEqual(self._ceiling(route), _BROWSE_LIMIT)
+
+    def test_the_browse_limit_clears_the_library_as_it_stands(self) -> None:
+        """190 audiobooks on the day browsing shipped. A limit below that
+        shows part of the shelf and says nothing about the rest — which is
+        the exact failure browsing exists to remove."""
+        from src.shelfmark_service.discord_bot import _BROWSE_LIMIT
+
+        self.assertGreater(_BROWSE_LIMIT, 190)
+
+
 class EbookBrowseTests(unittest.TestCase):
     """`/library type:ebook` with no query has to list the shelf. The route
     used to declare `q` with `min_length=1`, so the only way to find out what

@@ -428,10 +428,13 @@ def _library_label(item: dict[str, Any]) -> str:
 # directly, without a Discord interaction object graph (the same reason
 # is_permitted and _job_status_message are split out above).
 # How many results to fetch when BROWSING (no query) rather than
-# searching. Higher than the search limit because a browse has nothing to
-# narrow it: the whole point is seeing the shelf. Both endpoints cap at
-# 200/100 respectively, so this asks for as much as either will give.
-_BROWSE_LIMIT = 100
+# searching. A browse has nothing to narrow it — the whole point is seeing
+# the shelf — so this has to clear the WHOLE library or it truncates it
+# with nothing on screen to say so. The first version shipped at 100
+# against a library of 190 and showed a little over half of it, which is
+# the failure mode a browse exists to remove. 500 is chosen to outlive a
+# good deal of growth; both endpoints now cap above it.
+_BROWSE_LIMIT = 500
 
 
 def _library_query(kind: str, query: str) -> tuple[str, dict[str, Any]]:
