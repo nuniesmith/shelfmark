@@ -337,6 +337,61 @@ class ShelfmarkApi:
         return data, filename
 
 
+ACTIVE_JOB_STATUSES = frozenset({"queued", "running"})
+
+
+def _cancellable(jobs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The jobs `/cancel` may act on, newest first as the API returned them.
+
+    Terminal jobs are filtered out here rather than offered and refused on
+    press. `Database.cancel` does NOT reject a finished job — it records the
+    request and returns the row untouched — so a Cancel button beside a
+    succeeded job would appear to work and change nothing.
+    """
+    return [
+        job
+        for job in jobs
+        if isinstance(job, dict) and str(job.get("status") or "") in ACTIVE_JOB_STATUSES
+    ]
+
+
+def _job_label(job: dict[str, Any]) -> str:
+    kind = str(job.get("kind") or "job")
+    status = str(job.get("status") or "unknown")
+    job_id = str(job.get("id") or "")
+    return f"`{status}` **{kind}** — `{job_id[:8]}`"
+
+
+def _cancel_outcome_message(payload: dict[str, Any], job_id: str) -> str:
+    """What actually happened, which is not always "cancelled".
+
+    Three different outcomes reach this from one 200 response, and saying
+    "cancelled" for all of them would be wrong twice:
+
+    * `queued` -> `cancelled` immediately. It never ran.
+    * `running` -> only `cancel_requested` is set; the worker stops when it
+      next checks. The job is still running at the moment we reply, and
+      telling someone it is cancelled invites them to go looking for why the
+      download is still moving.
+    * already terminal -> nothing changed at all. `Database.cancel` writes
+      the audit row and returns the row untouched, so the API still answers
+      200 with a succeeded job. `_cancellable` keeps these out of the picker,
+      but a hand-typed id can still land here.
+    """
+    status = str(payload.get("status") or "unknown")
+    short = str(payload.get("id") or job_id)
+    if status == "cancelled":
+        return f"Cancelled **{short}**. It had not started yet."
+    if status == "running":
+        return (
+            f"Asked the worker to stop **{short}**. It is still finishing the "
+            "step it is on — check `/job` in a moment."
+        )
+    if status in {"succeeded", "failed"}:
+        return f"**{short}** already {status} — there was nothing to cancel."
+    return f"**{short}** is now `{status}`."
+
+
 def _actor(interaction: discord.Interaction) -> str:
     user_id = getattr(interaction.user, "id", "unknown")
     guild_id = interaction.guild_id or "dm"
@@ -349,7 +404,12 @@ def _result_list(payload: Any) -> list[dict[str, Any]]:
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
         return []
-    for key in ("results", "book", "podcast", "items", "downloads"):
+    # "jobs" is GET /api/v1/jobs. Its absence here is what made
+    # /library type:audiobook answer "nothing found" for every query for
+    # weeks: the route returned a shape this function could not see, and
+    # each half looked correct on its own. /cancel reads the job list the
+    # same way, so it would have reported "nothing is running" forever.
+    for key in ("results", "book", "podcast", "items", "downloads", "jobs"):
         value = payload.get(key)
         if isinstance(value, list):
             # Audiobookshelf search wraps each result in a libraryItem object.
@@ -886,6 +946,99 @@ class EbookView(_PagedView):
         return callback
 
 
+class CancelView(_PagedView):
+    """Cancel buttons over the jobs that can still be cancelled.
+
+    Exists because the alternative is typing a UUID. The job id only ever
+    appears in an EPHEMERAL reply, which the person who needs it has very
+    likely already dismissed — and the case this command is for is a mis-
+    pressed Grab on a 26 GB release, where the useful window is seconds.
+
+    Same shape as ReleaseView/EbookView: five per page, resolved against the
+    CURRENT page so a Next press cannot leave a button pointing at the row it
+    used to sit beside.
+    """
+
+    page_size: int = _PAGE_SIZE
+
+    def __init__(
+        self,
+        api: ShelfmarkApi,
+        jobs: list[dict[str, Any]],
+        actor: str,
+        guard: Callable[[discord.Interaction], Awaitable[bool]],
+        title: str,
+    ):
+        super().__init__(jobs, title, _job_label, guard)
+        self.api = api
+        self.jobs = jobs
+        self.actor = actor
+        self._action_buttons: list[discord.ui.Button] = []
+        for local_index in range(self.page_size):
+            button = discord.ui.Button(
+                style=discord.ButtonStyle.danger,
+                custom_id=f"shelfmark:job-cancel:{local_index}",
+                row=0,
+            )
+            button.callback = self._make_callback(local_index)  # type: ignore[method-assign]
+            self._action_buttons.append(button)
+            self.add_item(button)
+        self._sync_action_buttons()
+
+    def _sync_action_buttons(self) -> None:
+        for local_index, button in enumerate(self._action_buttons):
+            job = _resolve_page_item(self.jobs, self.page, local_index)
+            if job is None:
+                button.label = "—"
+                button.disabled = True
+            else:
+                absolute_number = self.page * self.page_size + local_index + 1
+                button.label = f"Cancel {absolute_number}"
+                button.disabled = False
+
+    def _make_callback(self, local_index: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.response.is_done():
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            job = _resolve_page_item(self.jobs, self.page, local_index)
+            if job is None:
+                await interaction.followup.send(
+                    "That slot is empty on this page.", ephemeral=True
+                )
+                return
+            job_id = str(job.get("id") or "")
+            try:
+                payload = await self.api.post(
+                    f"/api/v1/jobs/{urllib.parse.quote(job_id, safe='')}/cancel",
+                    json_body={},
+                    actor=self.actor,
+                )
+            except ServiceError as exc:
+                if exc.status == 429:
+                    await interaction.followup.send(
+                        _rate_limit_message("cancellations", exc), ephemeral=True
+                    )
+                    return
+                if exc.status == 404:
+                    # Retention can remove a finished job between the list and
+                    # the press; that is not an error worth a stack trace.
+                    await interaction.followup.send(
+                        f"**{job_id[:8]}** is no longer on the server.", ephemeral=True
+                    )
+                    return
+                await interaction.followup.send(
+                    "That job could not be cancelled.", ephemeral=True
+                )
+                return
+            await interaction.followup.send(
+                _cancel_outcome_message(payload if isinstance(payload, dict) else {}, job_id),
+                ephemeral=True,
+            )
+
+        return callback
+
+
 def is_permitted(member_role_ids: Iterable[int], allowed_roles: Collection[int]) -> bool:
     """Decide access from role IDs alone.
 
@@ -1108,6 +1261,73 @@ def install_commands(
                 await interaction.followup.send(_rate_limit_message("job checks", exc), ephemeral=True)
                 return
             await interaction.followup.send("That job could not be loaded.", ephemeral=True)
+
+    @bot.tree.command(name="cancel", description="Stop a Shelfmark job that is queued or running")
+    @app_commands.describe(job_id="Job ID — leave empty to pick from what is running")
+    async def cancel(interaction: discord.Interaction, job_id: str = "") -> None:
+        # `job_id` is optional for the same reason `/library`'s query is: the
+        # id only ever appeared in an ephemeral reply, and the case this
+        # command exists for is a mis-pressed Grab on a very large release,
+        # where the useful window is seconds rather than however long it
+        # takes to find a UUID.
+        if not await guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        actor = _actor(interaction)
+        job_id = job_id.strip()
+
+        if job_id:
+            try:
+                payload = await api.post(
+                    f"/api/v1/jobs/{urllib.parse.quote(job_id, safe='')}/cancel",
+                    json_body={},
+                    actor=actor,
+                )
+            except ServiceError as exc:
+                if exc.status == 429:
+                    await interaction.followup.send(
+                        _rate_limit_message("cancellations", exc), ephemeral=True
+                    )
+                    return
+                if exc.status == 404:
+                    await interaction.followup.send(
+                        f"No job **{job_id}** on the server.", ephemeral=True
+                    )
+                    return
+                await interaction.followup.send(
+                    "That job could not be cancelled.", ephemeral=True
+                )
+                return
+            await interaction.followup.send(
+                _cancel_outcome_message(payload if isinstance(payload, dict) else {}, job_id),
+                ephemeral=True,
+            )
+            return
+
+        try:
+            payload = await api.get(
+                "/api/v1/jobs", params={"limit": 50}, actor=actor
+            )
+        except ServiceError as exc:
+            if exc.status == 429:
+                await interaction.followup.send(
+                    _rate_limit_message("job checks", exc), ephemeral=True
+                )
+                return
+            await interaction.followup.send("The job list is unavailable.", ephemeral=True)
+            return
+
+        jobs = _cancellable(_result_list(payload))
+        if not jobs:
+            await interaction.followup.send(
+                "Nothing is queued or running right now.", ephemeral=True
+            )
+            return
+        view = CancelView(api, jobs, actor, guard, "Jobs you can cancel")
+        sent = await interaction.followup.send(
+            embed=view.render_embed(), view=view, ephemeral=True
+        )
+        view.message = sent
 
     @bot.tree.command(name="metadata-match", description="Queue an Audiobookshelf metadata match")
     @app_commands.describe(item_id="Audiobookshelf library item ID", title="Optional title hint", author="Optional author hint")
