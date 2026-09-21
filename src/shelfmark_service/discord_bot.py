@@ -539,31 +539,125 @@ def _request_query(kind: str, query: str) -> tuple[str, dict[str, Any]]:
     return "/api/v1/releases/search", {"q": query, "media_type": kind, "limit": 50}
 
 
+def _grab_outcome_message(payload: dict[str, Any], job_id: str) -> str:
+    """What the grab actually did, in a sentence.
+
+    This used to be "Queued release <uuid>" in every case, which is the same
+    thing it said when the download started, when qBittorrent silently
+    ignored a release already in the client, and when the link was dead.
+    A real report of that ("I don't think it's working") was a DUPLICATE:
+    the book had been grabbed five days earlier and was already on the
+    shelf, and nothing anywhere said so.
+
+    The job id is still offered, but last and only where it is useful --
+    a UUID is not an answer to "did that work?".
+    """
+    state = str(payload.get("state") or "")
+    name = str(payload.get("name") or "that release")
+    if state == "duplicate":
+        return (
+            f"**{name}** is already on the server — it was downloaded before, "
+            "so there is nothing new to fetch. Try `/library` to read it."
+        )
+    if state == "rejected":
+        return (
+            f"qBittorrent would not accept **{name}**. Nothing is downloading. "
+            "This usually means the tracker refused the link."
+        )
+    if state == "bad_link":
+        return (
+            f"The download link for **{name}** did not return a torrent — it has "
+            "probably expired. Run the search again to get a fresh one."
+        )
+    if state == "added":
+        return (
+            f"Downloading **{name}**. `/downloads` for progress; it will appear "
+            "in the library on its own when it lands."
+        )
+    # state == "unknown", or an older job queued before this existed.
+    job = payload.get("id", job_id)
+    return (
+        f"Queued **{name}**, but nothing new appeared in the download client "
+        f"and the reason could not be determined. Check `/downloads`, or "
+        f"`/job {job}`."
+    )
+
+
+async def _await_job(
+    api: "ShelfmarkApi",
+    job_id: str,
+    actor: str,
+    *,
+    attempts: int = 8,
+    delay: float = 1.0,
+) -> dict[str, Any] | None:
+    """Poll a job until it finishes, or give up and return None.
+
+    A grab job completes in about a second, so this almost always returns on
+    the first or second look. The cap exists so a stuck worker degrades to
+    "still working, check /job" instead of holding the interaction open.
+
+    Deliberately short and few: every poll is a rate-limited read, and the
+    point is to answer a person waiting on a button press, not to follow the
+    job to the end of the pipeline.
+    """
+    for attempt in range(attempts):
+        if attempt:
+            await asyncio.sleep(delay)
+        try:
+            payload = await api.get(f"/api/v1/jobs/{urllib.parse.quote(job_id, safe='')}", actor=actor)
+        except ServiceError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("status") in {"succeeded", "failed", "cancelled"}:
+            return payload
+    return None
+
+
 async def _queue_grab(api: ShelfmarkApi, release: dict[str, Any], interaction: discord.Interaction) -> None:
-    """POST the grab and report the queued job id.
+    """Queue the grab, wait for it, and say what actually happened.
 
     Shared by ReleaseView's immediate Grab press and _ConfirmGrabView's
     confirmed one -- the only difference between the two paths is whether a
-    size-confirmation round trip happened first. The payload and endpoint are
-    identical either way.
+    size-confirmation round trip happened first.
+
+    It waits because the grab is a JOB: the id comes back before any work is
+    done. Replying with that id was the whole defect -- "Queued release
+    <uuid>" reads identically whether the book is downloading, was already on
+    the shelf, or was refused outright.
     """
     await interaction.response.defer(ephemeral=True, thinking=True)
+    actor = _actor(interaction)
     try:
         result = await api.post(
-            "/api/v1/releases/grab",
-            json_body={"release": release},
-            actor=_actor(interaction),
-        )
-        job_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
-        await interaction.followup.send(
-            f"Queued release **{job_id}**. Use `/job {job_id}` for status.",
-            ephemeral=True,
+            "/api/v1/releases/grab", json_body={"release": release}, actor=actor
         )
     except ServiceError as exc:
         if exc.status == 429:
             await interaction.followup.send(_rate_limit_message("grabs", exc), ephemeral=True)
             return
-        await interaction.followup.send("The Shelfmark API could not queue that release.", ephemeral=True)
+        await interaction.followup.send(
+            "The Shelfmark API could not queue that release.", ephemeral=True
+        )
+        return
+
+    job_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
+    finished = await _await_job(api, job_id, actor)
+    if finished is None:
+        await interaction.followup.send(
+            f"Queued **{job_id}** — still working. `/job {job_id}` for status.",
+            ephemeral=True,
+        )
+        return
+    if finished.get("status") != "succeeded":
+        await interaction.followup.send(_job_status_message(finished, job_id), ephemeral=True)
+        return
+    outcome = finished.get("result")
+    await interaction.followup.send(
+        _grab_outcome_message(outcome if isinstance(outcome, dict) else {}, job_id),
+        ephemeral=True,
+    )
 
 
 class _ConfirmGrabView(discord.ui.View):

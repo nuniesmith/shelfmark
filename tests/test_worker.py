@@ -248,16 +248,22 @@ class GrabReleaseErrorCodeTests(WorkerTestCase):
             qbittorrent_category="a-custom-category",
         )
         job = self.make_job("grab_release", {"release": self._release()})
+        # `torrents` is polled either side of the add to see whether
+        # anything actually appeared -- qBittorrent's own reply cannot say.
         with mock.patch(
             "src.shelfmark_service.worker.QBittorrentClient.login", return_value="api-key"
         ), mock.patch(
             "src.shelfmark_service.worker.QBittorrentClient.add_urls", return_value="Ok."
-        ) as add_urls:
+        ) as add_urls, mock.patch(
+            "src.shelfmark_service.worker.QBittorrentClient.torrents",
+            side_effect=[[], [{"hash": "abc", "name": "A Book"}]],
+        ):
             result = worker.execute(job)
         add_urls.assert_called_once_with(
             ["http://prowlarr:9696/1/download?apikey=k&link=x"], category="a-custom-category"
         )
         self.assertTrue(result["submitted"])
+        self.assertEqual(result["state"], "added")
 
     def test_upstream_failure_reports_upstream_unavailable_without_leaking_the_apikey(self) -> None:
         worker = self.make_worker(qbittorrent_url="http://qbit.internal", qbittorrent_api_key="k")
@@ -1153,3 +1159,100 @@ class OrganizeLeavesNoEmptyDirsTests(unittest.TestCase):
         self._run()
         found = sorted(str(p.relative_to(self.library)) for p in self.library.rglob("*.epub"))
         self.assertEqual(found, ["Frank Herbert/1965 - Dune/Dune.epub"])
+
+
+class TorrentMetaTests(unittest.TestCase):
+    """The infohash is the ONLY identity qBittorrent dedupes on, so telling
+    "already have it" from "refused" depends entirely on computing it."""
+
+    @staticmethod
+    def _bencode(value):
+        """Build fixtures programmatically. Hand-written bencode gets its
+        length prefixes wrong -- the first version of this test declared
+        `20:http://tracker/announce`, which is 23 characters, and failed for
+        a reason that had nothing to do with the code under test."""
+        if isinstance(value, dict):
+            body = b"".join(
+                TorrentMetaTests._bencode(k) + TorrentMetaTests._bencode(v)
+                for k, v in sorted(value.items())
+            )
+            return b"d" + body + b"e"
+        if isinstance(value, int):
+            return b"i" + str(value).encode() + b"e"
+        return str(len(value)).encode() + b":" + value
+
+    def _torrent(self, name=b"Dune.epub", length=1024):
+        return self._bencode(
+            {
+                b"announce": b"http://tracker/announce",
+                b"info": {b"name": name, b"length": length, b"piece length": 16384},
+            }
+        )
+
+    def test_a_real_torrent_yields_a_hash_and_a_name(self) -> None:
+        from src.shelfmark_service.torrentmeta import parse
+
+        infohash, name = parse(self._torrent())
+        self.assertEqual(len(infohash), 40)
+        self.assertEqual(name, "Dune.epub")
+
+    def test_the_hash_covers_only_the_info_dict(self) -> None:
+        """Two torrents differing ONLY outside `info` are the same torrent,
+        which is exactly why a re-grab from a different tracker page still
+        dedupes against what is already in the client."""
+        from src.shelfmark_service.torrentmeta import parse
+
+        a = self._bencode({b"announce": b"http://one/", b"info": {b"name": b"x", b"length": 5}})
+        b = self._bencode({b"announce": b"http://two/", b"info": {b"name": b"x", b"length": 5}})
+        self.assertNotEqual(a, b)
+        self.assertEqual(parse(a)[0], parse(b)[0])
+
+    def test_keys_are_canonicalised_before_hashing(self) -> None:
+        """bencode REQUIRES sorted keys, and every client hashed the sorted
+        form. A file whose keys arrive out of order must still produce the
+        same infohash, or a re-grab would look like a different torrent and
+        the duplicate check would silently stop working.
+
+        The fixtures elsewhere in this class are built sorted, so they cannot
+        catch an encoder that merely echoes insertion order — this one is
+        deliberately built the other way round.
+        """
+        from src.shelfmark_service.torrentmeta import parse
+
+        sorted_info = {b"length": 5, b"name": b"x"}
+        raw_unsorted = b"d4:infod4:name1:x6:lengthi5eee"  # name BEFORE length
+        raw_sorted = self._bencode({b"info": sorted_info})
+        self.assertNotEqual(raw_unsorted, raw_sorted, "fixtures must differ on the wire")
+        self.assertEqual(
+            parse(raw_unsorted)[0],
+            parse(raw_sorted)[0],
+            "an unsorted file must hash to the same infohash",
+        )
+
+    def test_a_different_info_gives_a_different_hash(self) -> None:
+        from src.shelfmark_service.torrentmeta import parse
+
+        self.assertNotEqual(
+            parse(self._torrent(name=b"a.epub"))[0],
+            parse(self._torrent(name=b"b.epub"))[0],
+        )
+
+    def test_an_html_error_page_is_refused_not_hashed(self) -> None:
+        """Trackers answer a rate-limit or an expired link with HTML and
+        HTTP 200, so "it downloaded" is not "it is a torrent"."""
+        from src.shelfmark_service.torrentmeta import InvalidTorrent, parse
+
+        with self.assertRaises(InvalidTorrent):
+            parse(b"<html><body>Rate limited</body></html>")
+
+    def test_empty_bytes_are_refused(self) -> None:
+        from src.shelfmark_service.torrentmeta import InvalidTorrent, parse
+
+        with self.assertRaises(InvalidTorrent):
+            parse(b"")
+
+    def test_bencode_without_an_info_dict_is_refused(self) -> None:
+        from src.shelfmark_service.torrentmeta import InvalidTorrent, parse
+
+        with self.assertRaises(InvalidTorrent):
+            parse(self._bencode({b"announce": b"http://x/"}))
