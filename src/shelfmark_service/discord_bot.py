@@ -1247,20 +1247,59 @@ def install_commands(
                 return
             await interaction.followup.send("qBittorrent download status is unavailable.", ephemeral=True)
 
-    @bot.tree.command(name="job", description="Show a Shelfmark job")
-    @app_commands.describe(job_id="UUID returned when the job was queued")
-    async def job_status(interaction: discord.Interaction, job_id: str) -> None:
+    @bot.tree.command(name="job", description="Show recent Shelfmark jobs, or one by ID")
+    @app_commands.describe(job_id="Job ID — leave empty to list what has run recently")
+    async def job_status(interaction: discord.Interaction, job_id: str = "") -> None:
+        # Optional for the same reason /cancel's is: the id only ever appears
+        # in an ephemeral reply, so requiring it meant the command could only
+        # be used by someone who still had that message open.
         if not await guard(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            payload = await api.get(f"/api/v1/jobs/{job_id}", actor=_actor(interaction))
+        actor = _actor(interaction)
+        job_id = job_id.strip()
+
+        if job_id:
+            try:
+                payload = await api.get(
+                    f"/api/v1/jobs/{urllib.parse.quote(job_id, safe='')}", actor=actor
+                )
+            except ServiceError as exc:
+                if exc.status == 429:
+                    await interaction.followup.send(
+                        _rate_limit_message("job checks", exc), ephemeral=True
+                    )
+                    return
+                if exc.status == 404:
+                    await interaction.followup.send(
+                        f"No job **{job_id}** on the server.", ephemeral=True
+                    )
+                    return
+                await interaction.followup.send("That job could not be loaded.", ephemeral=True)
+                return
             await interaction.followup.send(_job_status_message(payload, job_id), ephemeral=True)
+            return
+
+        try:
+            payload = await api.get("/api/v1/jobs", params={"limit": 50}, actor=actor)
         except ServiceError as exc:
             if exc.status == 429:
-                await interaction.followup.send(_rate_limit_message("job checks", exc), ephemeral=True)
+                await interaction.followup.send(
+                    _rate_limit_message("job checks", exc), ephemeral=True
+                )
                 return
-            await interaction.followup.send("That job could not be loaded.", ephemeral=True)
+            await interaction.followup.send("The job list is unavailable.", ephemeral=True)
+            return
+
+        jobs = _result_list(payload)
+        if not jobs:
+            await interaction.followup.send("No jobs have run recently.", ephemeral=True)
+            return
+        view = _PagedView(jobs, "Recent Shelfmark jobs", _job_label, guard)
+        sent = await interaction.followup.send(
+            embed=view.render_embed(), view=view, ephemeral=True
+        )
+        view.message = sent
 
     @bot.tree.command(name="cancel", description="Stop a Shelfmark job that is queued or running")
     @app_commands.describe(job_id="Job ID — leave empty to pick from what is running")
@@ -1329,44 +1368,18 @@ def install_commands(
         )
         view.message = sent
 
-    @bot.tree.command(name="metadata-match", description="Queue an Audiobookshelf metadata match")
-    @app_commands.describe(item_id="Audiobookshelf library item ID", title="Optional title hint", author="Optional author hint")
-    async def metadata_match(interaction: discord.Interaction, item_id: str, title: str | None = None, author: str | None = None) -> None:
-        if not await guard(interaction):
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        payload: dict[str, Any] = {}
-        if title:
-            payload["title"] = title
-        if author:
-            payload["author"] = author
-        try:
-            result = await api.post(
-                f"/api/v1/items/{item_id}/match",
-                json_body=payload,
-                actor=_actor(interaction),
-            )
-            await interaction.followup.send(
-                f"Queued metadata match job **{result.get('id', 'unknown')}**.",
-                ephemeral=True,
-            )
-        except ServiceError as exc:
-            if exc.status == 429:
-                await interaction.followup.send(
-                    _rate_limit_message("metadata match requests", exc), ephemeral=True
-                )
-                return
-            await interaction.followup.send("The metadata match job could not be queued.", ephemeral=True)
-
-    @bot.tree.command(name="scan", description="Queue an Audiobookshelf library scan")
-    @app_commands.describe(library_id="Audiobookshelf library ID", force="Force a full rescan")
-    async def scan(interaction: discord.Interaction, library_id: str, force: bool = False) -> None:
+    @bot.tree.command(name="scan", description="Ask Audiobookshelf to re-scan the library")
+    @app_commands.describe(force="Re-read every book instead of just what changed")
+    async def scan(interaction: discord.Interaction, force: bool = False) -> None:
+        # No library argument. There is one Audiobookshelf library here and
+        # the API already knows its id, so asking a human to paste a UUID to
+        # name the only possible target was friction with nothing behind it.
         if not await guard(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             result = await api.post(
-                f"/api/v1/libraries/{library_id}/scan",
+                "/api/v1/libraries/scan",
                 json_body={"force": force},
                 actor=_actor(interaction),
             )
@@ -1379,34 +1392,6 @@ def install_commands(
                 await interaction.followup.send(_rate_limit_message("library scans", exc), ephemeral=True)
                 return
             await interaction.followup.send("The library scan job could not be queued.", ephemeral=True)
-
-    @bot.tree.command(name="organize-preview", description="Preview organizing an incoming folder")
-    @app_commands.describe(source="Absolute path mounted in the worker", destination="Optional destination root")
-    async def organize_preview(interaction: discord.Interaction, source: str, destination: str | None = None) -> None:
-        if not await guard(interaction):
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        payload = {"source": source}
-        if destination:
-            payload["dest"] = destination
-        try:
-            result = await api.post(
-                "/api/v1/jobs",
-                json_body={"kind": "organize_preview", "payload": payload},
-                actor=_actor(interaction),
-            )
-            await interaction.followup.send(
-                f"Queued preview job **{result.get('id', 'unknown')}**. Use `/job` for status.",
-                ephemeral=True,
-            )
-        except ServiceError as exc:
-            if exc.status == 429:
-                await interaction.followup.send(
-                    _rate_limit_message("organize preview requests", exc), ephemeral=True
-                )
-                return
-            await interaction.followup.send("The preview job could not be queued.", ephemeral=True)
-
 
 def blocking_problems() -> list[str]:
     """Configuration without which the bot cannot connect at all.

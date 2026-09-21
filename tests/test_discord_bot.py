@@ -609,6 +609,14 @@ class CommandRegistrationTests(unittest.IsolatedAsyncioTestCase):
             [("type", True), ("query", True)],
         )
 
+    async def test_job_takes_an_optional_job_id(self) -> None:
+        tree = self._tree()
+        options = tree.get_command("job").to_dict(tree)["options"]
+        self.assertEqual(
+            [(o["name"], o.get("required", False)) for o in options],
+            [("job_id", False)],
+        )
+
     async def test_cancel_takes_an_optional_job_id(self) -> None:
         """Optional so the picker is reachable. The id only ever appears in
         an ephemeral reply, and the case this exists for is a mis-pressed
@@ -620,15 +628,42 @@ class CommandRegistrationTests(unittest.IsolatedAsyncioTestCase):
             [("job_id", False)],
         )
 
+    async def test_the_command_set_is_exactly_this(self) -> None:
+        """The whole surface, pinned. Two commands were removed because they
+        could not be used from Discord at all: `/metadata-match` needed an
+        Audiobookshelf item UUID that nothing here ever displays (it was
+        never run once), and `/organize-preview` took a free-text absolute
+        path into the worker's filesystem. Both are still reachable on the
+        host through the API."""
+        tree = self._tree()
+        names = {command.name for command in tree.get_commands()}
+        self.assertEqual(
+            names,
+            {"library", "request", "downloads", "job", "cancel", "scan"},
+        )
+
+    async def test_no_command_demands_an_id_a_user_cannot_obtain(self) -> None:
+        """The defect this set was cleaned up for. Every id-shaped argument
+        left is OPTIONAL, with a picker behind it, because an id only ever
+        appears in an ephemeral reply the reader has probably dismissed."""
+        tree = self._tree()
+        for name in ("job", "cancel"):
+            with self.subTest(command=name):
+                options = tree.get_command(name).to_dict(tree)["options"]
+                required = [o["name"] for o in options if o.get("required")]
+                self.assertEqual(required, [], f"/{name} still demands {required}")
+
+    async def test_scan_needs_no_library_id(self) -> None:
+        """One library exists and the API knows its id."""
+        tree = self._tree()
+        options = tree.get_command("scan").to_dict(tree)["options"]
+        self.assertEqual([o["name"] for o in options], ["force"])
+        self.assertFalse(options[0].get("required", False))
+
     async def test_every_command_serializes(self) -> None:
         tree = self._tree()
-        names = set()
         for command in tree.get_commands():
             command.to_dict(tree)  # raises if Discord would refuse it
-            names.add(command.name)
-        self.assertIn("library", names)
-        self.assertIn("request", names)
-        self.assertIn("cancel", names)
 
 
 class PagedViewPageSizeTests(unittest.IsolatedAsyncioTestCase):

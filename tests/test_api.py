@@ -608,6 +608,7 @@ class RateLimitWiringTests(unittest.TestCase):
         "update_metadata": "actor",
         "match_metadata": "actor",
         "scan_library": "actor",
+        "scan_default_library": "actor",
         "grab_release": "actor",
         "pull_transfer": "actor",
         "create_job": "actor",
@@ -635,12 +636,19 @@ class RateLimitWiringTests(unittest.TestCase):
             )
 
     def test_every_route_is_accounted_for_in_exactly_one_tier(self) -> None:
-        """Guards the partition itself: 15 routes total (matching the
-        brief), no overlap, nothing missing."""
+        """Guards the partition itself: no overlap, nothing missing, and the
+        count is hardcoded so a route added later cannot quietly land in
+        neither tier.
+
+        The literal is meant to be edited when a route is added — that edit
+        is the moment someone decides which tier it belongs to. It has
+        already done that job once: adding `scan_default_library` failed
+        this test rather than shipping an unlimited mutating route.
+        """
         read = set(self._READ_ROUTES)
         action = set(self._ACTION_ROUTES)
         self.assertEqual(len(read & action), 0)
-        self.assertEqual(len(read) + len(action), 15)
+        self.assertEqual(len(read) + len(action), 16)
 
     def test_healthz_and_readyz_take_no_actor_dependency_at_all(self) -> None:
         """Not just 'a generous limit' -- these two never call
@@ -853,6 +861,61 @@ class SearchRetentionTests(unittest.TestCase):
             [("job", job.id)],
             "the search sweep must filter on target_type, not just on age",
         )
+
+
+class DefaultLibraryScanTests(unittest.TestCase):
+    """`POST /api/v1/libraries/scan` is what lets `/scan` in Discord take no
+    argument. It reads the library id from config, so the one thing that can
+    go wrong is config not having one."""
+
+    def setUp(self) -> None:
+        self.enqueued: list[tuple] = []
+        fake_db = mock.Mock()
+        fake_db.enqueue.side_effect = lambda kind, payload, actor: self.enqueued.append(
+            (kind, payload, actor)
+        ) or _job(id="queued-1", kind=kind, status="queued")
+        patcher = mock.patch.object(api_module, "database", fake_db)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _settings(self, library_id: str):
+        return mock.patch.object(
+            api_module,
+            "settings",
+            Settings(
+                audiobookshelf_url="http://abs",
+                audiobookshelf_token="t",
+                audiobookshelf_library_id=library_id,
+            ),
+        )
+
+    def test_the_configured_library_is_what_gets_scanned(self) -> None:
+        with self._settings("lib-abc"):
+            api_module.scan_default_library(
+                api_module.LibraryScanRequest(force=True), actor="local"
+            )
+        kind, payload, _ = self.enqueued[0]
+        self.assertEqual(kind, "library_scan")
+        self.assertEqual(payload, {"library_id": "lib-abc", "force": True})
+
+    def test_no_configured_library_is_refused_not_queued_blank(self) -> None:
+        """Without this the route enqueues a scan for library_id "" and the
+        failure surfaces later, inside the worker, as something obscure."""
+        with self._settings(""):
+            with self.assertRaises(HTTPException) as caught:
+                api_module.scan_default_library(
+                    api_module.LibraryScanRequest(force=False), actor="local"
+                )
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertIn("library", str(caught.exception.detail).lower())
+        self.assertEqual(self.enqueued, [], "nothing may be queued")
+
+    def test_naming_a_library_explicitly_still_works(self) -> None:
+        with self._settings("lib-abc"):
+            api_module.scan_library(
+                "other-lib", api_module.LibraryScanRequest(force=False), actor="local"
+            )
+        self.assertEqual(self.enqueued[0][1]["library_id"], "other-lib")
 
 
 class BrowseLimitFitsEveryRouteTests(unittest.TestCase):
