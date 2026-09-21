@@ -465,7 +465,10 @@ def readyz() -> dict[str, Any]:
 @app.get("/api/v1/library/search")
 def library_search(
     q: str = Query(default="", max_length=200),
-    limit: int = Query(default=25, ge=1, le=100),
+    # Ceiling raised from 100 so a BROWSE can return the whole library: it
+    # held 190 audiobooks the day browsing shipped, and a cap below that
+    # silently truncates the shelf with nothing on screen to say so.
+    limit: int = Query(default=25, ge=1, le=1000),
     _actor: str = Depends(_read_actor),
 ) -> dict[str, Any]:
     """Audiobooks already on the server. An empty `q` lists the library.
@@ -625,8 +628,10 @@ def release_search(
 def ebook_search(
     q: str = Query(default="", max_length=200),
     # Ceiling raised from 25 so an empty `q` can return a whole shelf, not
-    # an arbitrary first slice of one.
-    limit: int = Query(default=10, ge=1, le=200),
+    # an arbitrary first slice of one. It must stay at or above the bot's
+    # `_BROWSE_LIMIT`: a browse asks for exactly that, and a ceiling below
+    # it is a 422 that takes the whole command out, not a quiet trim.
+    limit: int = Query(default=10, ge=1, le=1000),
     _actor: str = Depends(_read_actor),
 ) -> dict[str, Any]:
     """Ebooks on the server. An empty `q` lists them all, author order.
