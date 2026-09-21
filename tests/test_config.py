@@ -161,5 +161,60 @@ class DiscordLargeReleaseThresholdTests(unittest.TestCase):
                 Settings.from_env()
 
 
+class RateLimitSettingsTests(unittest.TestCase):
+    """Defaults are deliberately generous per the brief -- a limit that
+    fires during normal two-user use is worse than none. Reads (30/60s)
+    cover several `/request`/`/library` searches in a sitting (each costs
+    exactly one API call -- paging is client-side); actions (10/60s) are
+    tighter because a grab reaches IPTorrents through Prowlarr's proxy and
+    queues real bandwidth/seeding obligations. See api._enforce_rate_limit's
+    docstring for the full reasoning."""
+
+    def test_read_defaults_are_thirty_per_minute(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            settings = Settings.from_env()
+            self.assertEqual(settings.rate_limit_read_max_requests, 30)
+            self.assertEqual(settings.rate_limit_read_window_seconds, 60.0)
+
+    def test_action_defaults_are_ten_per_minute(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            settings = Settings.from_env()
+            self.assertEqual(settings.rate_limit_action_max_requests, 10)
+            self.assertEqual(settings.rate_limit_action_window_seconds, 60.0)
+
+    def test_all_four_knobs_are_configurable(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "SHELFMARK_RATE_LIMIT_READ_MAX_REQUESTS": "5",
+                "SHELFMARK_RATE_LIMIT_READ_WINDOW_SECONDS": "30",
+                "SHELFMARK_RATE_LIMIT_ACTION_MAX_REQUESTS": "2",
+                "SHELFMARK_RATE_LIMIT_ACTION_WINDOW_SECONDS": "120",
+            },
+            clear=True,
+        ):
+            settings = Settings.from_env()
+            self.assertEqual(settings.rate_limit_read_max_requests, 5)
+            self.assertEqual(settings.rate_limit_read_window_seconds, 30.0)
+            self.assertEqual(settings.rate_limit_action_max_requests, 2)
+            self.assertEqual(settings.rate_limit_action_window_seconds, 120.0)
+
+    def test_a_zero_or_negative_max_requests_is_floored_at_one(self) -> None:
+        """A typo'd 0 must not silently build a limiter that refuses every
+        single request forever -- floored the same way
+        circuit_breaker_failure_threshold is."""
+        with mock.patch.dict(
+            "os.environ", {"SHELFMARK_RATE_LIMIT_ACTION_MAX_REQUESTS": "0"}, clear=True
+        ):
+            self.assertEqual(Settings.from_env().rate_limit_action_max_requests, 1)
+
+    def test_malformed_max_requests_is_rejected_not_silently_dropped(self) -> None:
+        with mock.patch.dict(
+            "os.environ", {"SHELFMARK_RATE_LIMIT_READ_MAX_REQUESTS": "not-a-number"}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                Settings.from_env()
+
+
 if __name__ == "__main__":
     unittest.main()

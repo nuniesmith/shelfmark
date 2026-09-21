@@ -339,5 +339,314 @@ class ListJobsEndpointTests(unittest.TestCase):
         self.assertIs(default.default, False)
 
 
+class ConsumeTokenTests(unittest.TestCase):
+    """`_consume_token` is the pure decision `RateLimiter.check` delegates
+    to -- driven with explicit `now` values so nothing here sleeps, the same
+    reason `is_permitted` in discord_bot.py is tested as a plain function."""
+
+    def test_a_full_bucket_allows_a_request_and_spends_one_token(self) -> None:
+        bucket = api_module._RateLimitBucket(tokens=5.0, updated_at=0.0)
+        retry_after = api_module._consume_token(bucket, now=0.0, capacity=5.0, refill_per_second=1.0)
+        self.assertIsNone(retry_after)
+        self.assertAlmostEqual(bucket.tokens, 4.0)
+
+    def test_an_empty_bucket_is_refused_with_the_exact_wait_time(self) -> None:
+        bucket = api_module._RateLimitBucket(tokens=0.0, updated_at=0.0)
+        retry_after = api_module._consume_token(bucket, now=0.0, capacity=5.0, refill_per_second=0.5)
+        # One token needed / 0.5 tokens-per-second refill = 2 seconds.
+        self.assertAlmostEqual(retry_after, 2.0)
+
+    def test_refill_over_a_long_elapsed_time_is_capped_at_capacity(self) -> None:
+        """A very stale bucket must not accumulate MORE than `capacity`
+        tokens -- otherwise an actor idle for an hour could burst far past
+        the configured limit the instant they return."""
+        bucket = api_module._RateLimitBucket(tokens=0.0, updated_at=0.0)
+        retry_after = api_module._consume_token(bucket, now=1000.0, capacity=3.0, refill_per_second=1.0)
+        self.assertIsNone(retry_after)
+        self.assertAlmostEqual(bucket.tokens, 2.0)  # capacity(3) - the 1 just spent
+
+    def test_waiting_the_full_reported_time_allows_the_next_request(self) -> None:
+        bucket = api_module._RateLimitBucket(tokens=1.0, updated_at=0.0)
+        self.assertIsNone(api_module._consume_token(bucket, now=0.0, capacity=1.0, refill_per_second=1.0))
+        retry_after = api_module._consume_token(bucket, now=0.1, capacity=1.0, refill_per_second=1.0)
+        self.assertIsNotNone(retry_after)
+        allowed = api_module._consume_token(
+            bucket, now=0.1 + retry_after, capacity=1.0, refill_per_second=1.0
+        )
+        self.assertIsNone(allowed)
+
+
+class RateLimiterTests(unittest.TestCase):
+    """`RateLimiter.check` -- what every route's dependency calls through
+    `_enforce_rate_limit`. Uses a caller-advanced fake clock (`self._now`)
+    instead of a real one so nothing here sleeps."""
+
+    def setUp(self) -> None:
+        self._now = 0.0
+        self.limiter = api_module.RateLimiter(clock=lambda: self._now)
+
+    def test_requests_within_capacity_all_succeed(self) -> None:
+        for _ in range(3):
+            self.assertIsNone(
+                self.limiter.check("read", "discord:1:2:3", capacity=3, refill_per_second=1.0)
+            )
+
+    def test_the_request_past_capacity_is_refused(self) -> None:
+        for _ in range(3):
+            self.limiter.check("read", "discord:1:2:3", capacity=3, refill_per_second=1.0)
+        retry_after = self.limiter.check("read", "discord:1:2:3", capacity=3, refill_per_second=1.0)
+        self.assertIsNotNone(retry_after)
+
+    def test_a_different_actor_has_an_independent_budget(self) -> None:
+        for _ in range(3):
+            self.limiter.check("read", "discord:1:2:3", capacity=3, refill_per_second=1.0)
+        self.assertIsNone(
+            self.limiter.check("read", "discord:9:9:9", capacity=3, refill_per_second=1.0)
+        )
+
+    def test_the_action_tier_for_the_same_actor_is_an_independent_budget(self) -> None:
+        """Reads and actions must not share one counter -- exhausting a
+        search budget must never block a grab for the same person, and vice
+        versa, since the two tiers exist because their real costs differ by
+        orders of magnitude."""
+        for _ in range(3):
+            self.limiter.check("read", "discord:1:2:3", capacity=3, refill_per_second=1.0)
+        self.assertIsNone(
+            self.limiter.check("action", "discord:1:2:3", capacity=3, refill_per_second=1.0)
+        )
+
+
+class RateLimiterEvictionTests(unittest.TestCase):
+    """The bucket table is keyed on the actor, and the actor is whatever
+    X-Shelfmark-Actor says once the bearer token checks out -- so without
+    eviction it grows without bound for the life of the container."""
+
+    def setUp(self) -> None:
+        self._now = 0.0
+        self.limiter = api_module.RateLimiter(
+            clock=lambda: self._now, max_actors=4, idle_eviction_seconds=3600.0
+        )
+
+    def _check(self, actor: str) -> float | None:
+        return self.limiter.check("read", actor, capacity=2, refill_per_second=1.0)
+
+    def test_the_table_never_grows_past_the_cap(self) -> None:
+        for index in range(50):
+            self._check(f"discord:{index}:1:1")
+            self._now += 0.001
+        self.assertLessEqual(len(self.limiter._buckets), 4)
+
+    def test_an_idle_bucket_is_dropped_before_a_recent_one(self) -> None:
+        self._check("idle")
+        self._now += 7200.0  # two hours: "idle" has long since refilled
+        for index in range(3):
+            self._check(f"recent:{index}")
+        self._check("new-arrival")
+        self.assertNotIn(("read", "idle"), self.limiter._buckets)
+        self.assertIn(("read", "recent:2"), self.limiter._buckets)
+
+    def test_when_every_bucket_is_recent_the_stalest_is_the_one_dropped(self) -> None:
+        """The idle cutoff frees nothing here -- every actor was seen
+        seconds ago -- so the table is at its cap with nothing safely
+        droppable, and the choice of WHICH to drop is the whole behaviour.
+        Taking the freshest would evict whoever is mid-session."""
+        for index in range(4):
+            self._check(f"actor:{index}")
+            self._now += 1.0
+        self._check("new-arrival")
+        self.assertNotIn(("read", "actor:0"), self.limiter._buckets)
+        for index in (1, 2, 3):
+            self.assertIn(("read", f"actor:{index}"), self.limiter._buckets)
+
+    def test_a_spent_bucket_survives_while_the_table_has_room(self) -> None:
+        """Eviction must not be a way to refill your own bucket early: as
+        long as the table is under its cap, a rate-limited actor keeps the
+        empty bucket that is currently refusing them."""
+        self._check("heavy")
+        self._check("heavy")
+        self.assertIsNotNone(self._check("heavy"))
+        for index in range(2):
+            self._check(f"other:{index}")
+        self._now += 0.5
+        self.assertIsNotNone(self._check("heavy"))
+
+
+class EnforceRateLimitTests(unittest.TestCase):
+    """`_enforce_rate_limit` -- what `_read_actor`/`_action_actor` call.
+    Patches the module-level `settings` and `_rate_limiter` (the same
+    pattern `ReadyzWorkerLivenessTests` above uses for `database`), so this
+    never touches the real process-wide limiter or a real clock."""
+
+    def setUp(self) -> None:
+        self._now = 0.0
+        limiter = api_module.RateLimiter(clock=lambda: self._now)
+        test_settings = Settings(
+            rate_limit_read_max_requests=2,
+            rate_limit_read_window_seconds=10.0,
+            rate_limit_action_max_requests=1,
+            rate_limit_action_window_seconds=10.0,
+        )
+        limiter_patch = mock.patch.object(api_module, "_rate_limiter", limiter)
+        settings_patch = mock.patch.object(api_module, "settings", test_settings)
+        limiter_patch.start()
+        settings_patch.start()
+        self.addCleanup(limiter_patch.stop)
+        self.addCleanup(settings_patch.stop)
+
+    def test_reads_up_to_the_configured_limit_are_allowed(self) -> None:
+        api_module._enforce_rate_limit("read", "discord:1:2:3")
+        api_module._enforce_rate_limit("read", "discord:1:2:3")  # limit is 2 -- both succeed
+
+    def test_the_read_past_the_limit_raises_429_with_a_retry_time(self) -> None:
+        api_module._enforce_rate_limit("read", "discord:1:2:3")
+        api_module._enforce_rate_limit("read", "discord:1:2:3")
+        with self.assertRaises(HTTPException) as ctx:
+            api_module._enforce_rate_limit("read", "discord:1:2:3")
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(ctx.exception.detail["error"], "rate_limited")
+        self.assertGreater(ctx.exception.detail["retry_after_seconds"], 0)
+        self.assertIn("Retry-After", ctx.exception.headers)
+
+    def test_the_action_tier_has_its_own_much_tighter_limit(self) -> None:
+        api_module._enforce_rate_limit("action", "discord:1:2:3")  # limit is 1 -- succeeds
+        with self.assertRaises(HTTPException) as ctx:
+            api_module._enforce_rate_limit("action", "discord:1:2:3")
+        self.assertEqual(ctx.exception.status_code, 429)
+
+    def test_exhausting_reads_does_not_touch_the_same_actors_action_budget(self) -> None:
+        api_module._enforce_rate_limit("read", "discord:1:2:3")
+        api_module._enforce_rate_limit("read", "discord:1:2:3")
+        with self.assertRaises(HTTPException):
+            api_module._enforce_rate_limit("read", "discord:1:2:3")
+        api_module._enforce_rate_limit("action", "discord:1:2:3")  # untouched by the read exhaustion
+
+    def test_local_actor_is_exempt_no_matter_how_many_calls(self) -> None:
+        """`local` is `_actor()`'s fallback when SHELFMARK_API_TOKEN isn't
+        set at all -- the operator's own private-network access, not a
+        Discord user. Exempted entirely rather than merely generous."""
+        for _ in range(50):
+            api_module._enforce_rate_limit("read", "local")
+            api_module._enforce_rate_limit("action", "local")
+
+    def test_bearer_actor_is_exempt_no_matter_how_many_calls(self) -> None:
+        """`bearer` is `_actor()`'s fallback for a valid bearer token with no
+        X-Shelfmark-Actor header -- a manual curl or monitoring script, not
+        the Discord bot (which always sets that header)."""
+        for _ in range(50):
+            api_module._enforce_rate_limit("read", "bearer")
+            api_module._enforce_rate_limit("action", "bearer")
+
+    def test_a_custom_actor_label_is_not_exempt(self) -> None:
+        """Only the exact sentinel strings `_actor()` itself falls back to
+        are exempt -- NOT any actor that merely fails to start with
+        'discord:'. X-Shelfmark-Actor is caller-supplied once the bearer
+        token checks out, so a blanket 'not discord-prefixed' exemption
+        would let a script dodge the limiter just by naming itself anything
+        other than a discord:... string."""
+        api_module._enforce_rate_limit("action", "cron-script")
+        with self.assertRaises(HTTPException):
+            api_module._enforce_rate_limit("action", "cron-script")
+
+
+class RateLimitedErrorTests(unittest.TestCase):
+    """`_rate_limited_error` builds the 429 body/headers directly -- this is
+    what discord_bot._rate_limit_wait_text parses on the other end."""
+
+    def test_the_wait_time_is_rounded_up_not_down(self) -> None:
+        """41.2s reported as 41s would let a retry land BEFORE a token is
+        actually available -- rounding up is what keeps the promise in the
+        message true."""
+        exc = api_module._rate_limited_error(41.2, "read")
+        self.assertEqual(exc.detail["retry_after_seconds"], 42)
+        self.assertEqual(exc.headers["Retry-After"], "42")
+
+    def test_read_tier_message_says_searches(self) -> None:
+        exc = api_module._rate_limited_error(5.0, "read")
+        self.assertIn("searches", exc.detail["message"])
+
+    def test_action_tier_message_says_actions_not_searches(self) -> None:
+        exc = api_module._rate_limited_error(5.0, "action")
+        self.assertIn("actions", exc.detail["message"])
+        self.assertNotIn("searches", exc.detail["message"])
+
+    def test_retry_after_is_never_advertised_as_zero(self) -> None:
+        """A 0s wait in the message would be actively misleading -- the
+        caller was JUST refused, so telling them to retry immediately is a
+        promise this code cannot keep."""
+        exc = api_module._rate_limited_error(0.0, "read")
+        self.assertEqual(exc.detail["retry_after_seconds"], 1)
+
+    def test_status_code_is_429(self) -> None:
+        exc = api_module._rate_limited_error(1.0, "action")
+        self.assertEqual(exc.status_code, 429)
+
+
+class RateLimitWiringTests(unittest.TestCase):
+    """WHICH tier each route is wired to -- a partition, not a hand-picked
+    list: every GET route but /healthz and /readyz (which take no actor
+    dependency at all, so they can NEVER be rate-limited) depends on
+    `_read_actor`; every mutating route depends on `_action_actor`. Checked
+    via the `Depends` object's own `.dependency` instead of by calling each
+    route (most need a configured client/database to run at all) -- the same
+    reason `test_release_search_defaults_to_books` above inspects a
+    parameter default rather than invoking the route for that fact."""
+
+    _READ_ROUTES = {
+        "library_search": "_actor",
+        "library_item": "_actor",
+        "release_search": "_actor",
+        "ebook_search": "_actor",
+        "ebook_download": "actor",
+        "downloads": "_actor",
+        "list_jobs": "_actor",
+        "get_job": "_actor",
+    }
+    _ACTION_ROUTES = {
+        "update_metadata": "actor",
+        "match_metadata": "actor",
+        "scan_library": "actor",
+        "grab_release": "actor",
+        "pull_transfer": "actor",
+        "create_job": "actor",
+        "cancel_job": "actor",
+    }
+
+    def test_every_read_route_depends_on_read_actor(self) -> None:
+        for func_name, param_name in self._READ_ROUTES.items():
+            func = getattr(api_module, func_name)
+            default = inspect.signature(func).parameters[param_name].default
+            self.assertIs(
+                default.dependency,
+                api_module._read_actor,
+                f"{func_name} must depend on _read_actor",
+            )
+
+    def test_every_action_route_depends_on_action_actor(self) -> None:
+        for func_name, param_name in self._ACTION_ROUTES.items():
+            func = getattr(api_module, func_name)
+            default = inspect.signature(func).parameters[param_name].default
+            self.assertIs(
+                default.dependency,
+                api_module._action_actor,
+                f"{func_name} must depend on _action_actor",
+            )
+
+    def test_every_route_is_accounted_for_in_exactly_one_tier(self) -> None:
+        """Guards the partition itself: 15 routes total (matching the
+        brief), no overlap, nothing missing."""
+        read = set(self._READ_ROUTES)
+        action = set(self._ACTION_ROUTES)
+        self.assertEqual(len(read & action), 0)
+        self.assertEqual(len(read) + len(action), 15)
+
+    def test_healthz_and_readyz_take_no_actor_dependency_at_all(self) -> None:
+        """Not just 'a generous limit' -- these two never call
+        _actor/_read_actor/_action_actor in the first place, so a monitoring
+        probe (Uptime Kuma polls /readyz every 60s) cannot be rate-limited by
+        construction, not by a case in this code remembering to skip it."""
+        self.assertEqual(dict(inspect.signature(api_module.healthz).parameters), {})
+        self.assertEqual(dict(inspect.signature(api_module.readyz).parameters), {})
+
+
 if __name__ == "__main__":
     unittest.main()

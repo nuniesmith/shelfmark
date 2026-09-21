@@ -179,6 +179,33 @@ class Settings:
     # Failed pipeline jobs are kept twice as long as succeeded ones -- rarer,
     # and worth noticing a pattern in.
     retention_pipeline_failed_seconds: float = 180.0 * 24.0 * 60.0 * 60.0
+    # Per-actor budget for every GET route except /healthz and /readyz (see
+    # api.py's _read_actor). The real cost of a search is a live call against
+    # IPTorrents through Prowlarr -- the ONE indexer configured here -- so
+    # this exists to stop a stuck retry loop or a bug in the bot from
+    # hammering that account, not to police normal use. `/request` and
+    # `/library` each cost exactly one call (paging is client-side over one
+    # already-fetched response, per discord_bot.py's `_request_query`/
+    # `_library_query` docstrings), so even someone trying several different
+    # queries in one sitting stays well under 30/minute. Deliberately generous
+    # per the brief: a limit that fires during normal two-user use is worse
+    # than none, since it teaches people to distrust the tool.
+    rate_limit_read_max_requests: int = 30
+    rate_limit_read_window_seconds: float = 60.0
+    # Per-actor budget for every mutating route (grab, transfer pull, job
+    # POST, metadata match, library scan, job cancel -- see api.py's
+    # _action_actor). Tighter than the read budget on purpose: a grab hands a
+    # release straight to qBittorrent, which fetches the .torrent through
+    # Prowlarr's own proxy using Prowlarr's credentials -- another live hit on
+    # the same private-tracker account -- and then queues real bandwidth and
+    # seeding obligations that have to be undone by hand if unwanted. A real
+    # human grabbing, matching, or scanning does this a handful of times per
+    # session at most; 10/minute is far above that while still bounding "a
+    # slip or an impatient run of presses" (the concern that motivated this)
+    # well before it can pile up unwanted torrents or get the tracker account
+    # flagged for abuse.
+    rate_limit_action_max_requests: int = 10
+    rate_limit_action_window_seconds: float = 60.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -258,6 +285,18 @@ class Settings:
             ),
             retention_pipeline_failed_seconds=_float_from_env(
                 "SHELFMARK_RETENTION_PIPELINE_FAILED_SECONDS", 180.0 * 24.0 * 60.0 * 60.0
+            ),
+            rate_limit_read_max_requests=max(
+                1, int(os.environ.get("SHELFMARK_RATE_LIMIT_READ_MAX_REQUESTS", "30"))
+            ),
+            rate_limit_read_window_seconds=_float_from_env(
+                "SHELFMARK_RATE_LIMIT_READ_WINDOW_SECONDS", 60.0
+            ),
+            rate_limit_action_max_requests=max(
+                1, int(os.environ.get("SHELFMARK_RATE_LIMIT_ACTION_MAX_REQUESTS", "10"))
+            ),
+            rate_limit_action_window_seconds=_float_from_env(
+                "SHELFMARK_RATE_LIMIT_ACTION_WINDOW_SECONDS", 60.0
             ),
         )
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import time
 import urllib.error
@@ -101,6 +102,53 @@ def _human_size(num_bytes: int) -> str:
     if num_bytes >= 1_000:
         return f"{num_bytes / 1_000:.1f} KB"
     return f"{num_bytes} B"
+
+
+def _rate_limit_wait_text(body: str) -> str:
+    """Turn a 429's raw response body into a phone-readable wait time.
+
+    `body` is `ServiceError.message` as HttpClient.request builds it: the
+    raw, undecoded response text (see clients.py), which for a 429 from
+    api._rate_limited_error is a JSON object shaped like
+    `{"detail": {"retry_after_seconds": 42, ...}}`. A bare "429" or a dumped
+    JSON blob means nothing to someone tapping a Discord button on their
+    phone -- this is the one place that gets turned into "try again in N
+    minutes". Split out and tested directly (see RateLimitWaitTextTests in
+    tests/test_discord_bot.py) rather than folded into an `except
+    ServiceError` block, the same reason `_job_status_message` above is its
+    own function: it can be checked against exact JSON strings without
+    standing up a Discord interaction.
+
+    Falls back to a generic wait message on anything that fails to parse --
+    a malformed or unexpected body must not raise a SECOND exception from
+    inside code that is already handling one.
+    """
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        return "Try again in a minute."
+    detail = parsed.get("detail") if isinstance(parsed, dict) else None
+    retry_after = detail.get("retry_after_seconds") if isinstance(detail, dict) else None
+    if not isinstance(retry_after, (int, float)) or retry_after <= 0:
+        return "Try again in a minute."
+    retry_after = int(retry_after)
+    if retry_after >= 60:
+        minutes = max(1, round(retry_after / 60))
+        return f"Try again in {minutes} minute{'s' if minutes != 1 else ''}."
+    return f"Try again in {retry_after} second{'s' if retry_after != 1 else ''}."
+
+
+def _rate_limit_message(kind: str, exc: ServiceError) -> str:
+    """The full sentence for a 429 from the Shelfmark API -- "you have run
+    too many searches, try again in N minutes" rather than a bare status
+    code. `kind` names what was being attempted ("searches", "grabs", ...)
+    so every command reads like an explanation of what to do next, not an
+    error dump. Every `except ServiceError` below checks `exc.status == 429`
+    and calls this FIRST, falling back to its existing generic message
+    otherwise -- an ordinary upstream outage (Prowlarr down, a timeout)
+    still reads exactly as it did before this change.
+    """
+    return f"You have run too many {kind}. {_rate_limit_wait_text(exc.message)}"
 
 
 # `/request` and `/library` used to show five results and stop -- a real
@@ -425,7 +473,10 @@ async def _queue_grab(api: ShelfmarkApi, release: dict[str, Any], interaction: d
             f"Queued release **{job_id}**. Use `/job {job_id}` for status.",
             ephemeral=True,
         )
-    except ServiceError:
+    except ServiceError as exc:
+        if exc.status == 429:
+            await interaction.followup.send(_rate_limit_message("grabs", exc), ephemeral=True)
+            return
         await interaction.followup.send("The Shelfmark API could not queue that release.", ephemeral=True)
 
 
@@ -763,7 +814,12 @@ class EbookView(_PagedView):
             book_id = str(book.get("id") or "")
             try:
                 data, filename = await asyncio.to_thread(self.api.fetch_ebook, book_id, self.actor)
-            except ServiceError:
+            except ServiceError as exc:
+                if exc.status == 429:
+                    await interaction.followup.send(
+                        _rate_limit_message("ebook downloads", exc), ephemeral=True
+                    )
+                    return
                 await interaction.followup.send(
                     "That book could not be fetched from the server.", ephemeral=True
                 )
@@ -874,7 +930,10 @@ def install_commands(
         endpoint, params = _library_query(kind, query)
         try:
             payload = await api.get(endpoint, params=params, actor=_actor(interaction))
-        except ServiceError:
+        except ServiceError as exc:
+            if exc.status == 429:
+                await interaction.followup.send(_rate_limit_message("searches", exc), ephemeral=True)
+                return
             # Audiobookshelf and the on-disk ebook walk are two independent
             # failure surfaces (a remote API vs. a local directory read) —
             # naming which one is down saves a round trip of "which command
@@ -934,7 +993,10 @@ def install_commands(
                 embed=view.render_embed(), view=view, ephemeral=True
             )
             view.message = sent
-        except ServiceError:
+        except ServiceError as exc:
+            if exc.status == 429:
+                await interaction.followup.send(_rate_limit_message("searches", exc), ephemeral=True)
+                return
             await interaction.followup.send("Prowlarr search is unavailable.", ephemeral=True)
 
     @bot.tree.command(name="downloads", description="Show Shelfmark downloads in qBittorrent")
@@ -956,7 +1018,10 @@ def install_commands(
                 progress_text = f"{float(progress) * 100:.1f}%" if isinstance(progress, (int, float)) else "?"
                 lines.append(f"• **{name[:80]}** — {progress_text} — `{state}`")
             await interaction.followup.send("\n".join(lines), ephemeral=True)
-        except ServiceError:
+        except ServiceError as exc:
+            if exc.status == 429:
+                await interaction.followup.send(_rate_limit_message("download checks", exc), ephemeral=True)
+                return
             await interaction.followup.send("qBittorrent download status is unavailable.", ephemeral=True)
 
     @bot.tree.command(name="job", description="Show a Shelfmark job")
@@ -968,7 +1033,10 @@ def install_commands(
         try:
             payload = await api.get(f"/api/v1/jobs/{job_id}", actor=_actor(interaction))
             await interaction.followup.send(_job_status_message(payload, job_id), ephemeral=True)
-        except ServiceError:
+        except ServiceError as exc:
+            if exc.status == 429:
+                await interaction.followup.send(_rate_limit_message("job checks", exc), ephemeral=True)
+                return
             await interaction.followup.send("That job could not be loaded.", ephemeral=True)
 
     @bot.tree.command(name="metadata-match", description="Queue an Audiobookshelf metadata match")
@@ -992,7 +1060,12 @@ def install_commands(
                 f"Queued metadata match job **{result.get('id', 'unknown')}**.",
                 ephemeral=True,
             )
-        except ServiceError:
+        except ServiceError as exc:
+            if exc.status == 429:
+                await interaction.followup.send(
+                    _rate_limit_message("metadata match requests", exc), ephemeral=True
+                )
+                return
             await interaction.followup.send("The metadata match job could not be queued.", ephemeral=True)
 
     @bot.tree.command(name="scan", description="Queue an Audiobookshelf library scan")
@@ -1011,7 +1084,10 @@ def install_commands(
                 f"Queued library scan job **{result.get('id', 'unknown')}**.",
                 ephemeral=True,
             )
-        except ServiceError:
+        except ServiceError as exc:
+            if exc.status == 429:
+                await interaction.followup.send(_rate_limit_message("library scans", exc), ephemeral=True)
+                return
             await interaction.followup.send("The library scan job could not be queued.", ephemeral=True)
 
     @bot.tree.command(name="organize-preview", description="Preview organizing an incoming folder")
@@ -1033,7 +1109,12 @@ def install_commands(
                 f"Queued preview job **{result.get('id', 'unknown')}**. Use `/job` for status.",
                 ephemeral=True,
             )
-        except ServiceError:
+        except ServiceError as exc:
+            if exc.status == 429:
+                await interaction.followup.send(
+                    _rate_limit_message("organize preview requests", exc), ephemeral=True
+                )
+                return
             await interaction.followup.send("The preview job could not be queued.", ephemeral=True)
 
 
