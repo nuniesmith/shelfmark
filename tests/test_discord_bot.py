@@ -798,3 +798,109 @@ class GrabLinkErrorMessageTests(unittest.TestCase):
             _grab_outcome_message({"state": "link_error", "name": "X"}, "j"),
             _grab_outcome_message({"state": "bad_link", "name": "X"}, "j"),
         )
+
+
+class _FakeFollowup:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str | None, dict]] = []
+
+    async def send(self, content: str | None = None, **kwargs: object) -> None:
+        self.sent.append((content, kwargs))
+
+
+class _FakeResponse:
+    def is_done(self) -> bool:
+        return False
+
+    async def defer(self, **_kwargs: object) -> None:
+        return None
+
+
+class _FakeInteraction:
+    def __init__(self) -> None:
+        self.response = _FakeResponse()
+        self.followup = _FakeFollowup()
+
+
+class _FakeEbookApi:
+    def __init__(self, *, data: bytes = b"x" * 1000, link: dict | None = None,
+                 link_error: ServiceError | None = None) -> None:
+        self.data = data
+        self.link = link
+        self.link_error = link_error
+        self.fetched: list[str] = []
+        self.linked: list[tuple[str, str]] = []
+
+    def fetch_ebook(self, book_id: str, actor: str) -> tuple[bytes, str]:
+        self.fetched.append(book_id)
+        return self.data, "A Big Book.epub"
+
+    def ebook_link(self, book_id: str, actor: str) -> dict:
+        self.linked.append((book_id, actor))
+        if self.link_error is not None:
+            raise self.link_error
+        return self.link or {}
+
+
+class EbookLinkTests(unittest.IsolatedAsyncioTestCase):
+    """A book over Discord's attachment limit gets a download link instead
+    of a dead end -- the case that left someone unable to get a book at all.
+    Async because `discord.ui.View.__init__` needs a running loop."""
+
+    BOOK = "0123456789abcdef01234567"
+    ACTOR = "discord:1:2:3"
+    LINK = {
+        "url": "https://shelf.example/dl/v1.token",
+        "expires_at": 1_800_000_000,
+        "note": "Open it on the home network.",
+    }
+
+    async def _press(self, api: _FakeEbookApi, size: int) -> list[tuple[str | None, dict]]:
+        books = [{"id": self.BOOK, "title": "A Big Book", "size": size}]
+        view = EbookView(api, books, self.ACTOR, 10_000_000, None, "Ebooks")  # type: ignore[arg-type]
+        interaction = _FakeInteraction()
+        await view._make_callback(0)(interaction)
+        return interaction.followup.sent
+
+    async def test_a_book_over_the_limit_gets_a_link_instead_of_an_upload(self) -> None:
+        api = _FakeEbookApi(link=self.LINK)
+        [(content, kwargs)] = await self._press(api, size=23_000_000)
+        self.assertEqual(api.fetched, [], "a too-large book must not be downloaded at all")
+        self.assertEqual(api.linked, [(self.BOOK, self.ACTOR)])
+        assert content is not None
+        self.assertIn("https://shelf.example/dl/v1.token", content)
+        self.assertIn("<t:1800000000:R>", content)
+        self.assertIn("Open it on the home network.", content)
+        self.assertIn("23.0 MB", content)
+        self.assertTrue(kwargs.get("ephemeral"), "the link is a credential; only its requester may see it")
+        self.assertNotIn("file", kwargs)
+
+    async def test_a_book_that_turns_out_too_big_after_fetching_gets_a_link(self) -> None:
+        """The listed size can be stale; the bytes actually read decide."""
+        api = _FakeEbookApi(data=b"x" * 12_000_000, link=self.LINK)
+        [(content, kwargs)] = await self._press(api, size=1_000)
+        self.assertEqual(api.fetched, [self.BOOK])
+        self.assertEqual(api.linked, [(self.BOOK, self.ACTOR)])
+        assert content is not None
+        self.assertIn("https://shelf.example/dl/v1.token", content)
+        self.assertNotIn("file", kwargs)
+
+    async def test_when_no_link_can_be_made_the_reply_still_says_why(self) -> None:
+        api = _FakeEbookApi(link_error=ServiceError("shelfmark-api", "not configured", status=503))
+        [(content, kwargs)] = await self._press(api, size=23_000_000)
+        assert content is not None
+        self.assertIn("can't be sent through Discord", content)
+        self.assertTrue(kwargs.get("ephemeral"))
+
+    async def test_a_rate_limited_link_request_says_so(self) -> None:
+        api = _FakeEbookApi(link_error=ServiceError("shelfmark-api", "slow down", status=429))
+        [(content, _kwargs)] = await self._press(api, size=23_000_000)
+        assert content is not None
+        self.assertIn("ebook downloads", content)
+
+    async def test_a_book_under_the_limit_is_still_attached_and_no_link_is_made(self) -> None:
+        api = _FakeEbookApi(link=self.LINK)
+        [(content, kwargs)] = await self._press(api, size=1_000)
+        self.assertEqual(api.linked, [])
+        self.assertIsNone(content)
+        self.assertIsInstance(kwargs.get("file"), discord.File)

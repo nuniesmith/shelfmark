@@ -8,6 +8,7 @@ has been staged on Freddy.
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import threading
 import time
@@ -18,13 +19,14 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
 from .clients import AudiobookshelfClient, ProwlarrClient, QBittorrentClient, ServiceError
 from .config import Settings
 from .db import Database, Job
 from .ebooks import EbookNotFound, list_ebooks, resolve_ebook
+from . import links
 
 
 settings = Settings.from_env()
@@ -430,6 +432,13 @@ def _upstream_error(exc: ServiceError) -> HTTPException:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # The same setup the worker has always had. Without it the API's INFO
+    # lines -- download links issued and used, among them -- were dropped
+    # before reaching `docker logs`; only warnings ever surfaced.
+    logging.basicConfig(
+        level=os.environ.get("SHELFMARK_LOG_LEVEL", "INFO"),
+        format='{"level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}',
+    )
     database.initialize()
     yield
 
@@ -738,6 +747,81 @@ def ebook_download(ebook_id: str, actor: str = Depends(_read_actor)) -> FileResp
     # in an author or title.
     response.headers["X-Shelfmark-Filename"] = urllib.parse.quote(path.name)
     return response
+
+
+# The real media type lets a phone offer to open the book (iOS: "Open in
+# Books") instead of saving an opaque blob; anything else stays octet-stream.
+_EBOOK_MEDIA_TYPES = {
+    ".epub": "application/epub+zip",
+    ".pdf": "application/pdf",
+    ".mobi": "application/x-mobipocket-ebook",
+    ".azw": "application/vnd.amazon.ebook",
+    ".azw3": "application/vnd.amazon.ebook",
+    ".cbz": "application/vnd.comicbook+zip",
+    ".cbr": "application/vnd.comicbook-rar",
+    ".fb2": "application/x-fictionbook+xml",
+}
+
+
+@app.post("/api/v1/ebooks/{ebook_id}/link")
+def ebook_link(ebook_id: str, actor: str = Depends(_read_actor)) -> dict[str, Any]:
+    """A signed, expiring link to one ebook: what the bot posts when the file
+    is too big to attach in Discord. See links.py for what the token grants.
+
+    503 when links are not set up (no public URL, or no API token to sign
+    with), so the bot can tell "not available here" apart from a failure.
+    """
+    if not (settings.api_token and settings.public_url):
+        raise HTTPException(status_code=503, detail="download links are not configured")
+    root = _ebook_root()
+    try:
+        path = resolve_ebook(root, ebook_id)
+    except EbookNotFound as exc:
+        raise HTTPException(status_code=404, detail="ebook not found") from exc
+    expires_at = int(time.time() + settings.download_link_hours * 3600)
+    token = links.sign(settings.api_token, ebook_id, expires_at)
+    logger.info("download link issued: ebook=%s actor=%s expires_at=%s", ebook_id, actor, expires_at)
+    return {
+        "url": f"{settings.public_url}/dl/{token}",
+        "expires_at": expires_at,
+        "filename": path.name,
+        "size": path.stat().st_size,
+        "note": settings.download_link_note,
+    }
+
+
+@app.api_route("/dl/{token}", methods=["GET", "HEAD"], response_model=None)
+def download_by_link(token: str) -> Response:
+    """Serve the ebook a download link names -- no Authorization header,
+    because the signed token is the credential (links.py).
+
+    Answers in plain text rather than JSON: the person reading an error here
+    is someone who tapped a link on their phone, not a program.
+    """
+    if not settings.api_token:
+        return PlainTextResponse("Not found.", status_code=404)
+    try:
+        ebook_id = links.verify(settings.api_token, token)
+    except links.LinkExpired:
+        return PlainTextResponse(
+            "This download link has expired. Ask the bot for the book again to get a fresh one.",
+            status_code=410,
+        )
+    except links.LinkError:
+        # One answer for every forged, truncated or mangled token.
+        return PlainTextResponse("Not found.", status_code=404)
+    try:
+        path = resolve_ebook(_ebook_root(), ebook_id)
+    except (EbookNotFound, HTTPException):
+        return PlainTextResponse(
+            "That book is no longer on the server. Ask the bot for it again.", status_code=404
+        )
+    logger.info("download link used: ebook=%s", ebook_id)
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type=_EBOOK_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream"),
+    )
 
 
 @app.get("/api/v1/downloads")

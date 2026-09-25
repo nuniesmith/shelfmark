@@ -992,5 +992,116 @@ class EbookBrowseTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
 
 
+class DownloadLinkTests(unittest.TestCase):
+    """An ebook over Discord's attachment limit used to be unobtainable
+    through the bot. These are the two routes that replace that dead end: one
+    issues a signed, expiring link to a single book, the other serves it to
+    whoever holds the link -- someone tapping it on a phone, so no bearer
+    token, and plain-text errors a person can act on."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="shelfmark-links-test-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "ebooks"
+        book_dir = self.root / "Some Author" / "A Big Book"
+        book_dir.mkdir(parents=True)
+        self.book = book_dir / "A Big Book.epub"
+        self.book.write_bytes(b"PK" + b"\0" * 4096)
+        self._use(Settings(
+            ebook_root=self.root,
+            api_token="api-token-for-tests",
+            public_url="https://shelf.example",
+            download_link_hours=24.0,
+            download_link_note="Open it on the home network.",
+        ))
+        from src.shelfmark_service.ebooks import list_ebooks
+        self.book_id = list_ebooks(self.root, "", 10)[0].id
+
+    def _use(self, settings: Settings) -> None:
+        patch = mock.patch.object(api_module, "settings", settings)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _token(self) -> str:
+        link = api_module.ebook_link(self.book_id, actor="discord:1:2:3")
+        return link["url"].rsplit("/dl/", 1)[1]
+
+    def test_a_link_is_the_public_url_plus_a_token_that_lasts_the_configured_hours(self) -> None:
+        before = int(datetime.now().timestamp())
+        link = api_module.ebook_link(self.book_id, actor="discord:1:2:3")
+        self.assertTrue(link["url"].startswith("https://shelf.example/dl/v1."), link["url"])
+        self.assertAlmostEqual(link["expires_at"] - before, 24 * 3600, delta=5)
+        self.assertEqual(link["filename"], "A Big Book.epub")
+        self.assertEqual(link["size"], self.book.stat().st_size)
+        self.assertEqual(link["note"], "Open it on the home network.")
+
+    def test_issuing_a_link_needs_the_bearer_token_like_any_other_read(self) -> None:
+        dependency = inspect.signature(api_module.ebook_link).parameters["actor"].default
+        self.assertIs(dependency.dependency, api_module._read_actor)
+
+    def test_serving_a_link_takes_no_bearer_token(self) -> None:
+        """A phone's browser sends no Authorization header: the token in the
+        path is the credential, so the route must not depend on one."""
+        self.assertEqual(list(inspect.signature(api_module.download_by_link).parameters), ["token"])
+
+    def test_no_link_without_a_public_url_or_a_signing_key(self) -> None:
+        for settings in (
+            Settings(ebook_root=self.root, api_token="api-token-for-tests"),
+            Settings(ebook_root=self.root, public_url="https://shelf.example"),
+        ):
+            with self.subTest(settings=settings), mock.patch.object(api_module, "settings", settings):
+                with self.assertRaises(HTTPException) as caught:
+                    api_module.ebook_link(self.book_id, actor="discord:1:2:3")
+                self.assertEqual(caught.exception.status_code, 503)
+
+    def test_no_link_for_a_book_that_is_not_there(self) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            api_module.ebook_link("f" * 24, actor="discord:1:2:3")
+        self.assertEqual(caught.exception.status_code, 404)
+
+    def test_a_link_serves_the_file_as_an_epub_download(self) -> None:
+        response = api_module.download_by_link(self._token())
+        self.assertIsInstance(response, api_module.FileResponse)
+        self.assertEqual(Path(response.path), self.book)
+        self.assertEqual(response.media_type, "application/epub+zip")
+        self.assertIn("attachment", response.headers["content-disposition"])
+
+    def test_an_expired_link_says_so_in_plain_text(self) -> None:
+        token = self._token()
+        with mock.patch.object(api_module.links.time, "time", return_value=10**12):
+            response = api_module.download_by_link(token)
+        self.assertEqual(response.status_code, 410)
+        self.assertIn(b"expired", response.body)
+        self.assertEqual(response.media_type, "text/plain")
+
+    def test_a_tampered_link_is_just_not_found(self) -> None:
+        version, _book, expires, signature = self._token().split(".")
+        response = api_module.download_by_link(".".join([version, "f" * 24, expires, signature]))
+        self.assertEqual(response.status_code, 404)
+
+    def test_a_forged_signature_on_a_real_book_is_refused(self) -> None:
+        """The case that matters: the right book id and a future expiry, with
+        a signature nobody made. Pointing a token at a book that does not
+        exist would 404 whether or not anything was checked."""
+        expires = int(datetime.now().timestamp()) + 3600
+        response = api_module.download_by_link(f"v1.{self.book_id}.{expires}.{'A' * 43}")
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIsInstance(response, api_module.FileResponse)
+
+    def test_links_die_with_the_api_token_that_signed_them(self) -> None:
+        token = self._token()
+        self._use(Settings(
+            ebook_root=self.root, api_token="rotated-token", public_url="https://shelf.example"
+        ))
+        self.assertEqual(api_module.download_by_link(token).status_code, 404)
+
+    def test_a_link_to_a_book_since_removed_explains_itself(self) -> None:
+        token = self._token()
+        self.book.unlink()
+        response = api_module.download_by_link(token)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn(b"no longer on the server", response.body)
+
+
 if __name__ == "__main__":
     unittest.main()

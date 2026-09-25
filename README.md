@@ -244,10 +244,14 @@ reader app just to browse files isn't wanted, so Shelfmark indexes
 - `/request type:ebook query:<text>` searches Prowlarr restricted to
   `PROWLARR_BOOK_CATEGORIES` and offers a grab button.
 - Discord refuses attachments over 10 MB on an unboosted server. The size is
-  checked and reported in plain language (naming the book and its size)
-  *before* any upload is attempted, rather than surfacing as a failed
-  Discord API call. Raise the ceiling with
-  `SHELFMARK_DISCORD_MAX_ATTACHMENT_MB` if the server is boosted.
+  checked *before* any upload is attempted, and a book over the limit gets a
+  **download link** instead, posted only to the person who asked. The link
+  works for one book, expires (24 hours by default), and is served by the API
+  at `/dl/<token>`, so it needs `SHELFMARK_PUBLIC_URL`. The token is signed
+  with a key derived from `SHELFMARK_API_TOKEN`, so rotating that token
+  revokes every outstanding link. Without a public URL the bot says the book
+  is too big, naming it and its size, as before. Raise the attachment ceiling
+  with `SHELFMARK_DISCORD_MAX_ATTACHMENT_MB` if the server is boosted.
 - A search result's id is an opaque token, never a filesystem path. The
   download endpoint re-derives it from the files it finds under the ebooks
   root and only serves a match that resolves back inside that root — a
@@ -296,6 +300,9 @@ is nothing to justify in the developer portal and no verification gate later.
 | `SHELFMARK_DISCORD_GUILD_ID` | Syncs commands to one guild, which is instant. Without it they sync globally and can take up to an hour to appear. |
 | `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` | Comma-separated role IDs permitted to use the bot. **Empty means nobody.** |
 | `SHELFMARK_DISCORD_MAX_ATTACHMENT_MB` | `/library type:ebook`'s file-size ceiling before Discord would refuse the upload. Default `10`; raise it if the server is boosted. |
+| `SHELFMARK_PUBLIC_URL` | Where people reach the API, e.g. `https://shelfmark.example.org`. The base of the download link a book over the attachment ceiling gets instead. Unset: no links. Set on the **API**, which issues them. |
+| `SHELFMARK_DOWNLOAD_LINK_HOURS` | How long a download link works. Default `24`. |
+| `SHELFMARK_DOWNLOAD_LINK_NOTE` | One line posted with every link, e.g. that the address only opens on a private network. |
 | `SHELFMARK_DISCORD_LARGE_RELEASE_THRESHOLD_MB` | Size (in MB) at or above which `/request`'s Grab button asks for confirmation instead of queuing immediately. Default `5000`. |
 | `PROWLARR_BOOK_CATEGORIES` | Categories `/request type:ebook` restricts to. Default `7000`, since a typical indexer advertises the general Books bucket rather than 7020 (EBook) specifically. |
 | `PROWLARR_AUDIOBOOK_CATEGORIES` | Categories `/request type:audiobook` restricts to. Default `3030,100064` (standard Newznab Audio/Audiobook plus this indexer's own AudioBook category) — verified against the live indexer; `book_only`'s 7000 alone returns zero audiobooks. |
