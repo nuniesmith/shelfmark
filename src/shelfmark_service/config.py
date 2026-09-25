@@ -63,6 +63,16 @@ class Settings:
     work_root: Path | None = None
     quarantine_root: Path | None = None
     api_token: str | None = None
+    # Where people reach this API from outside Freddy, e.g.
+    # https://shelfmark.example.org. The base of the download links the bot
+    # posts for an ebook too big to attach in Discord (see links.py); with it
+    # unset -- or with no api_token to sign with -- no links are issued, and
+    # the bot says the file is too big, as it always has.
+    public_url: str | None = None
+    download_link_hours: float = 24.0
+    # One line shown with every link, for whatever the deployment needs people
+    # to know, e.g. that the address only opens on a private network.
+    download_link_note: str | None = None
     worker_id: str = "shelfmark-worker"
     poll_interval: float = 2.0
     http_timeout: float = 15.0
@@ -218,6 +228,9 @@ class Settings:
             work_root=_path_from_env("SHELFMARK_WORK_ROOT"),
             quarantine_root=_path_from_env("SHELFMARK_QUARANTINE_ROOT"),
             api_token=os.environ.get("SHELFMARK_API_TOKEN") or None,
+            public_url=(os.environ.get("SHELFMARK_PUBLIC_URL") or "").strip().rstrip("/") or None,
+            download_link_hours=_float_from_env("SHELFMARK_DOWNLOAD_LINK_HOURS", 24.0),
+            download_link_note=(os.environ.get("SHELFMARK_DOWNLOAD_LINK_NOTE") or "").strip() or None,
             worker_id=os.environ.get("SHELFMARK_WORKER_ID") or socket.gethostname(),
             poll_interval=_float_from_env("SHELFMARK_WORKER_POLL_SECONDS", 2.0),
             http_timeout=_float_from_env("SHELFMARK_HTTP_TIMEOUT_SECONDS", 15.0),

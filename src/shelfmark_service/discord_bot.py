@@ -336,6 +336,16 @@ class ShelfmarkApi:
         filename = urllib.parse.unquote(filename_header) if filename_header else ebook_id
         return data, filename
 
+    def ebook_link(self, ebook_id: str, actor: str) -> dict[str, Any]:
+        """A signed, expiring download link for one ebook (see links.py): what
+        the bot posts instead of an attachment Discord would refuse."""
+        return self.request(
+            f"/api/v1/ebooks/{urllib.parse.quote(ebook_id, safe='')}/link",
+            method="POST",
+            json_body={},
+            actor=actor,
+        )
+
 
 ACTIVE_JOB_STATUSES = frozenset({"queued", "running"})
 
@@ -1008,15 +1018,10 @@ class EbookView(_PagedView):
                 return
             title = str(book.get("title") or "That book")
             size = book.get("size")
-            if _too_large(size, self.max_attachment_bytes):
-                await interaction.followup.send(
-                    f"**{title}** is {_human_size(int(size))}, over this server's "
-                    f"{_human_size(self.max_attachment_bytes)} attachment limit. "
-                    "It can't be sent through Discord this way.",
-                    ephemeral=True,
-                )
-                return
             book_id = str(book.get("id") or "")
+            if _too_large(size, self.max_attachment_bytes):
+                await self._send_link(interaction, book_id, title, int(size))
+                return
             try:
                 data, filename = await asyncio.to_thread(self.api.fetch_ebook, book_id, self.actor)
             except ServiceError as exc:
@@ -1034,11 +1039,7 @@ class EbookView(_PagedView):
                 # button is pressed (someone re-downloaded a different
                 # format in between) — trust the bytes actually read over
                 # the number quoted in the earlier search response.
-                await interaction.followup.send(
-                    f"**{filename}** turned out to be {_human_size(len(data))}, over the "
-                    f"{_human_size(self.max_attachment_bytes)} limit. It can't be sent this way.",
-                    ephemeral=True,
-                )
+                await self._send_link(interaction, book_id, filename, len(data))
                 return
             await interaction.followup.send(
                 file=discord.File(io.BytesIO(data), filename=filename),
@@ -1046,6 +1047,43 @@ class EbookView(_PagedView):
             )
 
         return callback
+
+    async def _send_link(
+        self, interaction: discord.Interaction, book_id: str, title: str, size: int
+    ) -> None:
+        """For a book too big to attach: a download link instead of a refusal.
+
+        Discord caps attachments at 10 MB on an unboosted server, and a real
+        epub or PDF can be well over that; before links, those books simply
+        could not be had through the bot at all. The link is posted
+        ephemerally because it is the credential -- whoever holds it can fetch
+        the book until it expires. When the API cannot make one (links not set
+        up there, or an error), the reply still says why nothing arrived.
+        """
+        too_big = (
+            f"**{title}** is {_human_size(size)}, over this server's "
+            f"{_human_size(self.max_attachment_bytes)} attachment limit"
+        )
+        try:
+            link = await asyncio.to_thread(self.api.ebook_link, book_id, self.actor)
+        except ServiceError as exc:
+            if exc.status == 429:
+                await interaction.followup.send(
+                    _rate_limit_message("ebook downloads", exc), ephemeral=True
+                )
+                return
+            await interaction.followup.send(
+                f"{too_big}. It can't be sent through Discord this way.", ephemeral=True
+            )
+            return
+        lines = [f"{too_big}, so here is a download link instead:", str(link["url"])]
+        expires_at = link.get("expires_at")
+        if isinstance(expires_at, int):
+            # Discord renders <t:...:R> as "in 24 hours" in the reader's locale.
+            lines.append(f"The link stops working <t:{expires_at}:R>.")
+        if link.get("note"):
+            lines.append(str(link["note"]))
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 class CancelView(_PagedView):
