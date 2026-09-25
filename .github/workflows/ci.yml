@@ -118,3 +118,27 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Freddy's Compose tracks `latest`, but nothing told freddy a new one
+      # existed: an image published here reached it only on the next, unrelated
+      # freddy deploy. This asks freddy to roll out exactly this commit
+      # (nuniesmith/freddy update-service.yml), which recreates only these
+      # services and checks they run this revision.
+      #
+      # FREDDY_DEPLOY_TOKEN is a fine-grained PAT with Actions: write on
+      # nuniesmith/freddy alone -- GITHUB_TOKEN cannot start a workflow in
+      # another repository. A missing token FAILS this job rather than skipping:
+      # a silent skip is a deploy that never happened, reported as green.
+      - name: Roll this commit out on freddy
+        env:
+          GH_TOKEN: ${{ secrets.FREDDY_DEPLOY_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::FREDDY_DEPLOY_TOKEN is not set, so freddy keeps running the previous image"
+            exit 1
+          fi
+          gh workflow run update-service.yml --repo nuniesmith/freddy \
+            -f image=ghcr.io/${{ github.repository }} \
+            -f revision=${{ github.sha }} \
+            -f services="shelfmark-api shelfmark-worker shelfmark-bot"
+          echo "Requested: ${{ github.server_url }}/nuniesmith/freddy/actions/workflows/update-service.yml"
