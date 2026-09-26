@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, a from-scratch rebuild, published and rolled out like any merge.
+  # Without it the image only changes when the code does, and the Python base,
+  # the apt packages the worker shells out to (rsync, ssh, 7-Zip, unrar) and
+  # the libraries under fastapi/uvicorn stop receiving fixes. Monday 08:47 UTC:
+  # clear of the nightly backups and the daily updates, and half an hour after
+  # discordarr's, so the two rollouts on freddy never queue behind each other.
+  schedule:
+    - cron: "47 8 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -90,7 +99,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: write
@@ -108,6 +117,12 @@ jobs:
         with:
           context: .
           push: true
+          # Always resolve the base image afresh, and on the weekly run skip the
+          # layer cache too: a cached apt or pip layer is reused for as long as
+          # the base image is unchanged, which would pin rsync and every
+          # unpinned dependency to whatever the cache was first filled with.
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' }}
           # `latest` is what Freddy's Compose tracks. The commit SHA tag is the
           # one to pin to when rolling back, since `latest` moves.
           tags: |

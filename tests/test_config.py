@@ -128,39 +128,6 @@ class DownloadAutomationSettingsTests(unittest.TestCase):
             )
 
 
-class DiscordLargeReleaseThresholdTests(unittest.TestCase):
-    """A release at/over this many MB is confirmed, not queued immediately,
-    on a Discord Grab press -- see ReleaseView/_needs_confirmation in
-    discord_bot.py. Default picked well above the longest single audiobook
-    seen in practice (Stephen King's THE STAND, unabridged, is 2813 MB) and
-    well below the 26 GB mis-ranked collection release that motivated the
-    guard in the first place.
-    """
-
-    def test_default_is_five_thousand_megabytes(self) -> None:
-        with mock.patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(Settings.from_env().discord_large_release_threshold_mb, 5000.0)
-
-    def test_threshold_is_configurable(self) -> None:
-        with mock.patch.dict(
-            "os.environ",
-            {"SHELFMARK_DISCORD_LARGE_RELEASE_THRESHOLD_MB": "8000"},
-            clear=True,
-        ):
-            self.assertEqual(
-                Settings.from_env().discord_large_release_threshold_mb, 8000.0
-            )
-
-    def test_malformed_threshold_is_rejected_not_silently_dropped(self) -> None:
-        with mock.patch.dict(
-            "os.environ",
-            {"SHELFMARK_DISCORD_LARGE_RELEASE_THRESHOLD_MB": "not-a-number"},
-            clear=True,
-        ):
-            with self.assertRaises(ValueError):
-                Settings.from_env()
-
-
 class RateLimitSettingsTests(unittest.TestCase):
     """Defaults are deliberately generous per the brief -- a limit that
     fires during normal two-user use is worse than none. Reads (30/60s)

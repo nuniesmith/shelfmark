@@ -55,6 +55,12 @@ class JobResponseTests(unittest.TestCase):
 
 from src.shelfmark_service import api as api_module
 
+# What the Discord bot asks for when browsing a whole shelf: `_BROWSE_LIMIT` in
+# nuniesmith/discordarr's src/discordarr/discord_bot.py (the bot moved there
+# from this repo). The API's `limit` ceilings must stay at or above it, or a
+# browse is a 422 that takes the whole command out. Change both together.
+_BROWSE_LIMIT = 500
+
 
 class FakeProwlarr:
     """Stands in for ProwlarrClient so these tests never touch the network —
@@ -345,7 +351,8 @@ class ListJobsEndpointTests(unittest.TestCase):
 class ConsumeTokenTests(unittest.TestCase):
     """`_consume_token` is the pure decision `RateLimiter.check` delegates
     to -- driven with explicit `now` values so nothing here sleeps, the same
-    reason `is_permitted` in discord_bot.py is tested as a plain function."""
+    reason the Discord bot's `is_permitted` (nuniesmith/discordarr) is tested
+    as a plain function."""
 
     def test_a_full_bucket_allows_a_request_and_spends_one_token(self) -> None:
         bucket = api_module._RateLimitBucket(tokens=5.0, updated_at=0.0)
@@ -553,7 +560,8 @@ class EnforceRateLimitTests(unittest.TestCase):
 
 class RateLimitedErrorTests(unittest.TestCase):
     """`_rate_limited_error` builds the 429 body/headers directly -- this is
-    what discord_bot._rate_limit_wait_text parses on the other end."""
+    what the Discord bot's `_rate_limit_wait_text` (nuniesmith/discordarr)
+    parses on the other end."""
 
     def test_the_wait_time_is_rounded_up_not_down(self) -> None:
         """41.2s reported as 41s would let a retry land BEFORE a token is
@@ -711,13 +719,14 @@ class LibrarySearchShapeTests(unittest.TestCase):
 
     def test_the_bot_can_actually_read_what_this_route_returns(self) -> None:
         """The bug lived in the SEAM, not in either side: the route was
-        reasonable JSON and `_result_list` was a reasonable unwrapper, and
-        together they produced nothing. Asserting the route's shape alone
-        would not have caught it, so this crosses the boundary on purpose."""
-        from src.shelfmark_service.discord_bot import _result_list
-
+        reasonable JSON and the bot's `_result_list` was a reasonable
+        unwrapper, and together they produced nothing. The bot now lives in
+        nuniesmith/discordarr, where `_result_list` reads a top-level
+        `results` list of objects -- so that is the shape pinned here."""
         payload = api_module.library_search(q="dune", limit=25, _actor="local")
-        self.assertEqual(len(_result_list(payload)), 2)
+        self.assertIsInstance(payload.get("results"), list)
+        self.assertEqual(len(payload["results"]), 2)
+        self.assertTrue(all(isinstance(item, dict) for item in payload["results"]))
 
     def test_an_empty_query_lists_the_library_instead_of_searching(self) -> None:
         payload = api_module.library_search(q="", limit=25, _actor="local")
@@ -943,8 +952,6 @@ class BrowseLimitFitsEveryRouteTests(unittest.TestCase):
         raise AssertionError(f"{route.__name__} has no limit parameter")
 
     def test_every_browsed_route_accepts_the_browse_limit(self) -> None:
-        from src.shelfmark_service.discord_bot import _BROWSE_LIMIT
-
         for route in (api_module.library_search, api_module.ebook_search):
             with self.subTest(route=route.__name__):
                 self.assertGreaterEqual(self._ceiling(route), _BROWSE_LIMIT)
@@ -953,8 +960,6 @@ class BrowseLimitFitsEveryRouteTests(unittest.TestCase):
         """190 audiobooks on the day browsing shipped. A limit below that
         shows part of the shelf and says nothing about the rest — which is
         the exact failure browsing exists to remove."""
-        from src.shelfmark_service.discord_bot import _BROWSE_LIMIT
-
         self.assertGreater(_BROWSE_LIMIT, 190)
 
 

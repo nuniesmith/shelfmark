@@ -74,17 +74,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
-
-  shelfmark-bot:
-    build: .
-    image: shelfmark:dev
-    container_name: shelfmark-bot
-    command: ["shelfmark-bot"]
-    env_file:
-      - .env
-    environment:
-      SHELFMARK_API_URL: http://shelfmark-api:8000
-    depends_on:
-      shelfmark-api:
-        condition: service_healthy
-    restart: unless-stopped

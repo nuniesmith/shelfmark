@@ -112,9 +112,10 @@ while the rest of the service keeps serving.
 | `AUDIOBOOKSHELF_LIBRARY_ID` | `a332fc04-1385-4502-b342-cc45fb502133` |
 | `PROWLARR_API_KEY` | Prowlarr → Settings → General |
 | `QBITTORRENT_USERNAME` / `_PASSWORD` | qBittorrent WebUI login |
-| `DISCORD_BOT_TOKEN` | Discord Developer Portal → Bot |
-| `SHELFMARK_DISCORD_GUILD_ID` | right-click the server → Copy ID |
-| `SHELFMARK_DISCORD_ALLOWED_ROLE_IDS` | role IDs, comma-separated |
+
+The Discord bot's token, guild id and role ids went with the bot to
+[nuniesmith/discordarr](https://github.com/nuniesmith/discordarr); freddy still
+holds them, for the `discordarr` container.
 
 Sullivan uses the same pattern for its *arr keys, which is where this one is
 copied from.

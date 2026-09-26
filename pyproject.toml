@@ -14,7 +14,6 @@ dependencies = [
     "mutagen==1.47.0",
     "fastapi==0.115.6",
     "uvicorn==0.34.0",
-    "discord.py==2.5.2",
 ]
 
 [project.scripts]
@@ -23,7 +22,6 @@ shelfmark-fix-metadata = "fix_metadata:main"
 shelfmark-api = "shelfmark_service.api:main"
 shelfmark-worker = "shelfmark_service.worker:main"
 shelfmark-worker-healthcheck = "shelfmark_service.worker:check_liveness_cli"
-shelfmark-bot = "shelfmark_service.discord_bot:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
