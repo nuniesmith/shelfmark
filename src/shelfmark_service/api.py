@@ -150,10 +150,11 @@ def _consume_token(
     Split out as its own function, and left to mutate the bucket it's
     handed rather than reach into a dict/lock itself, so the decision can be
     tested directly against explicit `now` values -- no sleeping, no
-    FastAPI object graph -- the same reason `is_permitted` and `_too_large`
-    live in discord_bot.py as plain functions. `RateLimiter.check` below is
-    the only caller in production; tests call this directly too (see
-    tests/test_api.py's `ConsumeTokenTests`).
+    FastAPI object graph -- the same reason the Discord bot (its own repo
+    now, nuniesmith/discordarr) keeps `is_permitted` and `_too_large` as
+    plain functions. `RateLimiter.check` below is the only caller in
+    production; tests call this directly too (see tests/test_api.py's
+    `ConsumeTokenTests`).
 
     Returns None when the request is allowed (a token was spent), or the
     number of seconds until the next token becomes available otherwise --
@@ -271,10 +272,11 @@ def _rate_limited_error(retry_after_seconds: float, tier: str) -> HTTPException:
     """Build the 429 for a rate-limited request.
 
     Includes BOTH a machine-readable `retry_after_seconds` in the JSON body
-    (discord_bot.py reads this to build "try again in N minutes" -- a raw
-    status code or a bare body means nothing to someone tapping a button on
-    their phone) and a standard `Retry-After` header (for any other client
-    that knows to look for it, e.g. curl or a future non-Discord caller).
+    (the Discord bot, nuniesmith/discordarr, reads this to build "try again
+    in N minutes" -- a raw status code or a bare body means nothing to
+    someone tapping a button on their phone) and a standard `Retry-After`
+    header (for any other client that knows to look for it, e.g. curl or a
+    future non-Discord caller).
     Unlike `_upstream_error`, this body is entirely ours to construct -- there
     is no upstream response to accidentally leak here -- so it can say
     exactly what happened.
@@ -739,12 +741,12 @@ def ebook_download(ebook_id: str, actor: str = Depends(_read_actor)) -> FileResp
         # confirm anything about what does or doesn't exist on disk.
         raise HTTPException(status_code=404, detail="ebook not found") from exc
     response = FileResponse(path, filename=path.name, media_type="application/octet-stream")
-    # The bot fetches this over plain urllib (see discord_bot.fetch_ebook),
-    # not the shared HttpClient, because HttpClient decodes every response as
-    # UTF-8 text and that corrupts binary epub/pdf/mobi bytes. Content-
-    # Disposition parsing to recover a filename is unnecessary work when a
-    # dedicated header can just carry it, percent-encoded in case of accents
-    # in an author or title.
+    # The bot fetches this over plain urllib (see `fetch_ebook` in
+    # nuniesmith/discordarr's discord_bot.py), not its HttpClient, because
+    # HttpClient decodes every response as UTF-8 text and that corrupts
+    # binary epub/pdf/mobi bytes. Content-Disposition parsing to recover a
+    # filename is unnecessary work when a dedicated header can just carry it,
+    # percent-encoded in case of accents in an author or title.
     response.headers["X-Shelfmark-Filename"] = urllib.parse.quote(path.name)
     return response
 

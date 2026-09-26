@@ -874,7 +874,7 @@ class Worker:
         """Best-effort Discord notification via a plain webhook POST.
 
         The worker must not import discord.py: that dependency belongs to
-        discord_bot.py's slash-command adapter, a separate long-running
+        the slash-command bot (nuniesmith/discordarr), a separate long-running
         process that holds a gateway connection. A Discord webhook is just an
         HTTP POST any client can make, so this reuses the same `HttpClient`
         every other integration in this file already goes through -- with its

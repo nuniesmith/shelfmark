@@ -207,7 +207,7 @@ class CircuitBreakerUnitTests(unittest.TestCase):
     clock instead of real sleeps -- these should run in well under a second."""
 
     def test_circuit_breaker_open_error_is_a_service_error(self) -> None:
-        # Existing call sites (api.py, discord_bot.py) do `except ServiceError`;
+        # Existing call sites (api.py, worker.py) do `except ServiceError`;
         # a breaker trip must still be caught there, not blow past them.
         self.assertIsInstance(CircuitBreakerOpenError("svc", 1.0), ServiceError)
 

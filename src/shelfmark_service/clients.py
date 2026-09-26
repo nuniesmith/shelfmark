@@ -31,7 +31,7 @@ class CircuitBreakerOpenError(ServiceError):
     """Raised in place of a real attempt while a service's breaker is open.
 
     Subclassing ServiceError means every existing `except ServiceError` call
-    site (api.py, discord_bot.py) keeps working unchanged, while code that
+    site (api.py, worker.py) keeps working unchanged, while code that
     cares can `isinstance()`-check for this specifically to tell "we did not
     even try" apart from "we tried and the provider said no".
     """
