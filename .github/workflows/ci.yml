@@ -140,5 +140,5 @@ jobs:
           gh workflow run update-service.yml --repo nuniesmith/freddy \
             -f image=ghcr.io/${{ github.repository }} \
             -f revision=${{ github.sha }} \
-            -f services="shelfmark-api shelfmark-worker shelfmark-bot"
+            -f services="shelfmark-api shelfmark-worker"
           echo "Requested: ${{ github.server_url }}/nuniesmith/freddy/actions/workflows/update-service.yml"
