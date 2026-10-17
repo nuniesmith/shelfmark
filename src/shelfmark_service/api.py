@@ -86,7 +86,19 @@ def _job_response(job: Job) -> dict[str, Any]:
         "code": job.error_code,
         "result": job.result,
         "cancel_requested": job.cancel_requested,
+        # Picked out of the payload one key at a time, never the payload
+        # itself: a grab's payload holds the indexer link and its apikey.
+        # `name` is the book a pipeline job is moving, which is what Discord's
+        # /retry picker shows beside each failed job.
+        "name": _payload_str(job, "_reconcile_name"),
+        "retry_of": _payload_str(job, "_retry_of"),
+        "attempt": job.payload.get("_attempt", 1) if isinstance(job.payload, dict) else 1,
     }
+
+
+def _payload_str(job: Job, key: str) -> str | None:
+    value = job.payload.get(key) if isinstance(job.payload, dict) else None
+    return value if isinstance(value, str) else None
 
 
 logger = logging.getLogger("shelfmark.api")
