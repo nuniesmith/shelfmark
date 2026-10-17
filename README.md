@@ -321,10 +321,42 @@ chain stops with a Discord warning rather than falling back to anything.
 webhook (`SHELFMARK_DISCORD_WEBHOOK_URL`) is a plain HTTP POST, so the
 worker posts to it directly through the same `HttpClient` every other
 integration in this file uses — no gateway connection, no `discord.py`
-import in the worker process. A completed book and a failed stage each get
-a message; a Discord outage only ever logs a warning; it never fails or
-retries the job that triggered it, since the jobs table (not Discord) is
-the source of truth.
+import in the worker process. A Discord outage only ever logs a warning;
+it never fails or retries the job that triggered it, since the jobs table
+(not Discord) is the source of truth.
+
+**One live status message per book.** Each torrent gets ONE webhook message
+that the worker edits at every stage (`status.py`), so the channel always
+shows where a book is: downloading, downloaded, copied to freddy, extracted
+and filed, then ready in the library, or the stage that failed and why. The
+message id lives in `status_messages` (schema migration 5), so a restart keeps
+editing the same message. `SHELFMARK_STATUS_MESSAGES=false` turns it off. A
+book that lands also gets a short "is in the library" message, and a stage
+that fails for good gets a warning; both ping the channel, edits do not.
+
+**Retries.** A failed stage of the automatic pipeline used to stay failed:
+its torrent was already claimed in `reconciled_torrents`, and the reconciler
+never offers a claimed hash again. Now a failure that can be transient
+(`upstream_unavailable`: an unreachable host or a refused login;
+`verification_failed`: a damaged copy) is queued again on its own, after
+`SHELFMARK_RETRY_BACKOFF_SECONDS` (default `300,1800`), up to
+`SHELFMARK_RETRY_MAX_ATTEMPTS` attempts (default 3, counting the first). Its
+status line says when the next try is. When the last attempt fails, or the
+failure would repeat (bad input, a missing source, a failed extraction), the
+warning names the fix: `POST /api/v1/jobs/{id}/retry`, which Discord's
+`/retry` calls with the short id the message shows. A retry is a new job
+with `_retry_of` and `_attempt` in its payload; the failed row keeps its
+error, and `job_retries` stops one failure from being retried twice.
+
+**A grab is only a duplicate if the torrent was there before it.**
+qBittorrent adds a URL torrent in the background and answers "Ok." first, so
+a list taken straight after the add can miss the new torrent. The grab now
+waits up to `SHELFMARK_GRAB_APPEAR_SECONDS` (default 15) for it, and a torrent
+found later counts as this grab's own unless the snapshot taken before the
+add already held it. A real duplicate reports what the existing copy is
+doing (`progress`, `torrent_state`, and `import`: the stage its import
+reached), so the reply can say "downloading, 43%" or "stuck at copying"
+instead of claiming the book is already in the library.
 
 **The off switch.** `SHELFMARK_DOWNLOAD_AUTOMATION_ENABLED=false` (default
 `true`) stops the periodic reconcile from ever being enqueued. Existing

@@ -11,15 +11,17 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .clients import AudiobookshelfClient, HttpClient, QBittorrentClient, ServiceError
 from .config import Settings
-from .db import Database, Job
+from .db import Database, Job, RetryRefused
 from .errors import ErrorCode, ShelfmarkError
 from .manifest import JsonlManifest, sha256_file
 from . import torrentmeta
+from .status import LABELS, STAGE_OF_KIND, StatusBoard, split_webhook_url
 from .transfer import RsyncTransfer, TransferError, wait_until_stable
 
 logger = logging.getLogger("shelfmark.worker")
@@ -158,18 +160,37 @@ def _is_torrent_complete(torrent: dict[str, Any]) -> bool:
     return isinstance(progress, (int, float)) and progress >= 1 and torrent.get("state") in _QBITTORRENT_COMPLETE_STATES
 
 
-def _split_webhook_url(url: str) -> tuple[str, str]:
-    """Split a webhook URL into (base_url, last_path_segment).
+# Kept under its old name: status.py owns webhook URLs now.
+_split_webhook_url = split_webhook_url
 
-    `HttpClient.request(path)` joins as `f"{base_url}/{path}"`. Calling it
-    with an empty path would append a trailing slash to the whole webhook
-    URL (`.../webhooks/<id>/<token>/`), which is a different route than the
-    one Discord documents and is not worth risking against a real webhook.
-    Splitting off the last segment as `path` reconstructs the exact original
-    URL with no trailing slash instead.
-    """
-    base, separator, last = url.rstrip("/").rpartition("/")
-    return base, last if separator else ""
+# Failures a second attempt can fix: an unreachable host or a refused login
+# (SSH, rsync, Audiobookshelf), or a copy that arrived damaged. Not bad input,
+# a missing source, a failed extraction or an internal bug: those fail the
+# same way every time, and retrying them only hides the error.
+RETRYABLE_CODES = frozenset({ErrorCode.UPSTREAM_UNAVAILABLE.value, ErrorCode.VERIFICATION_FAILED.value})
+
+
+def _human_wait(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 120:
+        return f"{seconds} s"
+    if seconds < 7200:
+        return f"{seconds // 60} min"
+    return f"{seconds // 3600} h"
+
+
+def _short_error(message: str) -> str:
+    """The first line of an error, short enough for one status line."""
+    first = (message or "").strip().splitlines()[0] if (message or "").strip() else "unknown error"
+    return first[:160]
+
+
+def retry_wait_seconds(settings: Settings, attempt: int) -> float | None:
+    """Seconds to wait before retrying attempt number `attempt`, or None for "do not"."""
+    if attempt >= settings.retry_max_attempts:
+        return None
+    backoff = settings.retry_backoff_seconds or (300,)
+    return float(backoff[min(attempt - 1, len(backoff) - 1)])
 
 
 def _plan_summary(plan: Any) -> dict[str, Any]:
@@ -198,6 +219,7 @@ class Worker:
         self.database = database
         self.settings = settings
         self.worker_id = settings.worker_id
+        self._status = StatusBoard(database, settings)
 
     def run_once(self) -> bool:
         job = self.database.claim_next(self.worker_id)
@@ -208,6 +230,7 @@ class Worker:
         )
         manifest.event("job_started", job_id=job.id, kind=job.kind, worker_id=self.worker_id)
         logger.info("job claimed id=%s kind=%s", job.id, job.kind)
+        self._mark_retry_started(job)
         try:
             self.database.heartbeat(job.id, self.worker_id)
             result = self.execute(job)
@@ -424,38 +447,38 @@ class Worker:
             category = self.settings.qbittorrent_category
             try:
                 client.login()
-                # Snapshot BEFORE the add. qBittorrent answers "Ok." whether
-                # it queued the torrent, silently ignored a duplicate, or
-                # could not fetch the URL at all, so its response carries no
-                # signal -- measured: the reply is byte-identical on a grab
-                # that downloads and one that does nothing.
-                before = {
-                    str(t.get("hash", "")).lower()
-                    for t in _as_list(client.torrents(category=category))
-                }
+                # Snapshot BEFORE the add, of EVERY category: qBittorrent
+                # answers "Ok." whether it queued the torrent, silently
+                # ignored a duplicate, or could not fetch the URL at all, so
+                # its response carries no signal -- measured: the reply is
+                # byte-identical on a grab that downloads and one that does
+                # nothing. A duplicate can sit in any category, so only the
+                # full list can say a torrent was there before this grab.
+                before = {str(t.get("hash", "")).lower() for t in _as_list(client.torrents())}
                 upstream = client.add_urls([add_url], category=category)
-                after = {
-                    str(t.get("hash", "")).lower()
-                    for t in _as_list(client.torrents(category=category))
-                }
+                added = self._wait_for_new_torrents(client, category, before)
             except ServiceError as exc:
                 raise _upstream_failure(exc) from exc
 
-            added = after - before
             if added:
+                for torrent_hash in sorted(added):
+                    self._status.update(
+                        torrent_hash, str(release.get("title") or ""), {"download": {"state": "active"}}
+                    )
                 return {
                     "release": release,
                     "upstream": upstream,
                     "submitted": True,
                     "state": "added",
                     "name": release.get("title"),
+                    "infohash": sorted(added)[0],
                 }
 
-            # Nothing new appeared. Work out WHY rather than reporting
-            # success: the two reasons need opposite responses from a
+            # Nothing new appeared in time. Work out WHY rather than
+            # reporting success: the reasons need opposite responses from a
             # person, and telling them apart needs the infohash, which is
             # the only identity qBittorrent dedupes on.
-            return self._explain_silent_grab(release, client, upstream)
+            return self._explain_silent_grab(release, client, upstream, before)
         if job.kind == "reconcile_downloads":
             return self._reconcile_downloads(job)
         if job.kind not in {"organize_preview", "organize_apply"}:
@@ -552,8 +575,29 @@ class Worker:
             )
 
 
+    def _wait_for_new_torrents(
+        self, client: QBittorrentClient, category: str, before: set[str]
+    ) -> set[str]:
+        """Hashes in `category` that were not in `before`, waiting up to `grab_appear_seconds`.
+
+        qBittorrent adds a URL torrent in the background: it answers "Ok.",
+        then fetches the .torrent through Prowlarr, and only then lists it.
+        A list taken straight after the add missed it, and the diagnosis
+        that followed found the new torrent and called it a duplicate.
+        """
+        deadline = time.monotonic() + max(0.0, self.settings.grab_appear_seconds)
+        while True:
+            now_listed = {
+                str(t.get("hash", "")).lower() for t in _as_list(client.torrents(category=category))
+            }
+            new = now_listed - before
+            if new or time.monotonic() >= deadline:
+                return new
+            time.sleep(1.0)
+
     def _explain_silent_grab(
-        self, release: dict[str, Any], client: QBittorrentClient, upstream: Any
+        self, release: dict[str, Any], client: QBittorrentClient, upstream: Any,
+        before: set[str] | None = None,
     ) -> dict[str, Any]:
         """Say why a grab added nothing: already there, or refused.
 
@@ -620,9 +664,28 @@ class Worker:
         except ServiceError:
             existing = []
         if existing:
+            torrent = existing[0]
+            if before is not None and infohash.lower() not in before:
+                # Not there before this grab, there now: the grab worked and
+                # qBittorrent was simply slow to list it.
+                self._status.update(infohash, name or str(release.get("title") or ""), {"download": {"state": "active"}})
+                result["state"] = "added"
+                result["name"] = release.get("title") or name
+                return result
             result["state"] = "duplicate"
-            result["name"] = existing[0].get("name") or name
-            result["category"] = existing[0].get("category")
+            result["name"] = torrent.get("name") or name
+            result["category"] = torrent.get("category")
+            # What the existing copy is doing, so the reply can say
+            # "downloading, 43%" or "stuck at copying" instead of
+            # assuming it is already in the library.
+            try:
+                result["progress"] = float(torrent.get("progress") or 0.0)
+            except (TypeError, ValueError):
+                result["progress"] = 0.0
+            result["torrent_state"] = torrent.get("state")
+            imported = self.database.import_status(infohash)
+            if imported:
+                result["import"] = imported
             return result
         result["state"] = "rejected"
         result["name"] = name or release.get("title")
@@ -699,6 +762,9 @@ class Worker:
             )
             if claimed is not None:
                 claimed_ids.append(claimed.id)
+                self._status.update(
+                    torrent_hash, name, {"download": {"state": "done"}, "copy": {"state": "active"}}
+                )
         return {
             "category": category,
             "seen": len(torrents),
@@ -723,10 +789,17 @@ class Worker:
             return
         name = job.payload.get("_reconcile_name") or torrent_hash
         if job.kind == "transfer_completed":
+            if result.get("verified"):
+                self._status.update(
+                    torrent_hash, name, {"copy": {"state": "done"}, "organize": {"state": "active"}}
+                )
             self._chain_transfer_completed(result, torrent_hash, name)
         elif job.kind == "organize_apply":
             self._chain_organize_apply(job, result, torrent_hash, name)
         elif job.kind == "library_scan":
+            self._status.update(
+                torrent_hash, name, {"library": {"state": "done", "label": "Ready in Audiobookshelf"}}
+            )
             self._notify(f":white_check_mark: **{name}** is in the library.")
 
     def _chain_transfer_completed(self, result: dict[str, Any], torrent_hash: str, name: str) -> None:
@@ -829,6 +902,14 @@ class Worker:
         if not result.get("books"):
             return
         if job.payload.get("media") == "ebook":
+            self._status.update(
+                torrent_hash,
+                name,
+                {
+                    "organize": {"state": "done"},
+                    "library": {"state": "done", "label": "Ready in the ebook library"},
+                },
+            )
             # Audiobookshelf has no ebook library (see README's "Ebooks"
             # section) -- Shelfmark serves ebooks by walking
             # SHELFMARK_EBOOKS_ROOT directly on every request, so there is no
@@ -837,6 +918,14 @@ class Worker:
             return
         library_id = self.settings.audiobookshelf_library_id
         if not (self.settings.audiobookshelf_url and self.settings.audiobookshelf_token and library_id):
+            self._status.update(
+                torrent_hash,
+                name,
+                {
+                    "organize": {"state": "done"},
+                    "library": {"state": "done", "label": "Filed; shows up after the next Audiobookshelf scan"},
+                },
+            )
             # The book is already filed into the library at this point --
             # Audiobookshelf's own periodic scan (or a manual `/scan`) will
             # pick it up. Not configured is a stopping point, not a failure
@@ -847,6 +936,11 @@ class Worker:
                 "scheduled or manual scan."
             )
             return
+        self._status.update(
+            torrent_hash,
+            name,
+            {"organize": {"state": "done"}, "library": {"state": "active", "label": "Adding to Audiobookshelf"}},
+        )
         self.database.enqueue(
             "library_scan",
             {"library_id": library_id, "_reconcile_hash": torrent_hash, "_reconcile_name": name},
@@ -854,20 +948,54 @@ class Worker:
         )
 
     def _notify_chain_failure(self, job: Job, message: str, code: str) -> None:
-        """Page Discord when an automatic pipeline stage fails.
+        """Report an automatic pipeline stage that failed.
 
         Gated on `_reconcile_hash` the same way `_chain_after_success` is: a
         manually-submitted job failing (a bad `/organize-preview` path, say)
         is already visible to whoever ran it through `/job` and does not need
         an unsolicited Discord message.
+
+        The book's status message always shows the failure. A separate
+        notice, which pings the channel, goes out only when nothing will
+        retry: a transient failure that the next attempt fixes should not
+        page anyone.
         """
         torrent_hash = job.payload.get("_reconcile_hash")
         if not torrent_hash:
             return
         label = job.payload.get("_reconcile_name") or torrent_hash
+        stage = STAGE_OF_KIND.get(job.kind)
+        attempt = _attempt_number(job)
+        wait = retry_wait_seconds(self.settings, attempt) if code in RETRYABLE_CODES else None
+        reason = _short_error(message)
+        if wait is not None:
+            detail = (
+                f"{reason}. Retrying in {_human_wait(wait)} "
+                f"(attempt {attempt + 1} of {self.settings.retry_max_attempts})"
+            )
+        else:
+            detail = f"{reason}. Fix the cause, then `/retry job:{job.id[:8]}`"
+        if stage:
+            self._status.update(torrent_hash, label, {stage: {"state": "failed", "detail": detail}})
+        if wait is not None:
+            return
+        where = LABELS[stage][0].lower() if stage else f"`{job.kind}`"
         self._notify(
-            f":warning: Automatic import of **{label}** failed at `{job.kind}`: "
-            f"{message[:300]} (`{code}`). See `/job {job.id}`."
+            f":warning: Import of **{label}** stopped at {where} (`{job.kind}`): {message[:300]} (`{code}`). "
+            f"Fix the cause, then `/retry job:{job.id}`."
+        )
+
+    def _mark_retry_started(self, job: Job) -> None:
+        """Show a retried pipeline stage as running again, with its attempt number."""
+        torrent_hash = job.payload.get("_reconcile_hash")
+        stage = STAGE_OF_KIND.get(job.kind)
+        attempt = _attempt_number(job)
+        if not torrent_hash or not stage or attempt <= 1:
+            return
+        self._status.update(
+            torrent_hash,
+            job.payload.get("_reconcile_name") or torrent_hash,
+            {stage: {"state": "active", "detail": f"attempt {attempt} of {self.settings.retry_max_attempts}"}},
         )
 
     def _notify(self, content: str) -> None:
@@ -940,6 +1068,60 @@ def _maybe_record_liveness(database: Database, settings: Settings, now: float, l
     if now - last_liveness < settings.poll_interval:
         return last_liveness
     database.record_liveness(settings.worker_id, pid=os.getpid())
+    return now
+
+
+def _attempt_number(job: Job) -> int:
+    try:
+        return max(1, int(job.payload.get("_attempt") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+# A failure older than this is not retried automatically, whatever its
+# attempt count: retention keeps failed rows for months, and a retry should
+# answer a fresh failure, never resurrect an old one.
+AUTO_RETRY_HORIZON_SECONDS = 2 * 24 * 3600.0
+
+
+def _maybe_retry_failed(
+    database: Database,
+    settings: Settings,
+    now: float,
+    last_check: float,
+    *,
+    wall_now: datetime | None = None,
+) -> float:
+    """Queue automatic retries of failed pipeline stages that are due.
+
+    A failed stage used to stay failed: its torrent was already claimed in
+    `reconciled_torrents`, so the reconciler never offered it again. This
+    re-queues a failure whose code is in RETRYABLE_CODES, once its wait from
+    `retry_backoff_seconds` has passed, until `retry_max_attempts`. Each
+    retry is a new job (see `Database.retry_job`), so the chain carries on
+    from it as if the first try had worked.
+    """
+    if now - last_check < settings.retry_check_interval_seconds:
+        return last_check
+    wall_now = wall_now or datetime.now(timezone.utc)
+    for job in database.failed_pipeline_jobs_not_retried():
+        if job.error_code not in RETRYABLE_CODES or not job.finished_at:
+            continue
+        wait = retry_wait_seconds(settings, _attempt_number(job))
+        if wait is None:
+            continue
+        try:
+            failed_at = datetime.fromisoformat(job.finished_at)
+        except ValueError:
+            continue
+        age = (wall_now - failed_at).total_seconds()
+        if age < wait or age > AUTO_RETRY_HORIZON_SECONDS:
+            continue
+        try:
+            retry = database.retry_job(job.id, actor="retrier", automatic=True)
+        except (LookupError, RetryRefused):
+            continue
+        logger.info("retry queued id=%s for failed id=%s kind=%s", retry.id, job.id, job.kind)
     return now
 
 
@@ -1052,12 +1234,14 @@ def main() -> None:
     last_reconcile = 0.0
     last_liveness = 0.0
     last_retention_sweep = 0.0
+    last_retry_check = 0.0
     while not stopping:
         database.requeue_stale(settings.worker_stale_seconds, actor=settings.worker_id)
         now = time.monotonic()
         last_liveness = _maybe_record_liveness(database, settings, now, last_liveness)
         last_reconcile = _maybe_enqueue_reconcile(database, settings, now, last_reconcile)
         last_retention_sweep = _maybe_sweep_retention(database, settings, now, last_retention_sweep)
+        last_retry_check = _maybe_retry_failed(database, settings, now, last_retry_check)
         if not worker.run_once():
             time.sleep(settings.poll_interval)
 

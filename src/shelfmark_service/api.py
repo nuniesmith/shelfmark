@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from .clients import AudiobookshelfClient, ProwlarrClient, QBittorrentClient, ServiceError
 from .config import Settings
-from .db import Database, Job
+from .db import Database, Job, RetryRefused
 from .ebooks import EbookNotFound, list_ebooks, resolve_ebook
 from . import links
 
@@ -898,6 +898,29 @@ def get_job(job_id: str, _actor: str = Depends(_read_actor)) -> dict[str, Any]:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return _job_response(job)
+
+
+@app.post("/api/v1/jobs/{job_id}/retry", status_code=status.HTTP_202_ACCEPTED)
+def retry_job(job_id: str, actor: str = Depends(_action_actor)) -> dict[str, Any]:
+    """Queue a failed job again, as a new job; the old one keeps its error.
+
+    `job_id` may be the short form Discord shows (8+ characters, unique).
+    A pipeline stage the reconciler started carries on through the rest of
+    the chain from the retry, so `/retry` on a failed copy ends with the
+    book in the library, exactly as the automatic retries do.
+    """
+    full_id = job_id if database.get_job(job_id) else database.resolve_job_id(job_id)
+    if not full_id:
+        raise HTTPException(status_code=404, detail="job not found")
+    try:
+        return _job_response(database.retry_job(full_id, actor=actor))
+    except LookupError:
+        raise HTTPException(status_code=404, detail="job not found") from None
+    except RetryRefused as exc:
+        detail: dict[str, Any] = {"message": str(exc)}
+        if exc.retry_job_id:
+            detail["retry_job_id"] = exc.retry_job_id
+        raise HTTPException(status_code=409, detail=detail) from None
 
 
 @app.post("/api/v1/jobs/{job_id}/cancel")
