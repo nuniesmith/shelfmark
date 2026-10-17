@@ -182,7 +182,8 @@ def _human_wait(seconds: float) -> str:
 def _short_error(message: str) -> str:
     """The first line of an error, short enough for one status line."""
     first = (message or "").strip().splitlines()[0] if (message or "").strip() else "unknown error"
-    return first[:160]
+    # The caller appends ". Retrying in ...", so a trailing stop would double.
+    return first[:160].rstrip(" .")
 
 
 def retry_wait_seconds(settings: Settings, attempt: int) -> float | None:

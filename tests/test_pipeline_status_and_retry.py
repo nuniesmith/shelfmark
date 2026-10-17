@@ -165,6 +165,13 @@ class FailureReportingTests(DatabaseCase):
         self.assertEqual(changes["copy"]["state"], "failed")
         self.assertIn("Retrying in 5 min (attempt 2 of 3)", changes["copy"]["detail"])
 
+    def test_an_error_ending_in_a_full_stop_does_not_get_a_second_one(self) -> None:
+        worker = self.make_worker()
+        worker._notify_chain_failure(self.failed_transfer(), "Permission denied (publickey).", "upstream_unavailable")
+        detail = worker._status.update.call_args[0][2]["copy"]["detail"]
+        self.assertNotIn("..", detail)
+        self.assertTrue(detail.startswith("Permission denied (publickey). Retrying in 5 min"), detail)
+
     def test_the_final_failure_pages_with_the_retry_command(self) -> None:
         worker = self.make_worker()
         failed = self.failed_transfer(attempt=3)
@@ -276,6 +283,19 @@ class StatusBoardTests(DatabaseCase):
         self.assertEqual(edit.kwargs["json_body"]["allowed_mentions"], {"parse": []})
         self.assertEqual(self.database.get_status_message(HASH)["message_id"], "999")
 
+    def test_a_message_started_mid_pipeline_shows_the_earlier_stages_done(self) -> None:
+        """Live 2026-10-17: the first message for a book that failed before
+        this shipped was written by its retry, and said "▫️ Downloading"
+        above a copy that could only have started after the download."""
+        http = mock.Mock()
+        http.request.return_value = {"id": "1"}
+        with mock.patch.object(status_module, "HttpClient", return_value=http):
+            self.board().update(HASH, NAME, {"copy": {"state": "failed", "detail": "denied"}})
+        lines = http.request.call_args.kwargs["json_body"]["content"].splitlines()
+        self.assertEqual(lines[1], "✅ Downloaded")
+        self.assertEqual(lines[2], "❌ Copying to freddy: denied")
+        self.assertEqual(lines[3], "▫️ Extracting and filing", "later stages stay untouched")
+
     def test_a_message_deleted_in_discord_is_posted_again(self) -> None:
         self.database.save_status_message(HASH, NAME, "999", {})
         http = mock.Mock()
@@ -318,6 +338,19 @@ class RetryEndpointTests(DatabaseCase):
             api_module.retry_job(failed.id, actor="t")
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertEqual(ctx.exception.detail["retry_job_id"], first["id"])
+
+    def test_a_job_shows_its_book_but_never_its_payload(self) -> None:
+        from src.shelfmark_service.api import _job_response
+
+        failed = self.failed_transfer()
+        response = _job_response(self.database.retry_job(failed.id))
+        self.assertEqual(response["name"], NAME)
+        self.assertEqual(response["retry_of"], failed.id)
+        self.assertEqual(response["attempt"], 2)
+        grab = self.database.enqueue(
+            "grab_release", {"release": {"downloadUrl": "http://p/dl?apikey=SECRET"}}
+        )
+        self.assertNotIn("SECRET", repr(_job_response(grab)))
 
     def test_an_unknown_job_is_not_found(self) -> None:
         with self.assertRaises(HTTPException) as ctx:

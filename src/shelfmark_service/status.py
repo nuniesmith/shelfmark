@@ -80,6 +80,22 @@ def render(name: str, stages: dict[str, dict[str, Any]]) -> str:
     return "\n".join(lines)[:2000]
 
 
+def _fill_in_earlier_stages(stages: dict[str, dict[str, Any]]) -> None:
+    """Mark every stage before the furthest one reached as done.
+
+    The stages run in order, so a book that is copying has downloaded. A
+    message first written mid-pipeline (by a retry, after this feature
+    shipped, of a book that failed before it) otherwise showed
+    "▫️ Downloading" above a copy that was clearly past it.
+    """
+    reached = [i for i, stage in enumerate(STAGES) if (stages.get(stage) or {}).get("state") not in (None, "pending")]
+    if not reached:
+        return
+    for stage in STAGES[: max(reached)]:
+        if (stages.get(stage) or {}).get("state") in (None, "pending"):
+            stages[stage] = {"state": "done"}
+
+
 def fresh_stages() -> dict[str, dict[str, Any]]:
     return {stage: {"state": "pending"} for stage in STAGES}
 
@@ -112,6 +128,7 @@ class StatusBoard:
         for stage, change in changes.items():
             if stage in STAGES:
                 stages[stage] = dict(change)
+        _fill_in_earlier_stages(stages)
         message_id = self._send(url, render(title, stages), row["message_id"] if row else None)
         self.database.save_status_message(h, title, message_id, stages)
 
