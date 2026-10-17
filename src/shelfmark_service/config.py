@@ -152,6 +152,22 @@ class Settings:
     download_automation_enabled: bool = True
     reconcile_interval_seconds: float = 60.0
     discord_webhook_url: str | None = None
+    # One Discord message per book, edited at every pipeline stage (status.py).
+    # Needs `discord_webhook_url`; off means only the final notices are sent.
+    status_messages_enabled: bool = True
+    # How long a grab waits for qBittorrent to list the torrent it just added.
+    # qBittorrent fetches a URL torrent in the background and answers "Ok."
+    # first, so a list taken at once often misses it -- and the grab then
+    # reported its OWN new torrent as an old duplicate (2026-10-17).
+    grab_appear_seconds: float = 15.0
+    # Automatic retries of a failed pipeline stage. `retry_max_attempts`
+    # counts the first try, so 3 means two retries; `retry_backoff_seconds`
+    # holds the wait after attempt 1, attempt 2, and so on (the last value
+    # repeats). Only failures that can be transient are retried; see
+    # worker.RETRYABLE_CODES.
+    retry_max_attempts: int = 3
+    retry_backoff_seconds: tuple[int, ...] = (300, 1800)
+    retry_check_interval_seconds: float = 60.0
     # How often the worker's main loop considers pruning old, terminal
     # `jobs`/`audit_events` rows (see worker.py's `_maybe_sweep_retention`
     # and db.py's `sweep_job_retention`). Defaults to once an hour, matching
@@ -271,6 +287,11 @@ class Settings:
             download_automation_enabled=_bool_from_env("SHELFMARK_DOWNLOAD_AUTOMATION_ENABLED", True),
             reconcile_interval_seconds=_float_from_env("SHELFMARK_RECONCILE_INTERVAL_SECONDS", 60.0),
             discord_webhook_url=os.environ.get("SHELFMARK_DISCORD_WEBHOOK_URL") or None,
+            status_messages_enabled=_bool_from_env("SHELFMARK_STATUS_MESSAGES", True),
+            grab_appear_seconds=_float_from_env("SHELFMARK_GRAB_APPEAR_SECONDS", 15.0),
+            retry_max_attempts=max(1, int(os.environ.get("SHELFMARK_RETRY_MAX_ATTEMPTS", "").strip() or 3)),
+            retry_backoff_seconds=_int_tuple_from_env("SHELFMARK_RETRY_BACKOFF_SECONDS", (300, 1800)),
+            retry_check_interval_seconds=_float_from_env("SHELFMARK_RETRY_CHECK_INTERVAL_SECONDS", 60.0),
             retention_sweep_interval_seconds=_float_from_env(
                 "SHELFMARK_RETENTION_SWEEP_INTERVAL_SECONDS", 3600.0
             ),

@@ -83,8 +83,30 @@ RETENTION_BATCH_SIZE = 500
 RECONCILE_EMPTY_SCAN_LIMIT = 5000
 
 
+def _attempt_of(payload: dict[str, Any]) -> int:
+    """Which attempt a job payload is: 1 unless `retry_job` numbered it."""
+    try:
+        return max(1, int(payload.get("_attempt") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class RetryRefused(ValueError):
+    """A retry that must not happen: the job is not failed, or was already retried."""
+
+    def __init__(self, message: str, retry_job_id: str | None = None):
+        super().__init__(message)
+        self.retry_job_id = retry_job_id
+
+
+# LIKE pattern for "this payload carries `_reconcile_hash`" -- the marker every
+# reconciler-started pipeline job has (see worker.py's `_chain_after_success`).
+# `_` is LIKE's one-character wildcard, so it is escaped.
+_RECONCILE_MARKER = '%"\\_reconcile\\_hash"%'
 
 
 @dataclass(frozen=True)
@@ -262,6 +284,47 @@ class Database:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (4, utc_now()),
                 )
+            # Migration 5: retries and live status messages.
+            #
+            # `job_retries` records that a FAILED job was queued again, and as
+            # which job. `failed_job_id` is the primary key so neither the
+            # automatic retrier nor a second `/retry` can queue the same
+            # failure twice: before this, a failed pipeline stage stayed
+            # failed for good, because its torrent was already claimed in
+            # `reconciled_torrents` and the reconciler never offers a claimed
+            # hash again (2026-10-17: a book stuck on Sullivan after one SSH
+            # refusal, with no way back short of editing the database).
+            #
+            # `status_messages` holds the ONE Discord message per torrent that
+            # the worker edits at every stage (see status.py), so a restart
+            # keeps editing the same message instead of starting a new one.
+            if conn.execute("SELECT 1 FROM schema_migrations WHERE version = 5").fetchone() is None:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS job_retries (
+                        failed_job_id TEXT PRIMARY KEY,
+                        retry_job_id TEXT NOT NULL,
+                        automatic INTEGER NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS status_messages (
+                        torrent_hash TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        message_id TEXT,
+                        stages_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (5, utc_now()),
+                )
 
     @staticmethod
     def _audit(
@@ -411,6 +474,165 @@ class Database:
             )
             conn.commit()
         return self.get_job(job_id)
+
+    def retry_job(self, job_id: str, actor: str = "system", *, automatic: bool = False) -> Job:
+        """Queue a fresh copy of a FAILED job and return it.
+
+        The copy keeps the payload, so a reconciler-started stage keeps its
+        `_reconcile_hash` and the chain carries on from it exactly as if the
+        first attempt had succeeded. It also gains `_retry_of` (the failed
+        job) and `_attempt` (1 for the original, counting up). The failed row
+        is left as it was: its error is the record of what went wrong.
+
+        Raises LookupError for an unknown id, RetryRefused when the job is
+        not failed or was already retried (with that retry's id). The check
+        and both writes share one transaction, so two retries racing for the
+        same failure cannot both win.
+        """
+        new_id = str(uuid.uuid4())
+        created = utc_now()
+        with closing(self.connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                raise LookupError(job_id)
+            if row["status"] != "failed":
+                conn.rollback()
+                raise RetryRefused(f"job is {row['status']}, and only a failed job can be retried")
+            done = conn.execute(
+                "SELECT retry_job_id FROM job_retries WHERE failed_job_id = ?", (job_id,)
+            ).fetchone()
+            if done is not None:
+                conn.rollback()
+                raise RetryRefused(f"already retried as {done['retry_job_id']}", done["retry_job_id"])
+            payload = json.loads(row["payload_json"])
+            payload["_retry_of"] = job_id
+            payload["_attempt"] = _attempt_of(payload) + 1
+            conn.execute(
+                """
+                INSERT INTO jobs(id, kind, payload_json, status, created_at)
+                VALUES (?, ?, ?, 'queued', ?)
+                """,
+                (new_id, row["kind"], json.dumps(payload, sort_keys=True), created),
+            )
+            conn.execute(
+                """
+                INSERT INTO job_retries(failed_job_id, retry_job_id, automatic, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (job_id, new_id, 1 if automatic else 0, created),
+            )
+            self._audit(
+                conn,
+                actor=actor,
+                action="job.retried",
+                target_type="job",
+                target_id=new_id,
+                details={"retry_of": job_id, "attempt": payload["_attempt"], "automatic": automatic},
+            )
+            conn.commit()
+        return self.get_job(new_id)  # type: ignore[return-value]
+
+    def resolve_job_id(self, prefix: str) -> str | None:
+        """The full id of the one job whose id starts with `prefix` (8+ chars).
+
+        Discord shows ids shortened, so `/retry` accepts the short form back.
+        Two matches is no match: retrying the wrong job is worse than asking
+        for more of the id.
+        """
+        prefix = prefix.strip().lower()
+        if len(prefix) < 8 or not all(c in "0123456789abcdef-" for c in prefix):
+            return None
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                "SELECT id FROM jobs WHERE id LIKE ? LIMIT 2", (prefix + "%",)
+            ).fetchall()
+        return rows[0]["id"] if len(rows) == 1 else None
+
+    def failed_pipeline_jobs_not_retried(self, limit: int = 100) -> list[Job]:
+        """Failed reconciler-chain jobs that were never queued again, newest first."""
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT j.* FROM jobs j
+                  LEFT JOIN job_retries r ON r.failed_job_id = j.id
+                 WHERE j.status = 'failed'
+                   AND r.failed_job_id IS NULL
+                   AND j.payload_json LIKE ? ESCAPE '\\'
+                 ORDER BY j.finished_at DESC
+                 LIMIT ?
+                """,
+                (_RECONCILE_MARKER, limit),
+            ).fetchall()
+        return [Job.from_row(row) for row in rows]
+
+    def import_status(self, torrent_hash: str) -> dict[str, Any] | None:
+        """What the pipeline knows about one torrent: None if it was never claimed.
+
+        Otherwise when it was claimed, and its newest pipeline job: the
+        stage (`kind`), how it ended, and the error if it failed. This is
+        what turns "already in qBittorrent" into something a person can act
+        on -- downloading, in the library, or stuck at a named stage.
+        """
+        h = torrent_hash.strip().lower()
+        if not h:
+            return None
+        with closing(self.connect()) as conn:
+            claim = conn.execute(
+                "SELECT name, created_at FROM reconciled_torrents WHERE lower(hash) = ?", (h,)
+            ).fetchone()
+            if claim is None:
+                return None
+            latest = conn.execute(
+                """
+                SELECT id, kind, status, error, error_code FROM jobs
+                 WHERE payload_json LIKE ? ESCAPE '\\'
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                (f'%"\\_reconcile\\_hash": "{h}"%',),
+            ).fetchone()
+        status: dict[str, Any] = {"claimed_at": claim["created_at"]}
+        if latest is not None:
+            status.update(
+                job_id=latest["id"],
+                stage=latest["kind"],
+                status=latest["status"],
+                error=(latest["error"] or "")[:300] or None,
+                error_code=latest["error_code"],
+            )
+        return status
+
+    def get_status_message(self, torrent_hash: str) -> dict[str, Any] | None:
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM status_messages WHERE torrent_hash = ?", (torrent_hash.lower(),)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "name": row["name"],
+            "message_id": row["message_id"],
+            "stages": json.loads(row["stages_json"]),
+        }
+
+    def save_status_message(
+        self, torrent_hash: str, name: str, message_id: str | None, stages: dict[str, Any]
+    ) -> None:
+        now = utc_now()
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO status_messages(torrent_hash, name, message_id, stages_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(torrent_hash) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    stages_json = excluded.stages_json,
+                    updated_at = excluded.updated_at
+                """,
+                (torrent_hash.lower(), name, message_id, json.dumps(stages, sort_keys=True), now, now),
+            )
 
     def get_job(self, job_id: str) -> Job | None:
         with closing(self.connect()) as conn:
@@ -812,6 +1034,10 @@ class Database:
             f"DELETE FROM audit_events WHERE target_type = 'job' AND target_id IN ({placeholders})",
             job_ids,
         )
+        # Keyed on the FAILED job only. Dropping a row because its retry job
+        # aged out would make a failure that was already retried look
+        # untouched, and the automatic retrier would queue it again.
+        conn.execute(f"DELETE FROM job_retries WHERE failed_job_id IN ({placeholders})", job_ids)
         conn.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", job_ids)
         conn.commit()
 
