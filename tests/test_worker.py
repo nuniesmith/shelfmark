@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import urllib.error
@@ -388,6 +390,46 @@ class TransferCompletedErrorCodeTests(WorkerTestCase):
         self.assertEqual(ctx.exception.details["differing_count"], 1)
 
 
+    def test_single_file_torrent_transfers_and_verifies(self) -> None:
+        """A book that is ONE file (a lone PDF) completes the transfer.
+
+        Regression (job 6cb20a96, "A Complete Guide to the Futures
+        Market"): transfer_completed pointed the settle step at the landed
+        FILE and snapshot_tree refused it -- "transfer path is not a
+        directory: /incoming/<book>.pdf". Everything downstream already
+        accepts a loose file in the incoming root.
+        """
+        incoming = Path(self.tmp.name) / "incoming"
+        incoming.mkdir()
+        name = "A Complete Guide to the Futures Market.pdf"
+
+        def fake_pull(remote: str, local: Path) -> None:
+            landed = Path(local) / Path(remote).name
+            landed.write_bytes(b"%PDF-fake")
+            old = landed.stat().st_mtime - 60
+            os.utime(landed, (old, old))
+
+        worker = self.make_worker(
+            sullivan_host="sullivan.internal",
+            sullivan_user="shelfmark-sync",
+            incoming_root=incoming,
+            manifest_root=Path(self.tmp.name) / "manifests",
+            transfer_settle_seconds=0,
+            transfer_poll_seconds=0.1,
+            transfer_timeout_seconds=5,
+        )
+        job = self.make_job("transfer_completed", {"remote_path": name})
+        with mock.patch(
+            "src.shelfmark_service.worker.RsyncTransfer.pull", side_effect=fake_pull
+        ), mock.patch(
+            "src.shelfmark_service.worker.RsyncTransfer.verify", return_value=[]
+        ):
+            result = worker.execute(job)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["files"], 1)
+        self.assertEqual(result["local_path"], str(incoming / name))
+
+
 class OrganizeJobErrorCodeTests(WorkerTestCase):
     def test_unsupported_job_kind_reports_invalid_payload(self) -> None:
         worker = self.make_worker()
@@ -415,6 +457,36 @@ class OrganizeJobErrorCodeTests(WorkerTestCase):
         self.assertEqual(ctx.exception.code, ErrorCode.EXTRACTION_FAILED)
         self.assertIn("broken.zip", ctx.exception.message)
         self.assertEqual(len(ctx.exception.details["errors"]), 1)
+
+
+    def test_nested_archives_extract_fully_in_one_job(self) -> None:
+        """zip -> zip -> epub is filed by a SINGLE organize_apply job.
+
+        Regression (the Advances in Financial Machine Learning import):
+        one extract pass per job peeled only the outer zip and left the
+        inner archive for a later pass/job, so nested scene releases
+        stalled between jobs. The job now loops extract/rebuild until no
+        archives remain.
+        """
+        inner = Path(self.tmp.name) / "inner.zip"
+        with zipfile.ZipFile(inner, "w") as archive:
+            archive.writestr("Nested Book.epub", b"epub-content")
+        source = Path(self.tmp.name) / "dump"
+        book_dir = source / "Some Author - Nested Book (2020)"
+        book_dir.mkdir(parents=True)
+        with zipfile.ZipFile(book_dir / "outer.zip", "w") as archive:
+            archive.writestr("inner.zip", inner.read_bytes())
+        library = Path(self.tmp.name) / "library"
+        worker = self.make_worker(manifest_root=Path(self.tmp.name) / "manifests")
+        job = self.make_job(
+            "organize_apply",
+            {"source": str(source), "dest": str(library), "media": "ebook"},
+        )
+        result = worker.execute(job)
+        self.assertTrue(result["applied"])
+        epubs = list(library.rglob("*.epub"))
+        self.assertEqual(len(epubs), 1)
+        self.assertEqual(epubs[0].read_bytes(), b"epub-content")
 
 
 class RunOnceErrorPersistenceTests(WorkerTestCase):

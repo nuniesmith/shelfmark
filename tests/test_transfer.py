@@ -27,6 +27,41 @@ class TransferTests(unittest.TestCase):
             )
             self.assertEqual(snapshot["book/01.mp3"][0], 5)
 
+    def test_stable_snapshot_accepts_a_single_file(self) -> None:
+        """A single-file torrent lands as one file, not a folder.
+
+        Regression: a lone-PDF book failed every transfer at the settle
+        step with "transfer path is not a directory: /incoming/<book>.pdf"
+        because snapshot_tree only accepted directories.
+        """
+        with tempfile.TemporaryDirectory(prefix="shelfmark-transfer-") as tmp:
+            file = Path(tmp) / "A Complete Guide to the Futures Market.pdf"
+            file.write_bytes(b"%PDF-fake")
+            old = file.stat().st_mtime - 60
+            os.utime(file, (old, old))
+            snapshot = wait_until_stable(
+                file,
+                settle_seconds=0,
+                poll_seconds=0.1,
+                timeout_seconds=1,
+                sleep=lambda _seconds: None,
+            )
+            self.assertEqual(
+                snapshot,
+                {file.name: (len(b"%PDF-fake"), file.stat().st_mtime_ns)},
+            )
+
+    def test_snapshot_of_a_missing_path_still_raises(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="shelfmark-transfer-") as tmp:
+            with self.assertRaises(TransferError):
+                wait_until_stable(
+                    Path(tmp) / "never-landed.pdf",
+                    settle_seconds=0,
+                    poll_seconds=0.1,
+                    timeout_seconds=1,
+                    sleep=lambda _seconds: None,
+                )
+
     def test_rsync_uses_argument_list_and_restricted_ssh(self) -> None:
         calls: list[tuple[list[str], dict[str, object]]] = []
 

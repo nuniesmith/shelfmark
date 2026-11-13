@@ -1470,11 +1470,24 @@ def extract_tar(path: Path, dest: Path) -> None:
 
 
 def run_cmd(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=False, capture_output=True, text=True)
+    # errors="replace": an extractor printing a filename it cannot encode in
+    # UTF-8 (unrar-free does exactly that on scene RARs) must not raise
+    # UnicodeDecodeError out of the subprocess call. That exception used to
+    # BE the reported extraction error -- "utf-8 codec can't decode byte
+    # 0xbf" -- masking the real failure and skipping every fallback tool.
+    return subprocess.run(
+        cmd, check=False, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+
+
+def _any_file(root: Path) -> bool:
+    return any(p.is_file() for p in root.rglob("*"))
 
 
 def extract_rar(path: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
+    failures: list[str] = []
     try:
         import rarfile
 
@@ -1482,40 +1495,53 @@ def extract_rar(path: Path, dest: Path) -> None:
             for info in rf.infolist():
                 _safe_target(dest, info.filename)
             rf.extractall(dest)
-        _reject_escaping_links(dest)
-        return
+        if _any_file(dest):
+            _reject_escaping_links(dest)
+            return
+        # rarfile can report success while its backend (unrar-free) skipped
+        # every file in the archive. An empty extraction is a failure, not
+        # a result -- fall through to the external tools.
+        failures.append("rarfile: extracted no files")
     except ImportError:
         # rarfile is optional; fall back to whatever is on PATH.
-        pass
+        failures.append("rarfile: not installed")
     except UnsafeArchive:
         # NEVER fall through on this one. It used to be caught by the bare
         # `except Exception` below, so an archive that FAILED the path check was
         # then handed to unrar/unar/7z with no check at all — the guard defeated
         # by its own fallback. A rejected archive is rejected.
         raise
-    except Exception:
-        pass
+    except Exception as exc:
+        failures.append(f"rarfile: {exc}")
+    attempts: list[tuple[str, list[str]]] = []
     unrar = which(["unrar"])
     if unrar:
-        r = run_cmd([unrar, "x", "-o+", "-y", str(path), str(dest) + os.sep])
-        if r.returncode == 0:
-            return
-        raise RuntimeError(r.stderr or r.stdout or "unrar failed")
+        attempts.append(("unrar", [unrar, "x", "-o+", "-y", str(path), str(dest) + os.sep]))
     unar = which(["unar"])
     if unar:
-        r = run_cmd([unar, "-f", "-o", str(dest), str(path)])
-        if r.returncode == 0:
-            return
-        raise RuntimeError(r.stderr or r.stdout or "unar failed")
+        attempts.append(("unar", [unar, "-f", "-o", str(dest), str(path)]))
     seven = which(["7z", "7za", "7zr"])
     if seven:
-        r = run_cmd([seven, "x", f"-o{dest}", "-y", str(path)])
-        if r.returncode == 0:
+        attempts.append(("7z", [seven, "x", f"-o{dest}", "-y", str(path)]))
+    for tool, cmd in attempts:
+        # Each tool gets its chance. This used to raise on the FIRST tool's
+        # failure, so a broken `unrar` on PATH (unrar-free misparses modern
+        # scene RARs and prints non-UTF-8 garbage) blocked 7z, which was
+        # never tried at all.
+        r = run_cmd(cmd)
+        if r.returncode == 0 and _any_file(dest):
             return
-        raise RuntimeError(r.stderr or r.stdout or "7z failed")
-    raise RuntimeError(
-        "No RAR extractor found. Install unrar, unar, or 7-Zip and keep it on PATH."
-    )
+        if r.returncode == 0:
+            failures.append(f"{tool}: reported success but extracted no files")
+        else:
+            detail = (r.stderr or r.stdout or f"{tool} failed").strip()[-500:]
+            failures.append(f"{tool}: {detail}")
+    if not attempts:
+        raise RuntimeError(
+            "No RAR extractor found. Install unrar, unar, or 7-Zip and keep it on PATH. "
+            f"({'; '.join(failures)})"
+        )
+    raise RuntimeError(f"Could not extract {path.name}: " + "; ".join(failures))
 
 
 def extract_7z(path: Path, dest: Path) -> None:
@@ -1526,6 +1552,73 @@ def extract_7z(path: Path, dest: Path) -> None:
     r = run_cmd([seven, "x", f"-o{dest}", "-y", str(path)])
     if r.returncode != 0:
         raise RuntimeError(r.stderr or r.stdout or "7z failed")
+
+
+def _gather_rar_volumes(path: Path) -> tuple[Path, Path | None]:
+    """Assemble a multi-volume RAR set in one place for its extractor.
+
+    Scene releases ship one volume per wrapper archive (`bb1zlb6a.zip` holds
+    `bb1zlb6.rar`, `bb1zlb6b.zip` holds `bb1zlb6.r00`), and the earlier
+    per-archive extraction leaves the volumes in SIBLING folders, where no
+    extractor can find volume 2 -- the set looks corrupt when it is merely
+    scattered. Search the archive's own folder and its siblings under the
+    same parent (the release folder) for continuation volumes with the same
+    stem (`.rNN`, or `.partN.<ext>` for the part-named scheme); if any live
+    outside the archive's own folder, hard-link (or copy, across filesystems)
+    the whole set into a private directory beside the archive and extract
+    from there. The originals are never touched, and the caller removes the
+    directory afterwards. With no scattered volumes this returns the archive
+    itself and changes nothing.
+    """
+    names: list[Path] = [path]
+    scattered = False
+
+    def _same_stem(name: str, pattern: str) -> bool:
+        return re.match(pattern, name, re.I) is not None
+
+    part = PART_RE.match(path.name)
+    if part:
+        base, ext = part.group("base"), part.group("ext")
+        wanted = rf"^{re.escape(base)}\.part0*\d+\.{ext}$"
+    else:
+        wanted = rf"^{re.escape(path.stem)}\.r\d\d$"
+    search_dirs = [path.parent]
+    parent = path.parent.parent
+    if parent != path.parent:
+        try:
+            search_dirs.extend(
+                d for d in parent.iterdir() if d.is_dir() and d != path.parent
+            )
+        except OSError:
+            pass
+    for directory in search_dirs:
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry == path or not entry.is_file():
+                continue
+            if _same_stem(entry.name, wanted):
+                names.append(entry)
+                if directory != path.parent:
+                    scattered = True
+    if not scattered:
+        return path, None
+    gathered = Path(
+        tempfile.mkdtemp(prefix=".shelfmark-volumes-", dir=path.parent)
+    )
+    try:
+        for volume in names:
+            target = gathered / volume.name
+            try:
+                os.link(volume, target)
+            except OSError:
+                shutil.copy2(volume, target)
+    except BaseException:
+        shutil.rmtree(gathered, ignore_errors=True)
+        raise
+    return gathered / path.name, gathered
 
 
 def extract_archive(path: Path, *, quarantine: Path | None = None) -> Path:
@@ -1558,23 +1651,35 @@ def extract_archive(path: Path, *, quarantine: Path | None = None) -> Path:
         raise RuntimeError(f"Unsupported archive: {path.name}")
 
     staging = staging_dir_for(path)
+    volume_dir: Path | None = None
     try:
+        extract_path = path
+        if kind == "rar":
+            extract_path, volume_dir = _gather_rar_volumes(path)
         if kind == "zip":
             extract_zip(path, staging)
         elif kind == "tar":
             extract_tar(path, staging)
         elif kind == "rar":
-            extract_rar(path, staging)
+            extract_rar(extract_path, staging)
         else:
             extract_7z(path, staging)
         # Belt and braces for the external extractors, which validate by their
         # own rules and cannot be made to use ours.
         _reject_escaping_links(staging)
+        if not _any_file(staging):
+            # An extractor claiming success while producing nothing (the
+            # unrar-free failure mode) must not move an empty tree into
+            # place and be filed as a book with no content.
+            raise RuntimeError(f"Extraction of {path.name} produced no files")
     except BaseException:
         # BaseException, not Exception: a KeyboardInterrupt mid-extraction is
         # exactly the case that used to strand fragments in the dump.
         _dispose_staging(staging, path, quarantine)
         raise
+    finally:
+        if volume_dir is not None:
+            shutil.rmtree(volume_dir, ignore_errors=True)
 
     dest = extract_dir_for(path)
     try:

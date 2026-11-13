@@ -522,7 +522,16 @@ class Worker:
 
         if self.database.cancellation_requested(job.id):
             raise JobCancelled("cancel requested before apply")
-        if plan.extracts:
+        # Extraction can uncover MORE archives: a scene release nests them
+        # (zip -> rar -> the book), and one pass only ever peels the outer
+        # layer. Loop extract/rebuild inside this job until a plan comes
+        # back with nothing left to extract, bounded so a pathological
+        # self-similar dump cannot spin forever. Archives still left at the
+        # bound are a failure, not content to organize around: apply_plan
+        # would ignore them and the book inside would be lost silently.
+        for _extract_pass in range(5):
+            if not plan.extracts:
+                break
             self._record_plan(manifest, plan)
             errors = apply_extracts(plan, trash=trash, dry_run=False, copy=bool(payload.get("copy", False)))
             if errors:
@@ -531,6 +540,13 @@ class Worker:
                 )
             plan = build_plan(**options)
             manifest.event("plan_recreated", summary=_plan_summary(plan))
+        if plan.extracts:
+            remaining = sorted({op.src.name for op in plan.extracts})
+            raise ShelfmarkError(
+                ErrorCode.EXTRACTION_FAILED,
+                "archives nested too deeply to extract in one job: " + ", ".join(remaining[:5]),
+                details={"errors": remaining},
+            )
         self._record_plan(manifest, plan)
         copy = bool(payload.get("copy", False))
         apply_plan(plan, trash=trash, dry_run=False, copy=copy)
