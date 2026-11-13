@@ -16,8 +16,18 @@ class TransferError(RuntimeError):
 
 
 def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
-    """Return relative-file size/mtime pairs for a completed download tree."""
+    """Return relative-file size/mtime pairs for a completed download tree.
+
+    A completed torrent is not always a directory: a single-file release
+    (a lone PDF is the common ebook case) lands as ONE file, and the settle
+    and verify steps have to accept it or every such book fails the transfer
+    with "transfer path is not a directory". Snapshot a file as a one-entry
+    tree keyed by its own name, so callers keep one shape either way.
+    """
     root = Path(root).expanduser().resolve()
+    if root.is_file() and not root.is_symlink():
+        stat = root.stat()
+        return {root.name: (stat.st_size, stat.st_mtime_ns)}
     if not root.is_dir():
         raise TransferError(f"transfer path is not a directory: {root}")
     result: dict[str, tuple[int, int]] = {}

@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import errno
 import io
+import os
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -457,6 +459,105 @@ class IsolatedExtractionTests(unittest.TestCase):
             library.exists() and any(library.rglob("*.mp3")),
             "fragments of a failed extraction were filed into the library",
         )
+
+    def test_run_cmd_survives_non_utf8_output(self) -> None:
+        """An extractor printing non-UTF-8 bytes must return, not raise.
+
+        Regression: run_cmd decoded captured output as strict UTF-8, so
+        unrar-free's garbled filename output raised UnicodeDecodeError out
+        of the subprocess call and THAT was reported as the extraction
+        failure ("byte 0xbf in position 210"), hiding the real problem.
+        """
+        result = main_module.run_cmd(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(bytes([0xFF, 0xBF])); sys.exit(3)",
+            ]
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertIsInstance(result.stdout, str)
+
+    def test_rar_falls_through_a_broken_unrar_to_the_next_tool(self) -> None:
+        """A failing first extractor must not block the fallback chain.
+
+        The fake `unrar` exits 1 while printing non-UTF-8 garbage (the
+        unrar-free behaviour on scene RARs); the fake `7z` writes the book.
+        Extraction must reach 7z and succeed.
+        """
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        unrar = bin_dir / "unrar"
+        unrar.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "sys.stdout.buffer.write(bytes([0xFF, 0xBF]))\n"
+            "sys.exit(1)\n"
+        )
+        unrar.chmod(0o755)
+        seven = bin_dir / "7z"
+        seven.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib, sys\n"
+            "out = next(a[2:] for a in sys.argv[1:] if a.startswith('-o'))\n"
+            "dest = pathlib.Path(out)\n"
+            "dest.mkdir(parents=True, exist_ok=True)\n"
+            "(dest / 'book.epub').write_bytes(b'epub')\n"
+        )
+        seven.chmod(0o755)
+        archive = self.source / "book.rar"
+        archive.write_bytes(b"not a real rar archive")
+        dest = self.root / "out"
+        with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}):
+            main_module.extract_rar(archive, dest)
+        self.assertEqual((dest / "book.epub").read_bytes(), b"epub")
+
+    def test_extraction_that_produces_no_files_fails(self) -> None:
+        """An archive of only directories is not a successful extraction.
+
+        Guards the unrar-free failure mode where the tool claims success
+        while extracting nothing at all: the empty tree must not be moved
+        into place as if it were the book.
+        """
+        archive = self.make_zip(self.source / "empty.zip", {"subdir/": b""})
+        with self.assertRaises(RuntimeError):
+            extract_archive(archive)
+        self.assertEqual(self.visible_entries(), ["empty.zip"])
+        self.assertFalse((self.source / STAGING_DIR_NAME).exists())
+
+    def test_scattered_rar_volumes_are_gathered_for_the_extractor(self) -> None:
+        """Volumes unpacked into sibling folders are presented as one set.
+
+        The production case: bb1zlb6a.zip -> bb1zlb6.rar sat alone in one
+        folder and bb1zlb6.r00 alone in its sibling, so the RAR extractor
+        could not find volume 2 at all.
+        """
+        release = self.source / "Some.Release.2020"
+        first_dir = release / "bb1zlb6a"
+        second_dir = release / "bb1zlb6b"
+        first_dir.mkdir(parents=True)
+        second_dir.mkdir(parents=True)
+        (first_dir / "bb1zlb6.rar").write_bytes(b"volume one")
+        (second_dir / "bb1zlb6.r00").write_bytes(b"volume two")
+
+        seen: dict[str, list[str]] = {}
+
+        def fake_extract(path: Path, dest: Path) -> None:
+            seen["siblings"] = sorted(p.name for p in path.parent.iterdir())
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "book.epub").write_bytes(b"epub")
+
+        with mock.patch.object(main_module, "extract_rar", fake_extract):
+            extracted = extract_archive(first_dir / "bb1zlb6.rar")
+
+        self.assertIn("bb1zlb6.r00", seen["siblings"])
+        self.assertEqual((extracted / "book.epub").read_bytes(), b"epub")
+        # The originals are untouched and the gathered set is cleaned up.
+        self.assertTrue((second_dir / "bb1zlb6.r00").exists())
+        leftovers = [
+            p for p in release.rglob("*") if p.name.startswith(".shelfmark-volumes-")
+        ]
+        self.assertEqual(leftovers, [])
 
     def test_escaping_symlink_is_rejected_and_leaves_nothing(self) -> None:
         """An escaping link is caught, and the rejected tree does not survive.
